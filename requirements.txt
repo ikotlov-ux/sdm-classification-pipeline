@@ -1,0 +1,42 @@
+# Основные зависимости пайплайнов классификации растительности и SDM
+# Установка: pip install -r requirements.txt
+# Рекомендуется использовать conda-forge для GDAL/rasterio/geopandas.
+
+# --- Numerical / data ---
+numpy>=1.24,<3
+pandas>=2.0
+scipy>=1.10
+scikit-learn>=1.3
+
+# --- Geospatial ---
+rasterio>=1.3
+geopandas>=0.14
+shapely>=2.0
+pyproj>=3.5
+fiona>=1.9
+rioxarray>=0.15
+
+# --- ML / boosting ---
+lightgbm>=4.0
+xgboost>=2.0
+catboost>=1.2
+
+# --- SDM-specific ---
+# MaxEnt (Java) вызывается через subprocess — требуется maxent.jar и JRE.
+
+# --- Visualization ---
+matplotlib>=3.7
+seaborn>=0.13
+
+# --- Utilities ---
+tqdm>=4.65
+joblib>=1.3
+pyyaml>=6.0
+
+# --- Optional: DEM indices ---
+# whitebox        # для WhiteboxTools в 00_Prepare_Layers
+# earthengine-api # для выгрузки слоёв из GEE
+
+# --- Optional: notebooks ---
+jupyter
+ipykernel
