@@ -78,6 +78,7 @@ python classification/03_tune_models.py            # обучение RF / CatBo
 python classification/04_predict_map.py            # финальная растровая карта + QGIS-проект
 python classification/05_classwise_importance.py   # per-class permutation importance + GAM-отклики
 python classification/07_generalization.py        # генерализация: sieve + сглаженный вектор (окно выбора файлов)
+python classification/08_Topology.py              # замена классов объектами целевых слоёв (OSM) + исправление топологии
 ```
 
 **Метрики оценки:** OA, каппа Коэна, TSS, F1-macro. Пространственная блочная кросс-валидация (K-Means по координатам).
