@@ -79,6 +79,7 @@ python classification/04_predict_map.py            # финальная раст
 python classification/05_classwise_importance.py   # per-class permutation importance + GAM-отклики
 python classification/07_generalization.py        # генерализация: sieve + сглаженный вектор (окно выбора файлов)
 python classification/08_Topology.py              # замена классов объектами целевых слоёв (OSM) + исправление топологии
+python classification/09_MatrixLegend.py          # матричная легенда: цвет × тон, XLSX с HEX-цветами
 ```
 
 **Метрики оценки:** OA, каппа Коэна, TSS, F1-macro. Пространственная блочная кросс-валидация (K-Means по координатам).

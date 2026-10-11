@@ -42,3 +42,4 @@ pyyaml>=6.0
 # --- Optional: notebooks ---
 jupyter
 ipykernel
+openpyxl>=3.0
