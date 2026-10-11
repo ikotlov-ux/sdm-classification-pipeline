@@ -1,63 +1,48 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-sieve_marching_squares_fast.py  —  версия для больших растров (десятки Мпикс,
-сотни тысяч контуров).
+07_generalization.py — генерализация классифицированной карты из 04_predict_map.
 
-Что изменено по сравнению с первой версией и ПОЧЕМУ:
+Окно для выбора файлов и параметров + быстрые алгоритмы (векторизованный sieve,
+тайловая векторизация marching squares), перенесённые из
+06_sieve_marching_squares.py без изменений.
 
-1) SIEVE полностью векторизован (numpy), без Python-цикла по компонентам.
-   В первой версии на каждую мелкую группу выполнялся отдельный
-   binary_dilation — при 13.7 млн групп это часы. Здесь голоса соседей
-   считаются сразу для всех групп через сдвиги массива + bincount/сортировку.
+1) SIEVE: связные группы пикселей одного класса меньше min_size
+   присоединяются к преобладающему соседнему классу (numpy, без цикла
+   по компонентам). Соседство 4 или 8.
+2) ВЕКТОРИЗАЦИЯ тайлами (marching squares, уровень 0.5 по маске класса):
+   узлы контура лежат между центрами пикселей, граница не «лестничная».
+   Чайкин, Douglas-Peucker, разбиение без зазоров внутри тайла (repair),
+   параллельные процессы (workers).
 
-2) ВЕКТОРИЗАЦИЯ идёт ТАЙЛАМИ, и починка топологии выполняется внутри тайла.
-   Причина: unary_union + polygonize по всей линейной сети растра (у вас это
-   ~860 тыс. контуров и ~10^8 вершин после Чайкина) — суперлинейная операция
-   GEOS, которая на таком объёме не завершается в разумное время. Тайлы
-   переводят стоимость в линейную и позволяют считать параллельно.
-   Тайлы читаются с запасом (margin), результат обрезается по внутренней
-   рамке, поэтому швы между тайлами совпадают без зазоров.
+Запуск из папки проекта:
+    %run 07_generalization.py        # Jupyter — откроется окно
+    python 07_generalization.py      # терминал — откроется окно
 
-3) Промежуточный результат каждого тайла сразу пишется в parquet-часть, так что
-   процесс виден, прерываем и возобновляем (--resume).
+В окне:
+  • «Добавить файлы…» — Проводник с мультивыбором (*_cat.tif из 04_FINAL);
+  • параметры с дефолтами; ход обработки выводится в консоль;
+  • по умолчанию сохраняется ТОЛЬКО вектор GPKG. Очищенный растр нужен
+    тайловой векторизации как промежуточный файл и удаляется после неё,
+    если не отмечен флажок «Сохранить очищенный растр».
+
+Выход: 07_GENERALIZATION/<ддммгг_ччмм><_vXXX источника>/
+    <base>_sieveN_cM_smK.gpkg     слой classes: class_value, class_name, area
+    <base>_sieveN_cM_smK_cat.tif  только по флажку
+    run_info.txt
+
+Без tkinter/дисплея — консольный режим. CLI сохранён:
+    python 07_generalization.py class.tif --min-size 5 --connectivity 4 \
+        --out-raster class_sieved.tif --out-vector class.gpkg --smooth 2 \
+        --tile 256 --workers 8
+
+Производительность (растр 6174x6408, 25 классов, 2 ядра): sieve ~2.5 мин;
+тайл 256 px с repair ~4 c, 512 px ~46 c — тайл с repair не увеличивать.
+При workers > 1 используется multiprocessing: в JupyterLab/Spyder это может
+не работать (spawn), многопоточный прогон надёжнее из cmd/Anaconda Prompt.
 
 Зависимости:
-    pip install numpy scipy scikit-image rasterio shapely geopandas pyarrow
-
-ИЗМЕРЕНО на растре 6174x6408, 25 классов, int16 (36 млн групп < 5 px,
-т.е. заведомо хуже вашего случая), 2 ядра:
-
-  sieve (min_size=5, conn=4)            8 итераций, ~2.5 мин
-  векторизация: тайл 256 px, repair     ~4 c на тайл
-  векторизация: тайл 512 px, repair     ~46 c на тайл   <-- НЕ увеличивать тайл
-  векторизация без repair               ~2 c на 512 px
-
-Стоимость repair (unary_union + polygonize) растёт резко нелинейно от площади,
-поэтому тайл 256 px даёт полный растр примерно за 10-35 мин (зависит от числа
-ядер), а тайл 1024 px — за многие часы. Один общий repair на весь растр
-(как в версии v1) на 860 тыс. контуров не завершается в принципе.
-
-Рецепт для растра 6174x6408:
-
-    # 1) чистка растра (~3 мин)
-    python sieve_marching_squares_fast.py class.tif --min-size 5 \
-        --connectivity 4 --out-raster class_sieved.tif --skip-vector
-
-    # 2) векторизация уже почищенного растра
-    python sieve_marching_squares_fast.py class_sieved.tif --min-size 0 \
-        --out-vector class.gpkg --smooth 2 --tile 256 --workers 8
-
-    # если объектов получается больше ~1 млн, финальная сборка тяжёлая:
-    #   --output-mode raw   (без слияния, видны разрезы по границам тайлов)
-    # либо увеличить --min-size (25-50) — это самый сильный рычаг скорости
-
-Прерванный расчёт можно продолжить: посчитанные тайлы лежат в папке
-<имя вектора>_parts, флаг --resume их не пересчитывает.
-
-ВАЖНО про --workers: при значении > 1 используется multiprocessing, поэтому
-вызывающий скрипт обязан иметь защиту `if __name__ == "__main__":`
-(на Windows без неё процессы будут перезапускать сам скрипт).
+    pip install numpy scipy scikit-image rasterio shapely geopandas pandas pyarrow
 """
 
 from __future__ import annotations
@@ -893,198 +878,397 @@ def _read_class_table(folder):
     return None
 
 
-def _run_pipeline_mode():
-    """Запуск с вопросами, в стиле пайплайна classification.
+# ===========================================================================
+# ГЕНЕРАЛИЗАЦИЯ СПИСКА ФАЙЛОВ (общая часть для окна и консоли)
+# ===========================================================================
 
-    Вход: 04_FINAL/ДДММГГ_ЧЧММ_vXXX (сырая классификация) либо
-    06_SIEVE_MARCHING_SQUARES/... (уже профильтрованный растр — тогда
-    sieve можно пропустить и сразу векторизовать).
-    Выход: 06_SIEVE_MARCHING_SQUARES/ДДММГГ_ЧЧММ_vXXX.
-    """
-    line = "=" * 60
-    print(f"\n{line}\n  06 - SIEVE + MARCHING SQUARES (быстрая версия)\n{line}\n",
-          flush=True)
-    root = os.getcwd()
-    print(f"Рабочая папка: {root}", flush=True)
+OUT_BASE_NAME = "07_GENERALIZATION"
+FINAL_BASE_NAME = "04_FINAL"
 
-    out_base = os.path.join(root, "06_SIEVE_MARCHING_SQUARES")
 
-    print("\n============================\n  ИСТОЧНИК\n============================",
-          flush=True)
-    print(" [1] 04_FINAL — сырая классификация (нужен sieve)", flush=True)
-    print(" [2] 06_SIEVE_MARCHING_SQUARES — уже профильтрованный растр "
-          "(только векторизация)", flush=True)
-    print(" [3] указать путь к растру вручную", flush=True)
-    srcmode = _prompt("Выберите", 1)
+def _in_notebook() -> bool:
+    return "ipykernel" in sys.modules
 
-    if srcmode == "3":
-        in_raster = input("  Путь к растру: ").strip().strip('"')
-        if not os.path.isfile(in_raster):
-            raise FileNotFoundError(in_raster)
-        version_suffix = "_v001"
-        id_to_name = None
-        src_folder = os.path.dirname(in_raster)
-        id_to_name = _read_class_table(src_folder)
-    else:
-        base = os.path.join(root, "04_FINAL" if srcmode == "1"
-                            else "06_SIEVE_MARCHING_SQUARES")
-        src_folder, version_suffix = _select_prev_subdir(base)
-        in_raster = _select_cat_raster(src_folder)
-        id_to_name = _read_class_table(src_folder)
-        if id_to_name is None:
-            id_to_name = _read_class_table(os.path.join(root, "04_FINAL"))
-    if id_to_name is None:
-        print("  • таблица классов не найдена — в векторе будет только "
-              "class_value", flush=True)
 
-    os.makedirs(out_base, exist_ok=True)
-    run_folder = datetime.now().strftime("%d%m%y_%H%M") + version_suffix
-    out_dir = os.path.join(out_base, run_folder)
-    os.makedirs(out_dir, exist_ok=True)
-    print(f"\nINPUT : {in_raster}", flush=True)
-    print(f"OUTPUT: {out_dir}\n", flush=True)
+def _default_params() -> dict:
+    cpu = os.cpu_count() or 1
+    cap = min(cpu, 60 if sys.platform == "win32" else cpu)
+    return {
+        "min_size": 5,
+        "connectivity": 4,
+        "smooth": 2,
+        "simplify": 0.0,
+        "edge_mode": "full",
+        "repair": True,
+        "tile": 256,
+        "margin": 16,
+        # в Jupyter multiprocessing (spawn) часто не работает
+        "workers": 1 if _in_notebook() else min(cap, 8),
+        "output_mode": "patch",
+        "save_raster": False,   # по умолчанию только вектор
+    }
 
-    import rasterio
-    with rasterio.open(in_raster) as s:
-        h, w = s.height, s.width
-        n_px = h * w
-    print(f"  Растр {w} x {h} = {n_px / 1e6:.1f} млн пикселей", flush=True)
 
-    print(f"\n{line}\n  ПАРАМЕТРЫ\n{line}\n", flush=True)
+def _version_suffix(path: str) -> str:
+    m = re.search(r"(_v\d{3})$", os.path.basename(os.path.dirname(path)))
+    return m.group(1) if m else ""
 
-    if srcmode == "2":
-        print("  Растр уже профильтрован, sieve по умолчанию выключен.",
-              flush=True)
-        min_size = _prompt_int("min_size (0 = без sieve)", 0)
-    else:
-        min_size = _prompt_int(
-            "min_size (мин. размер группы в пикселях; 0/1 = без sieve)", 5)
-    connectivity = _prompt_int("connectivity (4 или 8)", 4)
-    if connectivity not in (4, 8):
-        connectivity = 4
-        print("  ⚠ connectivity должен быть 4 или 8, использую 4", flush=True)
 
-    skip_vector = not _prompt_yes("Векторизовать (n = только sieve в растр)",
-                                  True)
-
-    smooth = simplify = 0
-    edge_mode, repair, tile, margin, workers, output_mode, resume = (
-        "full", True, 256, 16, 1, "patch", False)
-    if not skip_vector:
-        smooth = _prompt_int("smooth (итераций Чайкина, 0 = выкл, обычно 1-2)", 2)
-        simplify = _prompt_float("simplify (допуск Douglas-Peucker, 0 = выкл)", 0.0)
-        edge_mode = _prompt_choice("edge_mode", ["full", "shrink"], "full")
-        repair = _prompt_yes("repair (разбиение без зазоров; заметно дольше)",
-                             True)
-        tile = _prompt_int("tile (сторона тайла в пикселях; с repair не "
-                           "увеличивать выше 256-384)", 256)
-        margin = _prompt_int("margin (запас вокруг тайла, пикселей)", 16)
-        cpu = os.cpu_count() or 1
-        cap = min(cpu, 60 if sys.platform == "win32" else cpu)
-        print(f"  Ядер доступно: {cpu}, максимум процессов {cap}"
-              f"{' (предел Windows 61)' if sys.platform == 'win32' else ''}.",
-              flush=True)
-        print(f"  Внимание: в JupyterLab и Spyder workers > 1 может не "
-              f"заработать (spawn не всегда\n  импортирует __main__ из "
-              f"ноутбука) — многопоточный прогон надёжнее запускать из "
-              f"cmd/Anaconda Prompt.", flush=True)
-        workers = min(_prompt_int("workers (процессов)", min(cap, 8)), cap)
-        output_mode = _prompt_choice(
-            "output_mode (patch = отдельные контуры, class = мультиполигон "
-            "на класс, raw = без слияния и быстрее всего)",
-            ["patch", "class", "raw"], "patch")
-        resume = _prompt_yes("resume (продолжить прерванный прогон, если "
-                             "тайлы уже посчитаны)", False)
-
-        n_tiles = math.ceil(h / tile) * math.ceil(w / tile)
-        # замерено на 1 ядре: тайл 256 px с repair ~4 c, без repair ~0.5 c;
-        # с repair стоимость растёт примерно как куб стороны тайла
-        per = (4.0 * (tile / 256.0) ** 3 if repair
-               else 0.5 * (tile / 256.0) ** 2)
-        est = n_tiles * per / max(workers, 1) / 60.0
-        est_txt = "менее 1 мин" if est < 1 else f"~{est:.0f} мин"
-        print(f"\n  Тайлов будет {n_tiles}, векторизация {est_txt} "
-              f"(плюс сборка и запись GPKG)", flush=True)
-
-    base_name = re.sub(r"_cat$", "",
-                       os.path.splitext(os.path.basename(in_raster))[0])
-    # если растр уже прошёл обработку, не наращиваем суффиксы в имени
-    base_name = re.sub(r"_sieve\d+_c\d+_sm\d+(_dp[\d.]+)?(_norep)?$", "",
-                       base_name)
-    tag = f"sieve{min_size}_c{connectivity}_sm{smooth}"
-    if simplify > 0:
-        tag += f"_dp{simplify:g}"
-    if not repair:
+def _make_tag(p: dict) -> str:
+    tag = f"sieve{p['min_size']}_c{p['connectivity']}_sm{p['smooth']}"
+    if p["simplify"] > 0:
+        tag += f"_dp{p['simplify']:g}"
+    if not p["repair"]:
         tag += "_norep"
-    out_raster = (os.path.join(out_dir, f"{base_name}_{tag}_cat.tif")
-                  if min_size and min_size > 1 else None)
-    out_vector = (None if skip_vector
-                  else os.path.join(out_dir, f"{base_name}_{tag}.gpkg"))
+    return tag
 
-    print(f"\n  OUT растр : {os.path.basename(out_raster) if out_raster else '—'}",
-          flush=True)
-    print(f"  OUT вектор: {os.path.basename(out_vector) if out_vector else '—'}\n",
-          flush=True)
-    if not _prompt_yes("Запускать", True):
-        print("Отменено.", flush=True)
-        return
 
-    print(f"{line}\n  ОБРАБОТКА\n{line}\n", flush=True)
-    t0 = time.time()
-    run(in_raster=in_raster, min_size=min_size, connectivity=connectivity,
-        out_raster=out_raster, out_vector=out_vector, smooth=smooth,
-        simplify=simplify, edge_mode=edge_mode, repair=repair, tile=tile,
-        margin=margin, workers=workers, output_mode=output_mode,
-        layer="classes", skip_vector=skip_vector, resume=resume, verbose=True)
-    dt = time.time() - t0
+def _add_class_names(out_vector: str, id_to_name: dict) -> None:
+    import geopandas as gpd
+    gdf = gpd.read_file(out_vector, layer="classes")
+    gdf["class_name"] = gdf["class_value"].map(
+        lambda v: id_to_name.get(int(v), str(int(v))))
+    cols = [c for c in ("class_value", "class_name", "area") if c in gdf.columns]
+    cols += [c for c in gdf.columns if c not in cols and c != "geometry"]
+    gdf[cols + ["geometry"]].to_file(out_vector, layer="classes", driver="GPKG")
 
-    if id_to_name and out_vector and os.path.isfile(out_vector):
+
+def generalize_files(files: list[str], params: dict, out_base: str) -> list[str]:
+    """Обрабатывает растры по очереди. Возвращает список созданных GPKG."""
+    line = "=" * 60
+    os.makedirs(out_base, exist_ok=True)
+    stamp = datetime.now().strftime("%d%m%y_%H%M")
+    tag = _make_tag(params)
+    created = []
+
+    for k, in_raster in enumerate(files, 1):
+        print(f"\n{line}\n  [{k}/{len(files)}] {in_raster}\n{line}", flush=True)
+        out_dir = os.path.join(out_base, stamp + _version_suffix(in_raster))
+        os.makedirs(out_dir, exist_ok=True)
+
+        base = re.sub(r"_cat$", "", os.path.splitext(os.path.basename(in_raster))[0])
+        base = re.sub(r"_sieve\d+_c\d+_sm\d+(_dp[\d.]+)?(_norep)?$", "", base)
+        out_vector = os.path.join(out_dir, f"{base}_{tag}.gpkg")
+
+        do_sieve = params["min_size"] > 1
+        out_raster = None
+        tmp_raster = False
+        if do_sieve:
+            if params["save_raster"]:
+                out_raster = os.path.join(out_dir, f"{base}_{tag}_cat.tif")
+            else:
+                # тайловая векторизация читает растр с диска — временный файл
+                out_raster = os.path.join(out_dir, f"_tmp_{base}_{tag}_sieved.tif")
+                tmp_raster = True
+
+        t0 = time.time()
         try:
-            import geopandas as gpd
-            gdf = gpd.read_file(out_vector, layer="classes")
-            gdf["class_name"] = gdf["class_value"].map(
-                lambda v: id_to_name.get(int(v), str(int(v))))
-            cols = [c for c in ("class_value", "class_name", "area")
-                    if c in gdf.columns]
-            cols += [c for c in gdf.columns if c not in cols and c != "geometry"]
-            gdf = gdf[cols + ["geometry"]]
-            gdf.to_file(out_vector, layer="classes", driver="GPKG")
-            print("  ✓ Добавлено поле class_name", flush=True)
+            run(in_raster=in_raster,
+                min_size=params["min_size"],
+                connectivity=params["connectivity"],
+                out_raster=out_raster,
+                out_vector=out_vector,
+                smooth=params["smooth"],
+                simplify=params["simplify"],
+                edge_mode=params["edge_mode"],
+                repair=params["repair"],
+                tile=params["tile"],
+                margin=params["margin"],
+                workers=params["workers"],
+                output_mode=params["output_mode"],
+                layer="classes",
+                skip_vector=False,
+                resume=False,
+                verbose=True)
         except Exception as e:
-            print(f"  ⚠ Не удалось добавить class_name: {e}", flush=True)
+            print(f"  ! Ошибка обработки {os.path.basename(in_raster)}: {e}", flush=True)
+            continue
+        finally:
+            if tmp_raster and out_raster and os.path.isfile(out_raster):
+                try:
+                    os.remove(out_raster)
+                except OSError:
+                    pass
+        dt = time.time() - t0
 
-    meta = os.path.join(out_dir, "run_info.txt")
-    with open(meta, "w", encoding="utf-8") as f:
-        f.write("06 - Sieve + Marching Squares (быстрая версия)\n")
-        f.write(f"Запуск: {run_folder}\n")
-        f.write(f"Входной растр: {in_raster}\n")
-        f.write(f"Размер: {w} x {h}\n\nПараметры:\n")
-        for k, v in (("min_size", min_size), ("connectivity", connectivity),
-                     ("smooth", smooth), ("simplify", simplify),
-                     ("edge_mode", edge_mode), ("repair", repair),
-                     ("tile", tile), ("margin", margin),
-                     ("workers", workers), ("output_mode", output_mode)):
-            f.write(f"  {k:12s}= {v}\n")
-        f.write(f"\nВыход:\n  растр : {out_raster}\n  вектор: {out_vector}\n")
-        f.write(f"\nВремя работы: {dt / 60:.1f} мин\n")
+        if not os.path.isfile(out_vector):
+            print("  ! Вектор не создан.", flush=True)
+            continue
 
-    print(f"\n{line}\n  ГОТОВО за {dt / 60:.1f} мин\n{line}", flush=True)
-    print(f"  Растр : {out_raster or '—'}", flush=True)
-    print(f"  Вектор: {out_vector or '—'}", flush=True)
-    print(f"  Мета  : {meta}", flush=True)
+        # промежуточные тайлы больше не нужны
+        parts = os.path.splitext(out_vector)[0] + "_parts"
+        if os.path.isdir(parts):
+            shutil.rmtree(parts, ignore_errors=True)
 
+        id_to_name = _read_class_table(os.path.dirname(in_raster))
+        if id_to_name is None:
+            id_to_name = _read_class_table(os.path.join(os.getcwd(), FINAL_BASE_NAME))
+        if id_to_name:
+            try:
+                _add_class_names(out_vector, id_to_name)
+                print("  ✓ Добавлено поле class_name", flush=True)
+            except Exception as e:
+                print(f"  ! Не удалось добавить class_name: {e}", flush=True)
+        else:
+            print("  • таблица классов не найдена — в векторе только class_value",
+                  flush=True)
+
+        with open(os.path.join(out_dir, "run_info.txt"), "a", encoding="utf-8") as f:
+            f.write("07 - Generalization (sieve + marching squares)\n")
+            f.write(f"Запуск       : {stamp}\n")
+            f.write(f"Входной растр: {in_raster}\n")
+            for key, val in params.items():
+                f.write(f"  {key:12s}= {val}\n")
+            f.write(f"Вектор       : {os.path.basename(out_vector)}\n")
+            if out_raster and not tmp_raster:
+                f.write(f"Растр        : {os.path.basename(out_raster)}\n")
+            f.write(f"Время работы : {dt / 60:.1f} мин\n\n")
+
+        created.append(out_vector)
+
+    print(f"\n{line}\n  ГОТОВО: векторов {len(created)} из {len(files)}\n{line}",
+          flush=True)
+    for c in created:
+        print(f"  {c}", flush=True)
+    return created
+
+
+# ===========================================================================
+# ОКНО (tkinter)
+# ===========================================================================
+
+def _initial_dir(root_dir: str) -> str:
+    """Самая свежая подпапка 04_FINAL, иначе 04_FINAL, иначе рабочая папка."""
+    fb = os.path.join(root_dir, FINAL_BASE_NAME)
+    if os.path.isdir(fb):
+        subs = [os.path.join(fb, d) for d in os.listdir(fb)
+                if os.path.isdir(os.path.join(fb, d))]
+        return max(subs, key=os.path.getmtime) if subs else fb
+    return root_dir
+
+
+def _gui_dialog(root_dir: str):
+    """Возвращает (files, params, out_base) или None, если окно закрыто."""
+    import tkinter as tk
+    from tkinter import ttk, filedialog, messagebox
+
+    d = _default_params()
+    result = {}
+    files: list[str] = []
+    last_dir = {"path": _initial_dir(root_dir)}
+
+    win = tk.Tk()
+    win.title("07 — Генерализация классифицированной карты")
+    win.minsize(700, 0)
+    win.attributes("-topmost", True)          # в Jupyter окно иначе бывает позади
+    win.after(500, lambda: win.attributes("-topmost", False))
+    pad = {"padx": 8, "pady": 4}
+
+    # --- файлы ---
+    fr_f = ttk.LabelFrame(win, text="Входные растры (*_cat.tif из 04_FINAL)")
+    fr_f.pack(fill="both", expand=True, **pad)
+    fr_lb = ttk.Frame(fr_f)
+    fr_lb.pack(fill="both", expand=True, padx=6, pady=6)
+    lb = tk.Listbox(fr_lb, selectmode="extended", height=7, width=95)
+    sb = ttk.Scrollbar(fr_lb, orient="vertical", command=lb.yview)
+    lb.configure(yscrollcommand=sb.set)
+    lb.pack(side="left", fill="both", expand=True)
+    sb.pack(side="right", fill="y")
+
+    def add_files():
+        paths = filedialog.askopenfilenames(
+            parent=win, title="Выберите классифицированные растры",
+            initialdir=last_dir["path"],
+            filetypes=[("Классифицированные растры", "*_cat.tif"),
+                       ("GeoTIFF", "*.tif *.tiff"), ("Все файлы", "*.*")])
+        for p in paths:
+            p = os.path.normpath(p)
+            if p not in files:
+                files.append(p)
+                lb.insert("end", p)
+        if paths:
+            last_dir["path"] = os.path.dirname(paths[0])
+
+    def remove_sel():
+        for i in reversed(lb.curselection()):
+            lb.delete(i)
+            files.pop(i)
+
+    def clear_all():
+        lb.delete(0, "end")
+        files.clear()
+
+    fr_b = ttk.Frame(fr_f)
+    fr_b.pack(fill="x", padx=6, pady=(0, 6))
+    ttk.Button(fr_b, text="Добавить файлы…", command=add_files).pack(side="left")
+    ttk.Button(fr_b, text="Удалить выбранные", command=remove_sel).pack(side="left", padx=6)
+    ttk.Button(fr_b, text="Очистить", command=clear_all).pack(side="left")
+
+    # --- параметры ---
+    v = {
+        "min_size": tk.StringVar(value=str(d["min_size"])),
+        "connectivity": tk.IntVar(value=d["connectivity"]),
+        "smooth": tk.StringVar(value=str(d["smooth"])),
+        "simplify": tk.StringVar(value=str(d["simplify"])),
+        "edge_mode": tk.StringVar(value=d["edge_mode"]),
+        "repair": tk.BooleanVar(value=d["repair"]),
+        "tile": tk.StringVar(value=str(d["tile"])),
+        "margin": tk.StringVar(value=str(d["margin"])),
+        "workers": tk.StringVar(value=str(d["workers"])),
+        "output_mode": tk.StringVar(value=d["output_mode"]),
+        "save_raster": tk.BooleanVar(value=d["save_raster"]),
+    }
+
+    def radio(parent, var, opts):
+        f = ttk.Frame(parent)
+        for txt, val in opts:
+            ttk.Radiobutton(f, text=txt, variable=var, value=val).pack(side="left", padx=(0, 10))
+        return f
+
+    fr_s = ttk.LabelFrame(win, text="Sieve")
+    fr_s.pack(fill="x", **pad)
+    ttk.Label(fr_s, text="Мин. размер группы, пикс. (0/1 — без sieve)").grid(row=0, column=0, sticky="w", padx=6, pady=3)
+    ttk.Spinbox(fr_s, from_=0, to=100000, textvariable=v["min_size"], width=10).grid(row=0, column=1, sticky="w", padx=6)
+    ttk.Label(fr_s, text="Соседство").grid(row=1, column=0, sticky="w", padx=6, pady=3)
+    radio(fr_s, v["connectivity"], [("4", 4), ("8", 8)]).grid(row=1, column=1, sticky="w", padx=6)
+
+    fr_v = ttk.LabelFrame(win, text="Векторизация")
+    fr_v.pack(fill="x", **pad)
+    rows = [
+        ("Сглаживание Чайкина, итераций (0 — выкл, обычно 1-2)",
+         lambda p: ttk.Spinbox(p, from_=0, to=10, textvariable=v["smooth"], width=10)),
+        ("Упрощение Douglas-Peucker, ед. CRS (0 — выкл)",
+         lambda p: ttk.Entry(p, textvariable=v["simplify"], width=12)),
+        ("Поведение на краю растра",
+         lambda p: ttk.Combobox(p, textvariable=v["edge_mode"], values=["full", "shrink"],
+                                state="readonly", width=10)),
+        ("Сборка: patch — контуры, class — мультиполигон на класс, raw — без слияния",
+         lambda p: ttk.Combobox(p, textvariable=v["output_mode"],
+                                values=["patch", "class", "raw"], state="readonly", width=10)),
+        ("Тайл, пикс. (с repair не выше 256-384)",
+         lambda p: ttk.Spinbox(p, from_=64, to=4096, increment=64, textvariable=v["tile"], width=10)),
+        ("Запас вокруг тайла, пикс. (>= 8 при сглаживании)",
+         lambda p: ttk.Spinbox(p, from_=0, to=256, textvariable=v["margin"], width=10)),
+        ("Процессов" + (" (в Jupyter надёжно только 1)" if _in_notebook() else ""),
+         lambda p: ttk.Spinbox(p, from_=1, to=64, textvariable=v["workers"], width=10)),
+    ]
+    for r, (label, make) in enumerate(rows):
+        ttk.Label(fr_v, text=label).grid(row=r, column=0, sticky="w", padx=6, pady=3)
+        make(fr_v).grid(row=r, column=1, sticky="w", padx=6, pady=3)
+    ttk.Checkbutton(fr_v, text="Убирать зазоры между полигонами (repair; дольше)",
+                    variable=v["repair"]).grid(row=len(rows), column=0, columnspan=2,
+                                               sticky="w", padx=6, pady=3)
+
+    # --- вывод ---
+    fr_o = ttk.LabelFrame(win, text="Результаты")
+    fr_o.pack(fill="x", **pad)
+    v_out = tk.StringVar(value=os.path.join(root_dir, OUT_BASE_NAME))
+    ttk.Entry(fr_o, textvariable=v_out).grid(row=0, column=0, sticky="we", padx=6, pady=6)
+
+    def choose_out():
+        p = filedialog.askdirectory(parent=win, title="Папка результатов",
+                                    initialdir=root_dir)
+        if p:
+            v_out.set(os.path.normpath(p))
+
+    ttk.Button(fr_o, text="Обзор…", command=choose_out).grid(row=0, column=1, padx=6)
+    ttk.Checkbutton(fr_o, text="Сохранить также очищенный растр (*_cat.tif)",
+                    variable=v["save_raster"]).grid(row=1, column=0, columnspan=2,
+                                                    sticky="w", padx=6, pady=(0, 6))
+    fr_o.columnconfigure(0, weight=1)
+
+    def on_run():
+        if not files:
+            messagebox.showwarning("Нет файлов", "Добавьте хотя бы один растр.", parent=win)
+            return
+        try:
+            params = {
+                "min_size": int(v["min_size"].get()),
+                "connectivity": int(v["connectivity"].get()),
+                "smooth": int(v["smooth"].get()),
+                "simplify": max(float(v["simplify"].get().replace(",", ".")), 0.0),
+                "edge_mode": v["edge_mode"].get(),
+                "repair": bool(v["repair"].get()),
+                "tile": int(v["tile"].get()),
+                "margin": int(v["margin"].get()),
+                "workers": max(int(v["workers"].get()), 1),
+                "output_mode": v["output_mode"].get(),
+                "save_raster": bool(v["save_raster"].get()),
+            }
+        except (ValueError, tk.TclError):
+            messagebox.showerror("Ошибка", "Проверьте числовые параметры.", parent=win)
+            return
+        result.update(files=list(files), params=params,
+                      out_base=v_out.get().strip() or os.path.join(root_dir, OUT_BASE_NAME))
+        win.destroy()
+
+    fr_r = ttk.Frame(win)
+    fr_r.pack(fill="x", **pad)
+    ttk.Label(fr_r, text="Ход обработки выводится в консоль.").pack(side="left")
+    ttk.Button(fr_r, text="Закрыть", command=win.destroy).pack(side="right")
+    ttk.Button(fr_r, text="Запустить", command=on_run).pack(side="right", padx=6)
+
+    win.mainloop()
+    if not result:
+        return None
+    return result["files"], result["params"], result["out_base"]
+
+
+# ===========================================================================
+# КОНСОЛЬНЫЙ РЕЖИМ (нет tkinter или дисплея)
+# ===========================================================================
+
+def _console_dialog(root_dir: str):
+    src_folder, _ = _select_prev_subdir(os.path.join(root_dir, FINAL_BASE_NAME))
+    files = [_select_cat_raster(src_folder)]
+    d = _default_params()
+    p = dict(d)
+    p["min_size"] = _prompt_int("min_size (0/1 = без sieve)", d["min_size"])
+    p["connectivity"] = _prompt_int("connectivity (4 или 8)", d["connectivity"])
+    p["smooth"] = _prompt_int("smooth (итераций Чайкина)", d["smooth"])
+    p["simplify"] = _prompt_float("simplify (Douglas-Peucker, 0 = выкл)", d["simplify"])
+    p["repair"] = _prompt_yes("repair (без зазоров; дольше)", d["repair"])
+    p["workers"] = _prompt_int("workers (процессов)", d["workers"])
+    p["save_raster"] = _prompt_yes("сохранить очищенный растр", False)
+    return files, p, os.path.join(root_dir, OUT_BASE_NAME)
+
+
+def _run_interactive():
+    root_dir = os.getcwd()
+    line = "=" * 60
+    print(f"\n{line}\n  07 - ГЕНЕРАЛИЗАЦИЯ (sieve + marching squares)\n{line}", flush=True)
+    print(f"Рабочая папка: {root_dir}", flush=True)
+    try:
+        choice = _gui_dialog(root_dir)
+        if choice is None:
+            print("Окно закрыто без запуска.", flush=True)
+            return
+    except Exception as e:  # нет tkinter / дисплея
+        print(f"Графический интерфейс недоступен ({e}). Консольный режим.", flush=True)
+        choice = _console_dialog(root_dir)
+
+    files, params, out_base = choice
+    print(f"\nФайлов: {len(files)}", flush=True)
+    for key, val in params.items():
+        print(f"  {key:12s}= {val}", flush=True)
+    print(f"Папка результатов: {out_base}", flush=True)
+    generalize_files(files, params, out_base)
+
+
+# ===========================================================================
+# MAIN
+# ===========================================================================
 
 def main(argv=None):
     if argv is None:
         argv = sys.argv[1:]
-    # запуск без аргументов (кнопка Run, %run в Jupyter) —
-    # интерактивный режим вместо ошибки argparse
+    # запуск без аргументов (кнопка Run, %run в Jupyter) — окно
     if not argv:
-        _run_pipeline_mode()
+        _run_interactive()
         return
 
     p = argparse.ArgumentParser(
-        description="Быстрый sieve + тайловая векторизация marching squares")
+        description="Генерализация: быстрый sieve + тайловая векторизация marching squares")
     p.add_argument("input")
     p.add_argument("--min-size", type=int, default=3)
     p.add_argument("--connectivity", type=int, choices=[4, 8], default=8)
@@ -1097,14 +1281,11 @@ def main(argv=None):
     p.add_argument("--no-repair", action="store_true",
                    help="не приводить к разбиению без зазоров внутри тайла")
     p.add_argument("--tile", type=int, default=256,
-                   help="сторона тайла в пикселях. ВАЖНО: с --repair стоимость "
-                        "растёт резко нелинейно (256 px ~ 4 c, 512 px ~ 46 c), "
-                        "поэтому мелкие тайлы считаются в разы быстрее")
+                   help="сторона тайла в пикселях; с repair 256 px ~ 4 c, 512 px ~ 46 c")
     p.add_argument("--margin", type=int, default=16,
                    help="запас вокруг тайла в пикселях (>= 8 при smooth > 0)")
     p.add_argument("--workers", type=int, default=1)
-    p.add_argument("--output-mode", choices=["patch", "class", "raw"],
-                   default="patch")
+    p.add_argument("--output-mode", choices=["patch", "class", "raw"], default="patch")
     p.add_argument("--layer", default="classes")
     p.add_argument("--skip-vector", action="store_true")
     p.add_argument("--resume", action="store_true",

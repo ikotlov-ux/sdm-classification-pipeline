@@ -24,7 +24,7 @@ common/00_Prepare_Layers.py   →   Composite_filtered.tif + predictor_names.pkl
       05_classwise_importance.py per-class permutation importance + GAM-отклики
                                           │
                                           ▼
-      06_sieve_marching_squares.py sieve + сглаженный векторный слой
+      07_generalization.py       генерализация: sieve + сглаженный вектор
 ```
 
 ## Скрипты
@@ -44,8 +44,17 @@ common/00_Prepare_Layers.py   →   Composite_filtered.tif + predictor_names.pkl
 ### 05_classwise_importance.py
 Пермутационная важность **по классам** (что важно именно для класса `k`) и одномерные GAM-зависимости вероятности принадлежности к классу от значений признаков.
 
-### 06_sieve_marching_squares.py
-Читает `04_FINAL/*.tif`, применяет sieve (присоединение мелких групп к соседу с максимальной общей границей), строит сглаженный вектор тайлами. `resume` переиспользует готовые части, промежуточный формат — Parquet (с fallback на Pickle при отсутствии PyArrow). Палитра растра переносится в категории вектора (`QgsCategorizedSymbolRenderer` по полю `class_value`).
+### 07_generalization.py
+Генерализация классифицированной карты (номер 06 не используется). При запуске без аргументов (`%run 07_generalization.py` или `python 07_generalization.py`) открывается окно tkinter:
+
+- **«Добавить файлы…»** — Проводник с мультивыбором `*_cat.tif`; стартовая папка — самый свежий запуск в `04_FINAL`;
+- **Sieve** — минимальный размер группы (по умолчанию 5 пикс.) и соседство 4/8; мелкие группы присоединяются к преобладающему соседнему классу (векторизованный numpy, без цикла по компонентам);
+- **Векторизация** — marching squares тайлами (по умолчанию 256 px, запас 16 px): сглаживание Чайкина, упрощение Douglas-Peucker, разбиение без зазоров (`repair`), сборка `patch` / `class` / `raw`, число процессов;
+- **Результаты** — папка вывода и флажок «Сохранить также очищенный растр».
+
+По умолчанию сохраняется **только вектор** `07_GENERALIZATION/<ддммгг_ччмм>_vXXX/<base>_sieveN_cM_smK.gpkg` (слой `classes`: `class_value`, `class_name`, `area`) и `run_info.txt`. Очищенный растр нужен тайловой векторизации как промежуточный файл и удаляется после неё, если флажок не отмечен; промежуточные Parquet-тайлы тоже удаляются. Названия классов берутся из `*_stats.csv` рядом с растром (разделитель определяется автоматически).
+
+В JupyterLab по умолчанию 1 процесс: `multiprocessing` (spawn) там работает ненадёжно, многопоточный прогон лучше запускать из cmd/Anaconda Prompt. Без дисплея скрипт переходит в консольный режим; CLI сохранён (`--min-size`, `--connectivity`, `--out-raster`, `--out-vector`, `--smooth`, `--tile`, `--workers`, `--output-mode`, `--resume` и др.).
 
 ## Служебные поля (не предикторы)
 
@@ -64,6 +73,6 @@ polygon_id  n_pixels  class_name  ID  x  y
 | `samples.gpkg` (слой `sample_pixels`) | GeoPackage | 01 | 02, 03 |
 | `data_info.pkl` | pickle | 02/03 | 03, 04, 05 |
 | `final_models.pkl` | pickle | 03 | 04, 05 |
-| `04_FINAL/*.tif` | растр | 04 | 06 |
+| `04_FINAL/*_cat.tif` | растр | 04 | 07 |
 | `*.qgs`, `*.qml` | QGIS | 04 | — |
-| `vec.gpkg` | вектор | 06 | — |
+| `07_GENERALIZATION/*/*.gpkg` | вектор | 07 | — |

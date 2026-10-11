@@ -60,9 +60,9 @@
 ║    GAM-отклики P(class|x_j)            ║   ║    Response curves                     ║
 ║                       │                ║   ║                       │                ║
 ║                       ▼                ║   ║                       ▼                ║
-║  06_sieve_marching_squares.py          ║   ║  06s_model_dynamic.py                  ║
+║  07_generalization.py                  ║   ║  06s_model_dynamic.py                  ║
 ║    Sieve + сглаженный вектор           ║   ║    Разность, тренд, группы,           ║
-║    QgsCategorizedSymbolRenderer        ║   ║    матрица переходов между годами     ║
+║    окно выбора файлов (tkinter)        ║   ║    матрица переходов между годами     ║
 ║                                        ║   ║                                        ║
 ╚═══════════════════════════════════════╝   ╚═══════════════════════════════════════╝
 ```

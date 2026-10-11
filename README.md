@@ -21,7 +21,7 @@
         ┌───────────▼───────────┐   ┌─────────────▼──────────────┐
         │  classification/       │   │  sdm/                       │
         │  01 → 02 → 03 → 04    │   │  01s → 02s → 03s → 04s     │
-        │  → 05 → 06            │   │  → 05s → 06s                │
+        │  → 05 → 07            │   │  → 05s → 06s                │
         │                        │   │                             │
         │  Полигоны обучающих   │   │  Presence-only точки        │
         │  участков             │   │  + background с bias-grid   │
@@ -39,7 +39,7 @@
 sdm-classification-pipeline/
 ├── common/                 общая часть (шаг 00)
 │   └── 00_Prepare_Layers.py
-├── classification/         пайплайн классификации (шаги 01–06)
+├── classification/         пайплайн классификации (шаги 01–05, 07)
 ├── sdm/                    пайплайн SDM (шаги 01s–06s)
 ├── docs/                   схема развилки и заметки
 ├── requirements.txt
@@ -77,7 +77,7 @@ python classification/02_classification.py         # выбор предикто
 python classification/03_tune_models.py            # обучение RF / CatBoost / LightGBM / XGBoost / Ridge / LDA / QDA
 python classification/04_predict_map.py            # финальная растровая карта + QGIS-проект
 python classification/05_classwise_importance.py   # per-class permutation importance + GAM-отклики
-python classification/06_sieve_marching_squares.py # sieve + сглаженный вектор
+python classification/07_generalization.py        # генерализация: sieve + сглаженный вектор (окно выбора файлов)
 ```
 
 **Метрики оценки:** OA, каппа Коэна, TSS, F1-macro. Пространственная блочная кросс-валидация (K-Means по координатам).
