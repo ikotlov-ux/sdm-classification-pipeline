@@ -48,9 +48,11 @@
 Заголовки строк и столбцов закреплены.
 
 Выход: 09_MATRIX_LEGEND/<ддммгг_ччмм><_vXXX источника>/<слой>_legend.xlsx
-    лист «Матрица»   — раскрашенная матрица, в ячейках HEX
-    лист «Классы»    — все сочетания из слоя: код, значения, названия, HEX, RGB,
-                       число объектов
+    лист «Матрица»   — раскрашенная матрица; в ячейке через горизонтальную черту:
+                       число полигонов (сверху) и суммарная площадь (снизу);
+                       подписи строк и столбцов — названия классов из CSV
+    лист «Классы»    — все сочетания из слоя: код, значения, названия, цвет HEX, RGB,
+                       число полигонов, площадь
     лист «Цвета»     — базовые цвета и градиенты категорий цветовой оси
     лист «Параметры» — исходные данные и настройки (по ним раскраску можно
                        загрузить обратно кнопкой «Загрузить раскраску»)
@@ -122,6 +124,12 @@ PALETTES = {
         "#762a83", "#c51b7d", "#8c510a", "#35978f", "#b2182b", "#7f3b08"],
 }
 DEFAULT_PALETTE = "Контрастная качественная"
+
+AREA_FIELD = "__area_m2"
+AREA_UNITS = {"га": 1e4, "км²": 1e6, "м²": 1.0}
+AREA_FMT = {"га": "#,##0.00", "км²": "#,##0.000", "м²": "#,##0"}
+LABEL_MODES = [("name", "Название"), ("num_name", "Номер — название"), ("num", "Номер")]
+CELL_TEXT = [("count_area", "Число / площадь"), ("none", "Без подписи")]
 
 
 def log(msg=""):
@@ -250,14 +258,34 @@ def list_layers(path):
 
 
 def read_attrs(path, layer=None):
+    """Атрибуты слоя + площадь каждого объекта в м² (колонка __area_m2).
+    Географическая СК → площадь считается в UTM-зоне по центру данных."""
     import geopandas as gpd
-    kw = {"ignore_geometry": True}
-    if layer and len(list_layers(path)) > 1:
+    import pandas as pd
+    kw = {}
+    if layer and (len(list_layers(path)) > 1 or path.lower().endswith((".gpkg", ".sqlite", ".gdb"))):
         kw["layer"] = layer
-    elif layer and path.lower().endswith((".gpkg", ".sqlite", ".gdb")):
-        kw["layer"] = layer
-    df = gpd.read_file(path, **kw)
-    return df.drop(columns=[c for c in df.columns if c == "geometry"], errors="ignore")
+    gdf = gpd.read_file(path, **kw)
+    note = ""
+    if "geometry" in gdf.columns and gdf.geometry.notna().any():
+        g = gdf.geometry
+        if gdf.crs is None:
+            note = "СК слоя не задана — площадь в единицах координат слоя."
+        elif gdf.crs.is_geographic:
+            try:
+                g = gdf.to_crs(gdf.estimate_utm_crs()).geometry
+                note = "СК географическая — площадь рассчитана в UTM."
+            except Exception:
+                g = gdf.to_crs(6933).geometry
+                note = "СК географическая — площадь рассчитана в EPSG:6933."
+        area = g.area.fillna(0.0).values
+    else:
+        area = [0.0] * len(gdf)
+        note = "В слое нет геометрии — площадь не рассчитана."
+    df = pd.DataFrame(gdf.drop(columns=["geometry"], errors="ignore"))
+    df[AREA_FIELD] = area
+    df.attrs["area_note"] = note
+    return df
 
 
 # ===========================================================================
@@ -272,6 +300,9 @@ class MatrixModel:
         self.h_names, self.v_names = {}, {}
         self.h_title, self.v_title = "по горизонтали", "по вертикали"
         self.counts = {}        # (hk, vk) -> число объектов
+        self.areas = {}         # (hk, vk) -> площадь, м²
+        self.label_mode = "name"
+        self.area_unit = "га"
         self.codes = {}         # (hk, vk) -> исходные коды (одно поле)
         self.skipped = {}       # нераспознанные значения -> число
         self.source = {}
@@ -289,30 +320,36 @@ class MatrixModel:
         """cfg: mode two|one; h_field, v_field | field, method, k, sep, first_axis."""
         m = cls()
         m.source = dict(cfg)
+        if AREA_FIELD not in df.columns:
+            df = df.assign(**{AREA_FIELD: 0.0})
         if cfg["mode"] == "two":
             hf, vf = cfg["h_field"], cfg["v_field"]
             m.h_title, m.v_title = hf, vf
-            for (hv, vv), n in df.groupby([hf, vf], dropna=False).size().items():
+            agg = df.groupby([hf, vf], dropna=False)[AREA_FIELD].agg(["size", "sum"])
+            for (hv, vv), (n, a) in agg.iterrows():
                 hk, vk = norm_key(hv), norm_key(vv)
                 if hk is None or vk is None:
                     m.skipped[f"{hv} | {vv}"] = m.skipped.get(f"{hv} | {vv}", 0) + int(n)
                     continue
                 m.counts[(hk, vk)] = m.counts.get((hk, vk), 0) + int(n)
+                m.areas[(hk, vk)] = m.areas.get((hk, vk), 0.0) + float(a)
         else:
             f = cfg["field"]
             m.h_title = m.v_title = f
             first_v = cfg.get("first_axis", "v") == "v"
             m.v_title = f"{f}: {'1-я' if first_v else '2-я'} часть"
             m.h_title = f"{f}: {'2-я' if first_v else '1-я'} часть"
-            for val, n in df[f].value_counts(dropna=False).items():
+            agg = df.groupby(f, dropna=False)[AREA_FIELD].agg(["size", "sum"])
+            for val, (n, area_m2) in agg.iterrows():
                 pr = parse_code(val, cfg["method"], int(cfg.get("k", 1)), cfg.get("sep", "_"))
                 if pr is None:
                     kk = str(val)
                     m.skipped[kk] = m.skipped.get(kk, 0) + int(n)
                     continue
-                a, b = pr
-                vk, hk = (a, b) if first_v else (b, a)
+                p1, p2 = pr
+                vk, hk = (p1, p2) if first_v else (p2, p1)
                 m.counts[(hk, vk)] = m.counts.get((hk, vk), 0) + int(n)
+                m.areas[(hk, vk)] = m.areas.get((hk, vk), 0.0) + float(area_m2)
                 m.codes.setdefault((hk, vk), set()).add(raw_code(val))
         m.h_keys = sort_keys({h for h, _ in m.counts})
         m.v_keys = sort_keys({v for _, v in m.counts})
@@ -342,8 +379,17 @@ class MatrixModel:
         return names.get(key, "")
 
     def label(self, side, key):
+        """Подпись строки/столбца: название (по умолчанию; номер, если названия нет),
+        «номер — название» или номер."""
         n = self.name(side, key)
-        return f"{key} — {n}" if n else str(key)
+        if self.label_mode == "num" or not n:
+            return str(key)
+        if self.label_mode == "num_name":
+            return f"{key} — {n}"
+        return n
+
+    def area(self, hk, vk):
+        return self.areas.get((hk, vk), 0.0) / AREA_UNITS[self.area_unit]
 
     def set_hue_side(self, side):
         if side != self.hue_side:
@@ -381,7 +427,8 @@ class MatrixModel:
         return {"hue_side": self.hue_side, "base": self.base, "tone": self.tone,
                 "override": self.override, "palette": self.palette,
                 "manual": [[h, v, c] for (h, v), c in self.manual.items()],
-                "hide_absent": self.hide_absent}
+                "hide_absent": self.hide_absent, "label_mode": self.label_mode,
+                "area_unit": self.area_unit}
 
     def load_state(self, st):
         """Применить сохранённую раскраску; категории, которых нет, пропускаются."""
@@ -397,6 +444,10 @@ class MatrixModel:
         self.manual = {(h, v): norm_hex(c) for h, v, c in st.get("manual", [])
                        if h in hs and v in vs and is_hex(c)}
         self.hide_absent = bool(st.get("hide_absent", self.hide_absent))
+        if st.get("label_mode") in dict(LABEL_MODES):
+            self.label_mode = st["label_mode"]
+        if st.get("area_unit") in AREA_UNITS:
+            self.area_unit = st["area_unit"]
 
 
 # ===========================================================================
@@ -522,41 +573,67 @@ def save_xlsx(m, path):
     def fill(h):
         return PatternFill("solid", fgColor=h.lstrip("#").upper())
 
-    # ---------- Матрица ----------
+    def headers(ws, rows_per):
+        """Заголовки: строка 1 — столбцы, колонка A — строки (rows_per строк Excel на строку матрицы)."""
+        note = f"\nВ ячейке: число полигонов / площадь, {m.area_unit}"
+        ws.cell(1, 1, f"Строки: {m.v_title}\nСтолбцы: {m.h_title}{note}").font = bold
+        ws.cell(1, 1).alignment = Alignment(wrap_text=True, vertical="bottom")
+        for j, hk in enumerate(m.h_keys):
+            c = ws.cell(1, j + 2, m.label("h", hk))
+            c.alignment = Alignment(text_rotation=90, wrap_text=True, horizontal="center", vertical="bottom")
+            c.font = bold
+            c.border = border
+            if m.hue_side == "h":
+                c.fill = fill(m.base[hk])
+                c.font = Font(bold=True, color=text_color(m.base[hk]).lstrip("#").upper())
+            ws.column_dimensions[get_column_letter(j + 2)].width = 11
+        for i, vk in enumerate(m.v_keys):
+            r0 = 2 + i * rows_per
+            if rows_per > 1:
+                ws.merge_cells(start_row=r0, start_column=1, end_row=r0 + rows_per - 1, end_column=1)
+            c = ws.cell(r0, 1, m.label("v", vk))
+            c.font = bold
+            c.alignment = Alignment(wrap_text=True, vertical="center")
+            for k in range(rows_per):
+                ws.cell(r0 + k, 1).border = border
+                if m.hue_side == "v":
+                    ws.cell(r0 + k, 1).fill = fill(m.base[vk])
+            if m.hue_side == "v":
+                c.font = Font(bold=True, color=text_color(m.base[vk]).lstrip("#").upper())
+        ws.column_dimensions["A"].width = 42
+        ws.row_dimensions[1].height = 150
+        ws.freeze_panes = "B2"
+
+    # ---------- Матрица: число полигонов / площадь ----------
     ws = wb.active
     ws.title = "Матрица"
-    ws.cell(1, 1, f"{m.v_title} (строки) \\ {m.h_title} (столбцы)").font = bold
-    ws.cell(1, 1).alignment = Alignment(wrap_text=True, vertical="bottom")
-    for j, hk in enumerate(m.h_keys):
-        c = ws.cell(1, j + 2, m.label("h", hk))
-        c.alignment = Alignment(text_rotation=90, wrap_text=True, horizontal="center", vertical="bottom")
-        c.font = bold
-        c.border = border
-        if m.hue_side == "h":
-            c.fill = fill(m.base[hk])
-            c.font = Font(bold=True, color=text_color(m.base[hk]).lstrip("#").upper())
-        ws.column_dimensions[get_column_letter(j + 2)].width = 11
+    headers(ws, 2)
+    afmt = AREA_FMT[m.area_unit]
     for i, vk in enumerate(m.v_keys):
-        c = ws.cell(i + 2, 1, m.label("v", vk))
-        c.font = bold
-        c.border = border
-        c.alignment = Alignment(wrap_text=True, vertical="center")
-        if m.hue_side == "v":
-            c.fill = fill(m.base[vk])
-            c.font = Font(bold=True, color=text_color(m.base[vk]).lstrip("#").upper())
+        r0 = 2 + i * 2
+        ws.row_dimensions[r0].height = 15
+        ws.row_dimensions[r0 + 1].height = 15
         for j, hk in enumerate(m.h_keys):
-            cell = ws.cell(i + 2, j + 2)
-            cell.border = border
-            cell.alignment = Alignment(horizontal="center", vertical="center")
+            top, bot = ws.cell(r0, j + 2), ws.cell(r0 + 1, j + 2)
+            top.alignment = Alignment(horizontal="center", vertical="bottom")
+            bot.alignment = Alignment(horizontal="center", vertical="top")
             if m.hide_absent and not m.present(hk, vk):
+                top.border = Border(left=thin, right=thin, top=thin)
+                bot.border = Border(left=thin, right=thin, bottom=thin)
                 continue
             h = m.color(hk, vk)
-            cell.value = h.upper()
-            cell.fill = fill(h)
-            cell.font = Font(size=9, color=text_color(h).lstrip("#").upper())
-    ws.column_dimensions["A"].width = 42
-    ws.row_dimensions[1].height = 150
-    ws.freeze_panes = "B2"
+            tc = text_color(h).lstrip("#").upper()
+            line = Side(style="thin", color=tc)          # горизонтальная черта между числом и площадью
+            top.border = Border(left=thin, right=thin, top=thin, bottom=line)
+            bot.border = Border(left=thin, right=thin, bottom=thin, top=line)
+            for c in (top, bot):
+                c.fill = fill(h)
+                c.font = Font(size=9, color=tc)
+            if m.present(hk, vk):
+                top.value = m.counts[(hk, vk)]
+                top.number_format = "0"
+                bot.value = round(m.area(hk, vk), 6)
+                bot.number_format = afmt
 
     # ---------- Классы ----------
     wc = wb.create_sheet("Классы")
@@ -564,7 +641,7 @@ def save_xlsx(m, path):
     head = (["Код"] if one else []) + [
         f"Горизонталь ({m.h_title})", "Название (горизонталь)",
         f"Вертикаль ({m.v_title})", "Название (вертикаль)",
-        "HEX", "R", "G", "B", "Объектов", "Ручная правка"]
+        "HEX", "R", "G", "B", "Объектов", f"Площадь, {m.area_unit}", "Ручная правка"]
     for j, t in enumerate(head):
         c = wc.cell(1, j + 1, t)
         c.font = bold
@@ -577,14 +654,16 @@ def save_xlsx(m, path):
             rgb = [int(round(x * 255)) for x in hex2rgb(h)]
             row = ([", ".join(sorted(m.codes.get((hk, vk), [])))] if one else []) + [
                 _num(hk), m.name("h", hk), _num(vk), m.name("v", vk),
-                h.upper(), *rgb, m.counts[(hk, vk)], "да" if (hk, vk) in m.manual else ""]
+                h.upper(), *rgb, m.counts[(hk, vk)], round(m.area(hk, vk), 6),
+                "да" if (hk, vk) in m.manual else ""]
             for j, v in enumerate(row):
                 wc.cell(r, j + 1, v)
+            wc.cell(r, head.index(f"Площадь, {m.area_unit}") + 1).number_format = afmt
             hc = wc.cell(r, head.index("HEX") + 1)
             hc.fill = fill(h)
             hc.font = Font(color=text_color(h).lstrip("#").upper())
             r += 1
-    for j, w in enumerate([10] * (1 if one else 0) + [14, 34, 14, 34, 10, 6, 6, 6, 10, 13]):
+    for j, w in enumerate([10] * (1 if one else 0) + [14, 34, 14, 34, 10, 6, 6, 6, 10, 14, 13]):
         wc.column_dimensions[get_column_letter(j + 1)].width = w
     wc.freeze_panes = "A2"
 
@@ -631,6 +710,9 @@ def save_xlsx(m, path):
         ("Размер матрицы", f"{len(m.v_keys)} × {len(m.h_keys)}"),
         ("Нераспознанных значений", sum(m.skipped.values())),
         ("Ручных правок ячеек", len(m.manual)),
+        ("Подписи строк и столбцов", dict(LABEL_MODES)[m.label_mode]),
+        ("Единицы площади", m.area_unit),
+        ("Площадь", m.source.get("area_note", "") or "по геометрии в СК слоя"),
         ("state_json", json.dumps(m.state(), ensure_ascii=False)),
     ]
     for i, (k, v) in enumerate(pars):
@@ -723,7 +805,7 @@ class ScrollFrame:
 
 
 class App:
-    CELL_W, CELL_H = 74, 30      # размер ячейки при масштабе 1
+    CELL_W, CELL_H = 80, 40      # размер ячейки при масштабе 1
     RH, CH = 230, 150            # ширина заголовков строк / высота заголовков столбцов (px)
 
     def __init__(self, root_dir):
@@ -834,6 +916,18 @@ class App:
             ttk.Button(f3, text="Обзор…", width=7,
                        command=lambda v=var: self.browse_csv(v)).grid(row=r, column=2, **pad)
             ttk.Button(f3, text="×", width=2, command=lambda v=var: v.set("")).grid(row=r, column=3, **pad)
+        ttk.Label(f3, text="Подписи осей").grid(row=2, column=0, sticky="w", **pad)
+        self.v_lab = tk.StringVar(value=LABEL_MODES[0][1])
+        cbl = ttk.Combobox(f3, textvariable=self.v_lab, state="readonly", width=20,
+                           values=[t for _, t in LABEL_MODES])
+        cbl.grid(row=2, column=1, sticky="w", **pad)
+        cbl.bind("<<ComboboxSelected>>", lambda e: self._labels_changed())
+        ttk.Label(f3, text="Площадь в").grid(row=3, column=0, sticky="w", **pad)
+        self.v_unit = tk.StringVar(value="га")
+        cbu = ttk.Combobox(f3, textvariable=self.v_unit, state="readonly", width=8,
+                           values=list(AREA_UNITS))
+        cbu.grid(row=3, column=1, sticky="w", **pad)
+        cbu.bind("<<ComboboxSelected>>", lambda e: self._labels_changed())
         f3.columnconfigure(1, weight=1)
         ttk.Button(p, text="Построить матрицу", command=self.build).pack(fill="x", padx=12, pady=6)
 
@@ -921,8 +1015,14 @@ class App:
         ttk.Button(bar, text="Масштаб 1:1", command=self.zoom_1).pack(side="left", padx=4)
         ttk.Button(bar, text="+", width=3, command=lambda: self.zoom_center(1.25)).pack(side="left")
         ttk.Button(bar, text="−", width=3, command=lambda: self.zoom_center(0.8)).pack(side="left", padx=4)
+        ttk.Label(bar, text="В ячейках:").pack(side="left", padx=(12, 2))
+        self.v_celltxt = tk.StringVar(value=CELL_TEXT[0][1])
+        cbc = ttk.Combobox(bar, textvariable=self.v_celltxt, state="readonly", width=15,
+                           values=[t for _, t in CELL_TEXT])
+        cbc.pack(side="left")
+        cbc.bind("<<ComboboxSelected>>", lambda e: self.redraw())
         ttk.Label(bar, foreground="#555555",
-                  text="ЛКМ — цвет ячейки, ПКМ — меню, перетаскивание — сдвиг, колесо — масштаб").pack(
+                  text="ЛКМ — цвет, ПКМ — меню, перетаскивание — сдвиг, колесо — масштаб").pack(
             side="left", padx=10)
         self.cv = c = tk.Canvas(p, background="#f4f4f4", highlightthickness=0)
         c.pack(fill="both", expand=True)
@@ -990,7 +1090,9 @@ class App:
         i0 = max(0, math.floor((-self.oy) / ch))
         i1 = min(ni, math.ceil((H - self.CH - self.oy) / ch))
         fsz = int(max(6, min(13, 8.5 * self.z)))
-        show_txt = ch >= 15 and cw >= 44
+        mode_txt = next(k for k, t in CELL_TEXT if t == self.v_celltxt.get())
+        show_txt = ch >= 14 and cw >= 40 and mode_txt != "none"
+        two_lines = mode_txt == "count_area" and ch >= 28
         outline = "#9a9a9a" if cw > 8 else ""
         for i in range(i0, i1):
             vk = m.v_keys[i]
@@ -1010,8 +1112,19 @@ class App:
                     c.create_polygon(x + cw - s, y, x + cw, y, x + cw, y + s,
                                      fill=text_color(col), outline="")
                 if show_txt:
-                    c.create_text(x + cw / 2, y + ch / 2, text=col.upper(), fill=text_color(col),
-                                  font=("TkDefaultFont", fsz))
+                    tcol = text_color(col)
+                    if m.present(hk, vk):
+                        n_txt = str(m.counts[(hk, vk)])
+                        a_txt = _fmt_area(m.area(hk, vk), m.area_unit)
+                        if two_lines:
+                            c.create_text(x + cw / 2, y + ch * 0.29, text=n_txt, fill=tcol,
+                                          font=("TkDefaultFont", fsz))
+                            c.create_line(x + cw * 0.18, y + ch / 2, x + cw * 0.82, y + ch / 2, fill=tcol)
+                            c.create_text(x + cw / 2, y + ch * 0.71, text=a_txt, fill=tcol,
+                                          font=("TkDefaultFont", fsz))
+                        else:
+                            c.create_text(x + cw / 2, y + ch / 2, text=n_txt, fill=tcol,
+                                          font=("TkDefaultFont", fsz))
         # закреплённые заголовки
         hfs = int(max(7, min(11, 9 * self.z)))
         c.create_rectangle(0, 0, W, self.CH, fill="#e8e8e8", outline="")
@@ -1197,7 +1310,7 @@ class App:
         except Exception as ex:
             messagebox.showerror("Ошибка чтения", str(ex), parent=self.win)
             return
-        cols = [c for c in self.df.columns]
+        cols = [c for c in self.df.columns if c != AREA_FIELD]
         for cb in (self.cb_hf, self.cb_vf, self.cb_f):
             cb["values"] = cols
         # угадываем поля
@@ -1297,6 +1410,9 @@ class App:
         m.apply_palette(m.palette)
         m.tone.update(self._tone_from_ui())
         m.hide_absent = self.v_hide.get()
+        m.label_mode = next(k for k, t in LABEL_MODES if t == self.v_lab.get())
+        m.area_unit = self.v_unit.get()
+        m.source["area_note"] = self.df.attrs.get("area_note", "")
         if old is not None and old.h_keys == m.h_keys and old.v_keys == m.v_keys:
             m.load_state(old.state())      # перестроение тех же осей — сохраняем раскраску
         self.m = m
@@ -1344,6 +1460,13 @@ class App:
     def _apply_palette(self):
         if self.m:
             self.m.apply_palette(self.v_pal.get())
+            self._fill_cats()
+            self.redraw()
+
+    def _labels_changed(self):
+        if self.m:
+            self.m.label_mode = next(k for k, t in LABEL_MODES if t == self.v_lab.get())
+            self.m.area_unit = self.v_unit.get()
             self._fill_cats()
             self.redraw()
 
@@ -1494,6 +1617,8 @@ class App:
         self.v_seed.set(str(t["seed"]))
         self.v_pal.set(self.m.palette)
         self.v_hide.set(self.m.hide_absent)
+        self.v_lab.set(dict(LABEL_MODES)[self.m.label_mode])
+        self.v_unit.set(self.m.area_unit)
         self._fill_cats()
         self.redraw()
         self.status.set(f"Раскраска загружена из {os.path.basename(p)}.")
@@ -1522,6 +1647,16 @@ class App:
     def run(self):
         self.redraw()
         self.win.mainloop()
+
+
+def _fmt_area(v, unit):
+    if unit == "м²":
+        t = f"{v:,.0f}"
+    elif unit == "км²":
+        t = f"{v:,.3f}"
+    else:
+        t = f"{v:,.2f}"
+    return t.replace(",", " ").replace(".", ",") + " " + unit
 
 
 def _clip(s, n):
@@ -1567,6 +1702,9 @@ def main(argv=None):
     p.add_argument("--reverse", action="store_true")
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--show-absent", action="store_true", help="раскрашивать и отсутствующие сочетания")
+    p.add_argument("--labels", choices=[k for k, _ in LABEL_MODES], default="name",
+                   help="подписи строк/столбцов: name — название, num_name — номер — название, num — номер")
+    p.add_argument("--area-unit", choices=list(AREA_UNITS), default="га")
     p.add_argument("--out", default=None)
     a = p.parse_args(argv)
 
@@ -1588,6 +1726,10 @@ def main(argv=None):
     m.apply_palette(a.palette)
     m.tone.update(mode=a.tone, strength=a.strength, reverse=a.reverse, seed=a.seed)
     m.hide_absent = not a.show_absent
+    m.label_mode, m.area_unit = a.labels, a.area_unit
+    m.source["area_note"] = df.attrs.get("area_note", "")
+    if m.source["area_note"]:
+        log(m.source["area_note"])
     out = a.out or default_out_path(a.path, a.layer)
     save_xlsx(m, out)
     log(f"Матрица {len(m.v_keys)} × {len(m.h_keys)}, сочетаний: {len(m.counts)}, "
