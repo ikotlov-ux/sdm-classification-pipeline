@@ -11,7 +11,11 @@
 1. Пользователь выбирает слой П, поле класса (числовое или текстовое) и классы
    для замены (например, 300 — вода, 400 — болота).
 2. Каждому классу назначаются один или несколько слоёв ЦС (можно с фильтром
-   по атрибуту, например natural = water). Порядок строк задаёт приоритет,
+   по атрибуту, например natural = water). В одном диалоге «Добавить слой ЦС»
+   один источник распределяется сразу на несколько классов: значения фильтра
+   выбираются из списка (поиск, мультивыбор) и назначаются каждому классу
+   (water → 300, wetland → 400). Файл, слой и поле фильтра запоминаются;
+   двойной щелчок по строке таблицы — правка. Порядок строк задаёт приоритет,
    если объекты ЦС разных классов перекрываются: выше в списке — главнее.
 3. Для каждого класса K:
    3.1 Объекты K в П, пересекающиеся с ЦС(K), удаляются целиком; на их место
@@ -1003,35 +1007,124 @@ def _gui_dialog(root_dir):
             tv.insert("", "end", iid=str(i),
                       values=(_fmt(t["value"]), t["path"], t.get("layer") or "", flt))
 
-    def add_target():
+    def add_target(edit_index=None):
+        """Диалог слоя ЦС: один файл (или несколько) → несколько классов П,
+        у каждого класса свои значения фильтра."""
         if state["attrs"] is None:
             messagebox.showwarning("Нет слоя П", "Сначала выберите слой П и поле класса.", parent=win)
             return
+        edit = targets[edit_index] if edit_index is not None else None
+        last = state.get("last_ts", {})
+        labels = {k: lb_cls.get(i) for i, k in enumerate(cls_keys)}
         sel = selected_classes() or list(cls_keys)
-        dlg = tk.Toplevel(win)
-        dlg.title("Слой ЦС")
-        dlg.transient(win)
-        dlg.grab_set()
-        d_cls, d_path, d_lay = tk.StringVar(value=_fmt(sel[0]) if sel else ""), tk.StringVar(), tk.StringVar()
-        d_ff, d_fv = tk.StringVar(), tk.StringVar()
-        cache = {"df": None}
+        if edit is not None:
+            sel = [edit["value"]]
 
-        ttk.Label(dlg, text="Класс П (можно ввести новый)").grid(row=0, column=0, sticky="w", padx=8, pady=4)
-        ttk.Combobox(dlg, textvariable=d_cls, values=[_fmt(k) for k in sel], width=20).grid(
-            row=0, column=1, sticky="w", padx=8)
-        ttk.Label(dlg, text="Файлы ЦС").grid(row=1, column=0, sticky="w", padx=8, pady=4)
-        ttk.Entry(dlg, textvariable=d_path, width=60).grid(row=1, column=1, sticky="we", padx=8)
-        ttk.Label(dlg, text="Слой").grid(row=2, column=0, sticky="w", padx=8, pady=4)
-        cb_l = ttk.Combobox(dlg, textvariable=d_lay, state="readonly", width=40)
-        cb_l.grid(row=2, column=1, sticky="w", padx=8)
-        ttk.Label(dlg, text="Фильтр: поле (необязательно)").grid(row=3, column=0, sticky="w", padx=8, pady=4)
-        cb_ff = ttk.Combobox(dlg, textvariable=d_ff, width=30)
-        cb_ff.grid(row=3, column=1, sticky="w", padx=8)
-        ttk.Label(dlg, text="Фильтр: значения через запятую").grid(row=4, column=0, sticky="w", padx=8, pady=4)
-        ttk.Entry(dlg, textvariable=d_fv, width=40).grid(row=4, column=1, sticky="w", padx=8)
-        lb_hint = ttk.Label(dlg, text="", foreground="#555")
-        lb_hint.grid(row=5, column=0, columnspan=3, sticky="w", padx=8)
-        files = []
+        dlg = tk.Toplevel(win)
+        dlg.title("Слой ЦС" if edit is None else "Слой ЦС — правка")
+        dlg.transient(win)
+        dlg.geometry("820x640")
+        dlg.minsize(700, 520)
+
+        # кнопки — первыми и снизу, чтобы никогда не уходили за край окна
+        fr_b = ttk.Frame(dlg)
+        fr_b.pack(side="bottom", fill="x", padx=8, pady=8)
+        body = ttk.Frame(dlg)
+        body.pack(side="top", fill="both", expand=True)
+
+        files = list(edit["path"].split("; ")) if edit else list(last.get("files", []))
+        d_path = tk.StringVar(value="; ".join(files))
+        d_lay = tk.StringVar(value=(edit or {}).get("layer") or last.get("layer", ""))
+        d_ff = tk.StringVar(value=(edit or {}).get("ffield") or last.get("ffield", ""))
+        d_find = tk.StringVar()
+        cache = {"df": None, "vals": []}
+
+        fr_src = ttk.LabelFrame(body, text="Источник ЦС")
+        fr_src.pack(fill="x", padx=8, pady=4)
+        ttk.Label(fr_src, text="Файлы ЦС").grid(row=0, column=0, sticky="w", padx=6, pady=3)
+        ttk.Entry(fr_src, textvariable=d_path).grid(row=0, column=1, sticky="we", padx=6)
+        ttk.Label(fr_src, text="Слой").grid(row=1, column=0, sticky="w", padx=6, pady=3)
+        cb_l = ttk.Combobox(fr_src, textvariable=d_lay, state="readonly", width=40)
+        cb_l.grid(row=1, column=1, sticky="w", padx=6)
+        ttk.Label(fr_src, text="Поле фильтра").grid(row=2, column=0, sticky="w", padx=6, pady=3)
+        cb_ff = ttk.Combobox(fr_src, textvariable=d_ff, state="readonly", width=30)
+        cb_ff.grid(row=2, column=1, sticky="w", padx=6)
+        lb_info = ttk.Label(fr_src, text="", foreground="#555", wraplength=640, justify="left")
+        lb_info.grid(row=3, column=0, columnspan=3, sticky="w", padx=6, pady=(0, 4))
+        fr_src.columnconfigure(1, weight=1)
+
+        mid = ttk.Frame(body)
+        mid.pack(fill="both", expand=True, padx=8, pady=4)
+        mid.columnconfigure(0, weight=1)
+        mid.columnconfigure(2, weight=1)
+        mid.rowconfigure(0, weight=1)
+
+        # значения поля фильтра
+        fr_v = ttk.LabelFrame(mid, text="Значения фильтра (Ctrl/Shift — неск.)")
+        fr_v.grid(row=0, column=0, sticky="nsew")
+        fr_find = ttk.Frame(fr_v)
+        fr_find.pack(fill="x", padx=4, pady=3)
+        ttk.Label(fr_find, text="Поиск").pack(side="left")
+        ttk.Entry(fr_find, textvariable=d_find).pack(side="left", fill="x", expand=True, padx=4)
+        fr_lb = ttk.Frame(fr_v)
+        fr_lb.pack(fill="both", expand=True, padx=4, pady=(0, 4))
+        lb_v = tk.Listbox(fr_lb, selectmode="extended", exportselection=False, height=12)
+        sb_v = ttk.Scrollbar(fr_lb, orient="vertical", command=lb_v.yview)
+        lb_v.configure(yscrollcommand=sb_v.set)
+        lb_v.pack(side="left", fill="both", expand=True)
+        sb_v.pack(side="right", fill="y")
+        shown = []          # значения в порядке списка
+
+        # кнопки переноса
+        fr_mv = ttk.Frame(mid)
+        fr_mv.grid(row=0, column=1, sticky="ns", padx=6)
+
+        # классы П
+        fr_c = ttk.LabelFrame(mid, text="Классы П и их значения фильтра")
+        fr_c.grid(row=0, column=2, sticky="nsew")
+        tvc = ttk.Treeview(fr_c, columns=("cls", "vals"), show="headings", selectmode="extended", height=12)
+        tvc.heading("cls", text="Класс П")
+        tvc.heading("vals", text="Значения фильтра")
+        tvc.column("cls", width=170, anchor="w")
+        tvc.column("vals", width=170, anchor="w")
+        sb_c = ttk.Scrollbar(fr_c, orient="vertical", command=tvc.yview)
+        tvc.configure(yscrollcommand=sb_c.set)
+        tvc.pack(side="left", fill="both", expand=True, padx=(4, 0), pady=4)
+        sb_c.pack(side="right", fill="y", pady=4)
+        rows = {}           # iid -> {"key": значение класса, "vals": [..]}
+
+        def add_row(key, vals=None, label=None):
+            iid = f"r{len(rows)}"
+            rows[iid] = {"key": key, "vals": list(vals or [])}
+            tvc.insert("", "end", iid=iid, values=(label or labels.get(key, _fmt(key)),
+                                                   ", ".join(rows[iid]["vals"])))
+            return iid
+
+        for k in sel:
+            add_row(k, edit["fvalues"] if edit else None)
+
+        def fill_values(*_):
+            lb_v.delete(0, "end")
+            shown.clear()
+            q = d_find.get().strip().lower()
+            for v, n in cache["vals"]:
+                if q and q not in v.lower():
+                    continue
+                shown.append(v)
+                lb_v.insert("end", f"{v}   ({n})")
+                if len(shown) >= 5000:
+                    break
+
+        def load_values(*_):
+            df, ff = cache["df"], d_ff.get()
+            cache["vals"] = []
+            if df is not None and ff and ff in df.columns:
+                vc = df[ff].dropna().astype(str).str.strip().value_counts()
+                cache["vals"] = list(vc.items())
+                lb_info.config(text=f"Объектов в слое: {len(df)}; различных значений «{ff}»: {len(vc)}")
+            elif df is not None:
+                lb_info.config(text=f"Объектов в слое: {len(df)}. Без поля фильтра берётся весь слой.")
+            fill_values()
 
         def load_ts_fields(*_):
             if not files:
@@ -1039,17 +1132,13 @@ def _gui_dialog(root_dir):
             try:
                 df = read_layer(files[0], d_lay.get(), attrs_only=True)
             except Exception as e:
-                lb_hint.config(text=f"Ошибка чтения: {e}")
+                lb_info.config(text=f"Ошибка чтения: {e}")
                 return
             cache["df"] = df
             cb_ff["values"] = [""] + list(df.columns)
-            lb_hint.config(text=f"Объектов в слое: {len(df)}")
-
-        def show_values(*_):
-            df, ff = cache["df"], d_ff.get()
-            if df is not None and ff in df.columns:
-                vals = df[ff].dropna().astype(str).value_counts().head(15)
-                lb_hint.config(text="Частые значения: " + ", ".join(f"{k} ({n})" for k, n in vals.items()))
+            if d_ff.get() not in df.columns:
+                d_ff.set("")
+            load_values()
 
         def browse_ts():
             ps = filedialog.askopenfilenames(parent=dlg, title="Слои ЦС", initialdir=state["last_dir"],
@@ -1065,15 +1154,33 @@ def _gui_dialog(root_dir):
             d_lay.set(layers[0] if layers else "")
             load_ts_fields()
 
-        ttk.Button(dlg, text="Обзор…", command=browse_ts).grid(row=1, column=2, padx=8)
-        cb_l.bind("<<ComboboxSelected>>", load_ts_fields)
-        cb_ff.bind("<<ComboboxSelected>>", show_values)
-
-        def ok():
-            if not files or not d_cls.get().strip():
-                messagebox.showwarning("Не заполнено", "Укажите класс и файл ЦС.", parent=dlg)
+        def assign(mode):
+            iids = tvc.selection()
+            if not iids:
+                messagebox.showinfo("Классы", "Выделите строки классов справа.", parent=dlg)
                 return
-            txt = d_cls.get().strip()
+            vals = [shown[i] for i in lb_v.curselection()]
+            for iid in iids:
+                r = rows[iid]
+                if mode == "set":
+                    r["vals"] = vals
+                elif mode == "add":
+                    r["vals"] = r["vals"] + [v for v in vals if v not in r["vals"]]
+                else:
+                    r["vals"] = []
+                tvc.set(iid, "vals", ", ".join(r["vals"]))
+
+        ttk.Button(fr_mv, text="Назначить →", command=lambda: assign("set")).pack(pady=(40, 4), fill="x")
+        ttk.Button(fr_mv, text="Добавить →", command=lambda: assign("add")).pack(pady=4, fill="x")
+        ttk.Button(fr_mv, text="Очистить", command=lambda: assign("clear")).pack(pady=4, fill="x")
+
+        fr_new = ttk.Frame(fr_c)
+        d_new = tk.StringVar()
+
+        def add_new_class():
+            txt = d_new.get().strip()
+            if not txt:
+                return
             key = next((k for k in cls_keys if _fmt(k) == txt), None)
             if key is None:
                 try:
@@ -1081,19 +1188,68 @@ def _gui_dialog(root_dir):
                 except ValueError:
                     messagebox.showerror("Ошибка", f"Значение «{txt}» не подходит к типу поля.", parent=dlg)
                     return
-            fvals = [s.strip() for s in d_fv.get().split(",") if s.strip()]
-            for i, p in enumerate(files):
-                # у второго и следующих файлов слой берётся первый в файле
-                lay = d_lay.get() if i == 0 else (list_layers(p) or [""])[0]
-                targets.append({"value": key, "path": p, "layer": lay,
-                                "ffield": d_ff.get().strip(), "fvalues": fvals})
+            tvc.selection_set(add_row(key, label=labels.get(key, f"{_fmt(key)} (новый)")))
+            d_new.set("")
+
+        ttk.Button(fr_src, text="Обзор…", command=browse_ts).grid(row=0, column=2, padx=6)
+        cb_l.bind("<<ComboboxSelected>>", load_ts_fields)
+        cb_ff.bind("<<ComboboxSelected>>", load_values)
+        d_find.trace_add("write", fill_values)
+
+        fr_n = ttk.Frame(body)
+        fr_n.pack(fill="x", padx=8, pady=2)
+        ttk.Label(fr_n, text="Новый класс П (нет в слое П):").pack(side="left")
+        ttk.Entry(fr_n, textvariable=d_new, width=14).pack(side="left", padx=6)
+        ttk.Button(fr_n, text="Добавить в список классов", command=add_new_class).pack(side="left")
+        ttk.Label(body, foreground="#555", wraplength=780, justify="left",
+                  text="Выделите значения слева и класс(ы) справа → «Назначить». В слой ЦС попадут "
+                       "классы, которым назначены значения, и выделенные классы без значений "
+                       "(для них берётся весь слой ЦС).").pack(fill="x", padx=8, pady=(0, 2))
+
+        if files:
+            try:
+                layers = list_layers(files[0])
+                cb_l["values"] = layers
+                if d_lay.get() not in layers:
+                    d_lay.set(layers[0] if layers else "")
+                keep_ff = d_ff.get()
+                load_ts_fields()
+                if keep_ff and cache["df"] is not None and keep_ff in cache["df"].columns:
+                    d_ff.set(keep_ff)
+                    load_values()
+            except Exception as e:
+                lb_info.config(text=f"Ошибка чтения: {e}")
+
+        def ok():
+            if not files:
+                messagebox.showwarning("Не заполнено", "Укажите файл ЦС.", parent=dlg)
+                return
+            ff = d_ff.get().strip()
+            chosen = [r for iid, r in rows.items() if r["vals"] or iid in tvc.selection()]
+            if not chosen:
+                messagebox.showwarning("Не заполнено",
+                                       "Назначьте значения хотя бы одному классу или выделите класс.",
+                                       parent=dlg)
+                return
+            new = []
+            for r in chosen:
+                for i, p in enumerate(files):
+                    # у второго и следующих файлов слой берётся первый в файле
+                    lay = d_lay.get() if i == 0 else (list_layers(p) or [""])[0]
+                    new.append({"value": r["key"], "path": p, "layer": lay,
+                                "ffield": ff if r["vals"] else "", "fvalues": list(r["vals"])})
+            if edit_index is not None:
+                targets[edit_index:edit_index + 1] = new
+            else:
+                targets.extend(new)
+            state["last_ts"] = {"files": list(files), "layer": d_lay.get(), "ffield": ff}
             refresh_tv()
             dlg.destroy()
 
-        fr_b = ttk.Frame(dlg)
-        fr_b.grid(row=6, column=0, columnspan=3, sticky="e", padx=8, pady=8)
         ttk.Button(fr_b, text="Отмена", command=dlg.destroy).pack(side="right")
-        ttk.Button(fr_b, text="Добавить", command=ok).pack(side="right", padx=6)
+        ttk.Button(fr_b, text="Сохранить" if edit is not None else "Добавить",
+                   command=ok).pack(side="right", padx=6)
+        dlg.grab_set()
 
     def del_target():
         for iid in sorted((int(i) for i in tv.selection()), reverse=True):
@@ -1113,6 +1269,9 @@ def _gui_dialog(root_dir):
     fr_tb = ttk.Frame(fr_t)
     fr_tb.pack(fill="x", padx=6, pady=(0, 6))
     ttk.Button(fr_tb, text="Добавить слой ЦС…", command=add_target).pack(side="left")
+    ttk.Button(fr_tb, text="Изменить…",
+               command=lambda: tv.selection() and add_target(int(tv.selection()[0]))).pack(side="left", padx=6)
+    tv.bind("<Double-1>", lambda e: tv.identify_row(e.y) and add_target(int(tv.identify_row(e.y))))
     ttk.Button(fr_tb, text="Удалить", command=del_target).pack(side="left", padx=6)
     ttk.Button(fr_tb, text="Выше", command=lambda: move(-1)).pack(side="left")
     ttk.Button(fr_tb, text="Ниже", command=lambda: move(1)).pack(side="left", padx=6)
