@@ -34,7 +34,17 @@
      с силой, обратным порядком и зерном для случайной шкалы;
    • для любой категории можно задать свой градиент (кнопка в списке);
    • любую ячейку можно перекрасить вручную.
-5. «Сохранить XLSX».
+5. Перекодировка типов (раздел 4 окна): «Старый код → Новый код», «Выполнить».
+   Слияние: 1400 → 3400 — полигоны ячейки 1400 добавляются к 3400; перенумерация:
+   1400 → 1450 — ячейка получает новый код (новая строка / столбец появятся сами,
+   пустые исчезнут). Число полигонов и площадь пересчитываются сразу.
+   Два поля: ячейка задаётся парой «строка столбец» (1 400, 1;400, 1|400).
+   «Отменить» / «Повторить» (Ctrl+Z / Ctrl+Y) — до 50 шагов назад.
+   ПКМ по ячейке → «старый код = …» / «новый код = …» подставляет её код.
+   Сам слой не меняется: в стилях QGIS / ArcGIS исходные коды (1400, 2400…)
+   получают цвет и подпись новой ячейки. По флажку «Записать перекодированный
+   слой» сохраняется копия слоя с новыми кодами (<слой>_legend_recoded.gpkg).
+6. «Сохранить XLSX».
 
 Матрица на экране
 -----------------
@@ -53,9 +63,12 @@
                        подписи строк и столбцов — названия классов из CSV
     лист «Классы»    — все сочетания из слоя: код, значения, названия, цвет HEX, RGB,
                        число полигонов, площадь
+    лист «Перекодировка» — шаги «старый → новый», перенесённые объекты и площадь
+                       (при перекодировке; в «Классах» — столбец «Объединено из»)
     лист «Цвета»     — базовые цвета и градиенты категорий цветовой оси
     лист «Параметры» — исходные данные и настройки (по ним раскраску можно
-                       загрузить обратно кнопкой «Загрузить раскраску»)
+                       загрузить обратно кнопкой «Загрузить раскраску»;
+                       перекодировки восстанавливаются вместе с ней)
     <слой>_legend_qgis.qml       — стиль QGIS (Свойства слоя → Стиль → Загрузить стиль)
     <слой>_legend_arcgispro.lyrx — ArcGIS Pro (Символы → Импорт / «Применить символы из слоя»)
     <слой>_legend_arcmap108.py   — ArcMap 10.8: выполнить в окне Python ArcMap
@@ -72,6 +85,8 @@ CLI (раскраска по умолчанию, без окна):
     python 09_MatrixLegend.py map.gpkg --layer classes --field code --parse first:1 \\
         --first-axis v --names-v veg.csv --names-h stage.csv --out legend.xlsx
     python 09_MatrixLegend.py map.gpkg --fields STAGE VEG --tone tint
+    python 09_MatrixLegend.py map.gpkg --field class_value --parse last:3 \\
+        --recode 1400=3400 2400=3400 4400=3400 --write-layer
 
 Зависимости:
     pip install numpy pandas geopandas pyogrio openpyxl
@@ -81,6 +96,7 @@ from __future__ import annotations
 
 import argparse
 import colorsys
+import copy
 import csv
 import io
 import json
@@ -236,6 +252,9 @@ def parse_code(v, method, k=1, sep="_"):
     return a, b
 
 
+UNDO_LIMIT = 50            # глубина отмены перекодировок
+
+
 def sort_keys(keys):
     def k(x):
         try:
@@ -348,6 +367,13 @@ class MatrixModel:
         self.manual = {}        # (hk, vk) -> HEX
         self.hide_absent = True
         self.palette = DEFAULT_PALETTE
+        # перекодировка типов: исходные сведения слоя + список шагов
+        self._base = None
+        self.recodes = []       # [{old, new, old_txt, new_txt, new_vals, n, area}]
+        self.redo_stack = []
+        self.undo_floor = 0     # шаги до этого индекса отменить нельзя (глубина UNDO_LIMIT)
+        self.final = {}         # исходный кортеж значений -> новый кортеж (для перекодированного слоя)
+        self.cell_code = {}     # ячейка -> код, введённый как «новый» (одно поле)
 
     # ---------- построение ----------
     @classmethod
@@ -395,7 +421,127 @@ class MatrixModel:
             raise ValueError("Не найдено ни одного сочетания классов — проверьте поля и способ разбора.")
         m.hue_side = "h" if len(m.h_keys) >= len(m.v_keys) else "v"
         m.apply_palette(m.palette)
+        m._base = copy.deepcopy((m.counts, m.areas, m.codes, m.orig))
         return m
+
+    # ---------- перекодировка типов ----------
+    def cell_from_text(self, txt):
+        """Код, введённый пользователем → (ячейка (hk, vk), кортеж значений полей).
+        Одно поле: код целиком (разбирается так же, как поле). Два поля: «строка столбец»
+        через пробел, «;», «|», «/» или «,»."""
+        txt = str(txt).strip()
+        if not txt:
+            raise ValueError("Код не задан.")
+        src = self.source
+        if src.get("mode") == "two":
+            parts = [x for x in re.split(r"[\s;|/,]+", txt) if x]
+            if len(parts) != 2:
+                raise ValueError(f"«{txt}»: нужны два значения — строка и столбец "
+                                 f"({src.get('v_field')} и {src.get('h_field')}), например «1 101».")
+            vv, hv = parts
+            hk, vk = norm_key(hv), norm_key(vv)
+            if hk is None or vk is None:
+                raise ValueError(f"«{txt}»: пустое значение.")
+            return (hk, vk), (hv, vv)
+        pr = parse_code(txt, src.get("method"), int(src.get("k", 1)), src.get("sep", "_"))
+        if pr is None:
+            raise ValueError(f"«{txt}» не разбирается выбранным способом "
+                             f"({dict(PARSE_METHODS).get(src.get('method'), '')}).")
+        p1, p2 = pr
+        vk, hk = (p1, p2) if src.get("first_axis", "v") == "v" else (p2, p1)
+        return (hk, vk), (txt,)
+
+    def cell_text(self, hk, vk):
+        """Код ячейки для подстановки в поля перекодировки."""
+        if self.source.get("mode") == "two":
+            return f"{vk} {hk}"
+        if (hk, vk) in self.cell_code:
+            return self.cell_code[(hk, vk)]
+        codes = sorted(self.codes.get((hk, vk), []))
+        if codes:
+            return codes[0]
+        a, b = (vk, hk) if self.source.get("first_axis", "v") == "v" else (hk, vk)
+        return f"{a}{self.source.get('sep', '_')}{b}" if self.source.get("method") == "sep" else f"{a}{b}"
+
+    def recode(self, old_txt, new_txt):
+        """Перенести сведения ячейки «старый код» в ячейку «новый код» (слияние или
+        перенумерация). → описание шага."""
+        old, _ = self.cell_from_text(old_txt)
+        new, new_vals = self.cell_from_text(new_txt)
+        if old == new:
+            raise ValueError("Старый и новый коды указывают на одну ячейку.")
+        if old not in self.counts:
+            raise ValueError(f"Код «{old_txt}» в матрице отсутствует (нет полигонов).")
+        op = {"old": old, "new": new, "old_txt": str(old_txt).strip(),
+              "new_txt": str(new_txt).strip(), "new_vals": new_vals}
+        self.recodes.append(op)
+        self.redo_stack.clear()
+        self.undo_floor = max(self.undo_floor, len(self.recodes) - UNDO_LIMIT)
+        self._recompute()
+        return op
+
+    def can_undo(self):
+        return len(self.recodes) > self.undo_floor
+
+    def undo(self):
+        if not self.can_undo():
+            return None
+        op = self.recodes.pop()
+        self.redo_stack.append(op)
+        self._recompute()
+        return op
+
+    def redo(self):
+        if not self.redo_stack:
+            return None
+        op = self.redo_stack.pop()
+        self.recodes.append(op)
+        self._recompute()
+        return op
+
+    def replay(self, pairs):
+        """Повторить перекодировки [(старый, новый), ...]; неприменимые пропускаются."""
+        bad = []
+        for o, n in pairs:
+            try:
+                self.recode(o, n)
+            except ValueError as ex:
+                bad.append(f"{o} → {n}: {ex}")
+        self.redo_stack.clear()
+        return bad
+
+    def _recompute(self):
+        """Пересобрать матрицу: исходные сведения слоя + все шаги перекодировки по порядку."""
+        counts, areas, codes, orig = copy.deepcopy(self._base)
+        final, cell_code = {}, {}
+        for op in self.recodes:
+            o, n = op["old"], op["new"]
+            if o not in counts:
+                op["n"], op["area"] = 0, 0.0
+                continue
+            op["n"], op["area"] = counts[o], areas.get(o, 0.0)
+            counts[n] = counts.get(n, 0) + counts.pop(o)
+            areas[n] = areas.get(n, 0.0) + areas.pop(o, 0.0)
+            codes.setdefault(n, set()).update(codes.pop(o, set()))
+            moved = orig.pop(o, set())
+            for t in moved:
+                final[t] = tuple(op["new_vals"])
+            orig.setdefault(n, set()).update(moved)
+            if self.source.get("mode") != "two":
+                cell_code[n] = op["new_txt"]
+            cell_code.pop(o, None)
+            self.manual.pop(o, None)
+        self.counts, self.areas, self.codes, self.orig = counts, areas, codes, orig
+        self.final, self.cell_code = final, cell_code
+        self.h_keys = sort_keys({h for h, _ in counts})
+        self.v_keys = sort_keys({v for _, v in counts})
+        miss = [k for k in self.hue_keys if k not in self.base]
+        if miss:                                    # новые категории цветовой оси — цвет из палитры
+            used = set(self.base.values())
+            cols = [c for c in palette_colors(self.palette, len(self.hue_keys) + len(self.base))
+                    if c not in used]
+            for k, c in zip(miss, cols + ["#888888"] * len(miss)):
+                self.base[k] = c
 
     def set_names(self, h_names=None, v_names=None):
         if h_names is not None:
@@ -466,10 +612,15 @@ class MatrixModel:
                 "override": self.override, "palette": self.palette,
                 "manual": [[h, v, c] for (h, v), c in self.manual.items()],
                 "hide_absent": self.hide_absent, "label_mode": self.label_mode,
-                "area_unit": self.area_unit}
+                "area_unit": self.area_unit,
+                "recodes": [[op["old_txt"], op["new_txt"]] for op in self.recodes]}
 
     def load_state(self, st):
-        """Применить сохранённую раскраску; категории, которых нет, пропускаются."""
+        """Применить сохранённую раскраску; категории, которых нет, пропускаются.
+        Перекодировки из сохранённого файла применяются, если в модели их ещё нет."""
+        self.load_bad = []
+        if st.get("recodes") and not self.recodes:
+            self.load_bad = self.replay(st["recodes"])
         if st.get("hue_side") in ("h", "v"):
             self.hue_side = st["hue_side"]
         self.apply_palette(st.get("palette", self.palette))
@@ -679,7 +830,8 @@ def save_xlsx(m, path):
     head = (["Код"] if one else []) + [
         f"Горизонталь ({m.h_title})", "Название (горизонталь)",
         f"Вертикаль ({m.v_title})", "Название (вертикаль)",
-        "HEX", "R", "G", "B", "Объектов", f"Площадь, {m.area_unit}", "Ручная правка"]
+        "HEX", "R", "G", "B", "Объектов", f"Площадь, {m.area_unit}", "Ручная правка",
+        "Объединено из (исходные значения)"]
     for j, t in enumerate(head):
         c = wc.cell(1, j + 1, t)
         c.font = bold
@@ -690,10 +842,15 @@ def save_xlsx(m, path):
                 continue
             h = m.color(hk, vk)
             rgb = [int(round(x * 255)) for x in hex2rgb(h)]
-            row = ([", ".join(sorted(m.codes.get((hk, vk), [])))] if one else []) + [
+            src_vals = sorted(QGIS_DELIM.join(t) if len(t) > 1 else t[0]
+                              for t in m.orig.get((hk, vk), set()))
+            merged = any(t in m.final for t in m.orig.get((hk, vk), set()))
+            code = m.cell_code.get((hk, vk)) or ", ".join(sorted(m.codes.get((hk, vk), [])))
+            row = ([_num(code)] if one else []) + [
                 _num(hk), m.name("h", hk), _num(vk), m.name("v", vk),
                 h.upper(), *rgb, m.counts[(hk, vk)], round(m.area(hk, vk), 6),
-                "да" if (hk, vk) in m.manual else ""]
+                "да" if (hk, vk) in m.manual else "",
+                ", ".join(src_vals) if merged else ""]
             for j, v in enumerate(row):
                 wc.cell(r, j + 1, v)
             wc.cell(r, head.index(f"Площадь, {m.area_unit}") + 1).number_format = afmt
@@ -701,9 +858,29 @@ def save_xlsx(m, path):
             hc.fill = fill(h)
             hc.font = Font(color=text_color(h).lstrip("#").upper())
             r += 1
-    for j, w in enumerate([10] * (1 if one else 0) + [14, 34, 14, 34, 10, 6, 6, 6, 10, 14, 13]):
+    for j, w in enumerate([10] * (1 if one else 0) + [14, 34, 14, 34, 10, 6, 6, 6, 10, 14, 13, 30]):
         wc.column_dimensions[get_column_letter(j + 1)].width = w
     wc.freeze_panes = "A2"
+
+    # ---------- Перекодировка ----------
+    if m.recodes:
+        wr = wb.create_sheet("Перекодировка")
+        lab = "строка столбец" if not one else "код"
+        for j, t in enumerate(["Шаг", f"Старый ({lab})", f"Новый ({lab})", "Старая ячейка",
+                               "Новая ячейка", "Перенесено объектов", f"Перенесено, {m.area_unit}"]):
+            wr.cell(1, j + 1, t).font = bold
+        for i, op in enumerate(m.recodes):
+            (oh, ov), (nh, nv) = op["old"], op["new"]
+            row = [i + 1, _num(op["old_txt"]), _num(op["new_txt"]),
+                   f"{m.label('v', ov)} — {m.label('h', oh)}",
+                   f"{m.label('v', nv)} — {m.label('h', nh)}", op.get("n", 0),
+                   round(op.get("area", 0.0) / AREA_UNITS[m.area_unit], 6)]
+            for j, v in enumerate(row):
+                wr.cell(i + 2, j + 1, v)
+            wr.cell(i + 2, 7).number_format = afmt
+        for j, w in enumerate([6, 16, 16, 50, 50, 12, 16]):
+            wr.column_dimensions[get_column_letter(j + 1)].width = w
+        wr.freeze_panes = "A2"
 
     # ---------- Цвета ----------
     wk = wb.create_sheet("Цвета")
@@ -748,6 +925,7 @@ def save_xlsx(m, path):
         ("Размер матрицы", f"{len(m.v_keys)} × {len(m.h_keys)}"),
         ("Нераспознанных значений", sum(m.skipped.values())),
         ("Ручных правок ячеек", len(m.manual)),
+        ("Шагов перекодировки", len(m.recodes)),
         ("Подписи строк и столбцов", dict(LABEL_MODES)[m.label_mode]),
         ("Единицы площади", m.area_unit),
         ("Площадь", m.source.get("area_note", "") or "по геометрии в СК слоя"),
@@ -1029,6 +1207,40 @@ def write_arcmap_script(m, path, lyr_path):
     return path
 
 
+def write_recoded_layer(m, xlsx_path):
+    """Копия исходного слоя с перекодированными значениями поля (полей) →
+    <база>_recoded.gpkg рядом с XLSX. Без перекодировок — None."""
+    if not m.final:
+        return None
+    import geopandas as gpd
+    src = m.source
+    gdf = gpd.read_file(src["path"], layer=src.get("layer") or None)
+    fields = [src["h_field"], src["v_field"]] if src.get("mode") == "two" else [src["field"]]
+    keys = list(zip(*[gdf[f].map(orig_str) for f in fields]))
+    hit = [k in m.final for k in keys]
+    for i, f in enumerate(fields):
+        kind = m.field_types.get(f, "string")
+        vals = []
+        for k, h in zip(keys, hit):
+            if not h:
+                continue
+            v = m.final[k][i]
+            try:
+                v = int(float(v)) if kind == "integer" else float(v) if kind == "double" else str(v)
+            except ValueError:
+                raise ValueError(f"Значение «{v}» нельзя записать в числовое поле {f}.")
+            vals.append(v)
+        gdf.loc[hit, f] = vals
+    base = os.path.splitext(os.path.abspath(xlsx_path))[0]
+    out = base + "_recoded.gpkg"
+    lname = src.get("layer") or os.path.splitext(os.path.basename(src["path"]))[0]
+    if os.path.exists(out):
+        os.remove(out)
+    gdf.to_file(out, layer=lname, driver="GPKG")
+    log(f"Перекодированный слой: {out} (изменено объектов: {sum(hit)})")
+    return out
+
+
 def save_styles(m, xlsx_path):
     """Файлы стилей рядом с XLSX: <база>_qgis.qml, <база>_arcgispro.lyrx,
     <база>_arcmap108.py (создаёт <база>_arcmap108.lyr в ArcMap)."""
@@ -1245,8 +1457,38 @@ class App:
         f3.columnconfigure(1, weight=1)
         ttk.Button(p, text="Построить матрицу", command=self.build).pack(fill="x", padx=12, pady=6)
 
+        # 4. перекодировка типов
+        f7 = ttk.LabelFrame(p, text="4. Перекодировка типов (слияние, перенумерация)")
+        f7.pack(fill="x", padx=6, pady=4)
+        self.v_rc_hint = tk.StringVar(value="Постройте матрицу.")
+        ttk.Label(f7, textvariable=self.v_rc_hint, foreground="#555555", justify="left",
+                  wraplength=380).grid(row=0, column=0, columnspan=4, sticky="w", **pad)
+        self.v_rc_old, self.v_rc_new = tk.StringVar(), tk.StringVar()
+        ttk.Label(f7, text="Старый").grid(row=1, column=0, sticky="w", **pad)
+        e_old = ttk.Entry(f7, textvariable=self.v_rc_old, width=12)
+        e_old.grid(row=1, column=1, sticky="we", **pad)
+        ttk.Label(f7, text="→ Новый").grid(row=1, column=2, sticky="w", **pad)
+        e_new = ttk.Entry(f7, textvariable=self.v_rc_new, width=12)
+        e_new.grid(row=1, column=3, sticky="we", **pad)
+        e_old.bind("<Return>", lambda e: e_new.focus_set())
+        e_new.bind("<Return>", lambda e: self.do_recode())
+        fbr = ttk.Frame(f7)
+        fbr.grid(row=2, column=0, columnspan=4, sticky="w")
+        ttk.Button(fbr, text="Выполнить", command=self.do_recode).pack(side="left", padx=6, pady=2)
+        self.b_undo = ttk.Button(fbr, text="Отменить", command=self.undo_recode, state="disabled")
+        self.b_undo.pack(side="left", padx=2, pady=2)
+        self.b_redo = ttk.Button(fbr, text="Повторить", command=self.redo_recode, state="disabled")
+        self.b_redo.pack(side="left", padx=2, pady=2)
+        self.lb_rc = tk.Listbox(f7, height=5, activestyle="none")
+        self.lb_rc.grid(row=3, column=0, columnspan=4, sticky="we", **pad)
+        self.v_rc_info = tk.StringVar(value="")
+        ttk.Label(f7, textvariable=self.v_rc_info, foreground="#555555").grid(
+            row=4, column=0, columnspan=4, sticky="w", **pad)
+        f7.columnconfigure(1, weight=1)
+        f7.columnconfigure(3, weight=1)
+
         # 4. цвет и тон
-        f4 = ttk.LabelFrame(p, text="4. Цвет и тон")
+        f4 = ttk.LabelFrame(p, text="5. Цвет и тон")
         f4.pack(fill="x", padx=6, pady=4)
         self.v_hue = tk.StringVar(value="h")
         self.rb_h = ttk.Radiobutton(f4, text="Цвет — по горизонтали", value="h",
@@ -1288,7 +1530,7 @@ class App:
         f4.columnconfigure(1, weight=1)
 
         # 5. категории цветовой оси
-        self.f5 = ttk.LabelFrame(p, text="5. Категории цветовой оси")
+        self.f5 = ttk.LabelFrame(p, text="6. Категории цветовой оси")
         self.f5.pack(fill="x", padx=6, pady=4)
         ttk.Label(self.f5, text="Щелчок по цветному квадрату — изменить цвет категории;\n"
                                 "«Градиент» — свой способ тона для категории.",
@@ -1297,7 +1539,7 @@ class App:
         self.f_cats.pack(fill="x")
 
         # 6. ячейки и сохранение
-        f6 = ttk.LabelFrame(p, text="6. Ячейки и сохранение")
+        f6 = ttk.LabelFrame(p, text="7. Ячейки и сохранение")
         f6.pack(fill="x", padx=6, pady=4)
         self.v_hide = tk.BooleanVar(value=True)
         ttk.Checkbutton(f6, text="Не раскрашивать сочетания, которых нет в слое",
@@ -1310,6 +1552,9 @@ class App:
         self.v_styles = tk.BooleanVar(value=True)
         ttk.Checkbutton(f6, text="Стили: QGIS, ArcGIS Pro, ArcMap 10.8",
                         variable=self.v_styles).grid(row=4, column=0, columnspan=3, sticky="w", **pad)
+        self.v_wlayer = tk.BooleanVar(value=False)
+        ttk.Checkbutton(f6, text="Записать перекодированный слой (GPKG)",
+                        variable=self.v_wlayer).grid(row=5, column=0, columnspan=3, sticky="w", **pad)
         ttk.Label(f6, text="Файл XLSX").grid(row=3, column=0, sticky="w", **pad)
         self.v_out = tk.StringVar()
         ttk.Entry(f6, textvariable=self.v_out, width=24).grid(row=3, column=1, sticky="we", **pad)
@@ -1582,6 +1827,12 @@ class App:
             menu.add_command(label="Ввести HEX ячейки…", command=lambda: self.edit_cell(hk, vk, hex_=True))
             menu.add_command(label="Сбросить ячейку",
                              command=lambda: (m.manual.pop((hk, vk), None), self.redraw()))
+            menu.add_separator()
+            code = m.cell_text(hk, vk)
+            menu.add_command(label=f"Перекодировка: старый код = {code}",
+                             command=lambda: self.v_rc_old.set(code), state="normal" if n else "disabled")
+            menu.add_command(label=f"Перекодировка: новый код = {code}",
+                             command=lambda: self.v_rc_new.set(code))
         else:
             hue_key = None
             if hit[0] == "hhead" and m.hue_side == "h":
@@ -1730,6 +1981,12 @@ class App:
         m.label_mode = next(k for k, t in LABEL_MODES if t == self.v_lab.get())
         m.area_unit = self.v_unit.get()
         m.source["area_note"] = self.df.attrs.get("area_note", "")
+        same_src = old is not None and all(old.source.get(k) == m.source.get(k) for k in (
+            "path", "layer", "mode", "field", "h_field", "v_field", "method", "k", "sep", "first_axis"))
+        if same_src and old.recodes:
+            bad = m.replay([[op["old_txt"], op["new_txt"]] for op in old.recodes])
+            for b in bad:
+                log(f"Перекодировка не применена: {b}")
         if old is not None and old.h_keys == m.h_keys and old.v_keys == m.v_keys:
             m.load_state(old.state())      # перестроение тех же осей — сохраняем раскраску
         self.m = m
@@ -1744,7 +2001,67 @@ class App:
                + (f", по вертикали {len(miss_v)}." if miss_v else ""))
         self.status.set(msg)
         log(msg)
+        self._rc_refresh()
         self.win.after(50, self.view_readable)
+
+    # ---------- перекодировка ----------
+    def _rc_refresh(self):
+        m = self.m
+        if m is None:
+            return
+        if m.source.get("mode") == "two":
+            self.v_rc_hint.set(f"Ячейка задаётся парой «строка столбец» ({m.source.get('v_field')} "
+                               f"{m.source.get('h_field')}), например «1 400». Правый щелчок по "
+                               "ячейке подставляет её код.")
+        else:
+            self.v_rc_hint.set(f"Ячейка задаётся кодом поля {m.source.get('field')}, например "
+                               "1400 → 3400 (слияние) или 1400 → 1450 (перенумерация). "
+                               "Правый щелчок по ячейке подставляет её код.")
+        self.lb_rc.delete(0, "end")
+        for i, op in enumerate(m.recodes):
+            self.lb_rc.insert("end", f"{i + 1}. {op['old_txt']} → {op['new_txt']}   "
+                                     f"({op.get('n', 0)} об., {_fmt_area(op.get('area', 0.0) / AREA_UNITS[m.area_unit], m.area_unit)})")
+        self.lb_rc.see("end")
+        self.b_undo.configure(state="normal" if m.can_undo() else "disabled")
+        self.b_redo.configure(state="normal" if m.redo_stack else "disabled")
+        self.v_rc_info.set(f"Шагов: {len(m.recodes)}; можно отменить: {len(m.recodes) - m.undo_floor} "
+                           f"(не более {UNDO_LIMIT}); повторить: {len(m.redo_stack)}.")
+
+    def _after_recode(self, msg):
+        self.v_hue.set(self.m.hue_side)
+        self._update_hue_labels()
+        self._fill_cats()
+        self._clamp()
+        self.redraw()
+        self._rc_refresh()
+        self.status.set(msg)
+        log(msg)
+
+    def do_recode(self):
+        from tkinter import messagebox
+        if not self.m:
+            messagebox.showwarning("Нет матрицы", "Сначала постройте матрицу.", parent=self.win)
+            return
+        try:
+            op = self.m.recode(self.v_rc_old.get(), self.v_rc_new.get())
+        except ValueError as ex:
+            messagebox.showwarning("Перекодировка", str(ex), parent=self.win)
+            return
+        m = self.m
+        self.v_rc_old.set("")
+        self._after_recode(f"{op['old_txt']} → {op['new_txt']}: перенесено {op['n']} объектов, "
+                           f"{_fmt_area(op['area'] / AREA_UNITS[m.area_unit], m.area_unit)}. "
+                           f"Матрица {len(m.v_keys)} × {len(m.h_keys)}, сочетаний: {len(m.counts)}.")
+
+    def undo_recode(self, *_):
+        if self.m and self.m.can_undo():
+            op = self.m.undo()
+            self._after_recode(f"Отменено: {op['old_txt']} → {op['new_txt']}.")
+
+    def redo_recode(self, *_):
+        if self.m and self.m.redo_stack:
+            op = self.m.redo()
+            self._after_recode(f"Повторено: {op['old_txt']} → {op['new_txt']}.")
 
     def _update_hue_labels(self):
         if self.m:
@@ -1805,7 +2122,7 @@ class App:
             return
         m = self.m
         side = m.hue_side
-        self.f5.configure(text=f"5. Категории цветовой оси ({'горизонталь' if side == 'h' else 'вертикаль'}, "
+        self.f5.configure(text=f"6. Категории цветовой оси ({'горизонталь' if side == 'h' else 'вертикаль'}, "
                                f"{len(m.hue_keys)})")
         for r, k in enumerate(m.hue_keys):
             sw = tk.Label(self.f_cats, width=3, background=m.base[k], relief="raised", cursor="hand2")
@@ -1936,9 +2253,14 @@ class App:
         self.v_hide.set(self.m.hide_absent)
         self.v_lab.set(dict(LABEL_MODES)[self.m.label_mode])
         self.v_unit.set(self.m.area_unit)
+        self._update_hue_labels()
         self._fill_cats()
+        self._clamp()
         self.redraw()
-        self.status.set(f"Раскраска загружена из {os.path.basename(p)}.")
+        self._rc_refresh()
+        bad = getattr(self.m, "load_bad", [])
+        self.status.set(f"Раскраска загружена из {os.path.basename(p)}."
+                        + (f" Перекодировок не применено: {len(bad)}." if bad else ""))
 
     def save(self):
         from tkinter import messagebox
@@ -1952,6 +2274,10 @@ class App:
         try:
             save_xlsx(self.m, out)
             styles = save_styles(self.m, out) if self.v_styles.get() else []
+            if self.v_wlayer.get():
+                lp = write_recoded_layer(self.m, out)
+                if lp:
+                    styles.append(lp)
         except PermissionError:
             messagebox.showerror("Ошибка записи", f"Файл занят (открыт в Excel?):\n{out}", parent=self.win)
             return
@@ -1959,12 +2285,14 @@ class App:
             messagebox.showerror("Ошибка записи", str(ex), parent=self.win)
             return
         self.v_out.set(out)
-        self.status.set(f"Сохранено: {out}" + (f" + стили ({len(styles)})" if styles else ""))
+        self.status.set(f"Сохранено: {out}" + (f" + файлы ({len(styles)})" if styles else ""))
         log(f"Сохранено: {out}")
         for sp in styles:
-            log(f"Стиль: {sp}")
+            log(f"Файл: {sp}")
 
     def run(self):
+        self.win.bind("<Control-z>", self.undo_recode)
+        self.win.bind("<Control-y>", self.redo_recode)
         self.redraw()
         self.win.mainloop()
 
@@ -2026,6 +2354,10 @@ def main(argv=None):
                    help="подписи строк/столбцов: name — название, num_name — номер — название, num — номер")
     p.add_argument("--area-unit", choices=list(AREA_UNITS), default="га")
     p.add_argument("--no-styles", action="store_true", help="не создавать файлы стилей QGIS / ArcGIS")
+    p.add_argument("--recode", nargs="+", default=[], metavar="СТАРЫЙ=НОВЫЙ",
+                   help="перекодировка типов по порядку: 1400=3400 2400=3400 (два поля: \"1 400=3 400\")")
+    p.add_argument("--write-layer", action="store_true",
+                   help="записать копию слоя с перекодированными значениями (<база>_recoded.gpkg)")
     p.add_argument("--out", default=None)
     a = p.parse_args(argv)
 
@@ -2051,14 +2383,24 @@ def main(argv=None):
     m.source["area_note"] = df.attrs.get("area_note", "")
     if m.source["area_note"]:
         log(m.source["area_note"])
+    for rc in a.recode:
+        o, sep_, n = rc.partition("=")
+        if not sep_:
+            p.error(f"--recode: ожидается СТАРЫЙ=НОВЫЙ, получено «{rc}»")
+        op = m.recode(o, n)
+        log(f"{op['old_txt']} → {op['new_txt']}: перенесено {op['n']} объектов")
     out = a.out or default_out_path(a.path, a.layer)
     save_xlsx(m, out)
     styles = [] if a.no_styles else save_styles(m, out)
+    if a.write_layer:
+        lp = write_recoded_layer(m, out)
+        if lp:
+            styles.append(lp)
     log(f"Матрица {len(m.v_keys)} × {len(m.h_keys)}, сочетаний: {len(m.counts)}, "
         f"нераспознанных значений: {sum(m.skipped.values())}")
     log(f"Сохранено: {out}")
     for sp in styles:
-        log(f"Стиль: {sp}")
+        log(f"Файл: {sp}")
 
 
 if __name__ == "__main__":
