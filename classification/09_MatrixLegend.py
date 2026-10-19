@@ -56,6 +56,13 @@
     лист «Цвета»     — базовые цвета и градиенты категорий цветовой оси
     лист «Параметры» — исходные данные и настройки (по ним раскраску можно
                        загрузить обратно кнопкой «Загрузить раскраску»)
+    <слой>_legend_qgis.qml       — стиль QGIS (Свойства слоя → Стиль → Загрузить стиль)
+    <слой>_legend_arcgispro.lyrx — ArcGIS Pro (Символы → Импорт / «Применить символы из слоя»)
+    <слой>_legend_arcmap108.py   — ArcMap 10.8: выполнить в окне Python ArcMap
+                                   (execfile), слой раскрасится и сохранится
+                                   <слой>_legend_arcmap108.lyr
+    Подписи классов в стилях: «строка — столбец». Два поля: QGIS — выражение
+    concat("строка", '|', "столбец"); ArcGIS — уникальные значения по двум полям.
 
 Запуск из папки проекта:
     %run 09_MatrixLegend.py      # Jupyter — откроется окно
@@ -164,6 +171,32 @@ def norm_key(v):
     if re.fullmatch(r"[+-]?\d+(\.0*)?", s):
         return str(int(float(s)))
     return s
+
+
+def orig_str(v):
+    """Значение поля как строка, совпадающая с тем, как его покажут ГИС (3.0 → '3')."""
+    try:
+        import numpy as np
+        if isinstance(v, np.generic):
+            v = v.item()
+    except Exception:
+        pass
+    if isinstance(v, bool):
+        return str(int(v))
+    if isinstance(v, int):
+        return str(v)
+    if isinstance(v, float):
+        return str(int(v)) if v.is_integer() else repr(v)
+    return str(v)
+
+
+def _field_kind(series):
+    import pandas as pd
+    if pd.api.types.is_bool_dtype(series) or pd.api.types.is_integer_dtype(series):
+        return "integer"
+    if pd.api.types.is_float_dtype(series):
+        return "double"
+    return "string"
 
 
 def raw_code(v):
@@ -303,6 +336,8 @@ class MatrixModel:
         self.areas = {}         # (hk, vk) -> площадь, м²
         self.label_mode = "name"
         self.area_unit = "га"
+        self.orig = {}          # (hk, vk) -> исходные значения полей (для файлов стилей)
+        self.field_types = {}   # поле -> integer | double | string
         self.codes = {}         # (hk, vk) -> исходные коды (одно поле)
         self.skipped = {}       # нераспознанные значения -> число
         self.source = {}
@@ -322,6 +357,7 @@ class MatrixModel:
         m.source = dict(cfg)
         if AREA_FIELD not in df.columns:
             df = df.assign(**{AREA_FIELD: 0.0})
+        m.field_types = {c: _field_kind(df[c]) for c in df.columns if c != AREA_FIELD}
         if cfg["mode"] == "two":
             hf, vf = cfg["h_field"], cfg["v_field"]
             m.h_title, m.v_title = hf, vf
@@ -333,6 +369,7 @@ class MatrixModel:
                     continue
                 m.counts[(hk, vk)] = m.counts.get((hk, vk), 0) + int(n)
                 m.areas[(hk, vk)] = m.areas.get((hk, vk), 0.0) + float(a)
+                m.orig.setdefault((hk, vk), set()).add((orig_str(hv), orig_str(vv)))
         else:
             f = cfg["field"]
             m.h_title = m.v_title = f
@@ -351,6 +388,7 @@ class MatrixModel:
                 m.counts[(hk, vk)] = m.counts.get((hk, vk), 0) + int(n)
                 m.areas[(hk, vk)] = m.areas.get((hk, vk), 0.0) + float(area_m2)
                 m.codes.setdefault((hk, vk), set()).add(raw_code(val))
+                m.orig.setdefault((hk, vk), set()).add((orig_str(val),))
         m.h_keys = sort_keys({h for h, _ in m.counts})
         m.v_keys = sort_keys({v for _, v in m.counts})
         if not m.h_keys or not m.v_keys:
@@ -724,6 +762,282 @@ def save_xlsx(m, path):
     return path
 
 
+# ===========================================================================
+# 4б. ФАЙЛЫ СТИЛЕЙ: QGIS (.qml), ArcGIS Pro (.lyrx), ArcMap 10.8 (.py → .lyr)
+# ===========================================================================
+
+OUTLINE_RGB = (110, 110, 110)
+QGIS_DELIM = "|"
+ARCMAP_DELIM = ", "
+
+
+def style_entries(m):
+    """→ (поля, список классов): поля в порядке «строка, столбец» (или одно поле кода);
+    класс = {values: [кортежи значений полей], label, hex, n}."""
+    if m.source.get("mode") == "two":
+        fields = [m.source["v_field"], m.source["h_field"]]
+    else:
+        fields = [m.source["field"]]
+    out = []
+    for vk in m.v_keys:
+        for hk in m.h_keys:
+            if not m.present(hk, vk):
+                continue
+            vals = sorted(m.orig.get((hk, vk), set()))
+            if len(fields) == 2:
+                vals = [(vv, hv) for hv, vv in vals]
+            out.append({"values": vals, "label": f"{m.label('v', vk)} — {m.label('h', hk)}",
+                        "hex": m.color(hk, vk), "n": m.counts[(hk, vk)]})
+    return fields, out
+
+
+def _rgb255(h):
+    return [int(round(c * 255)) for c in hex2rgb(h)]
+
+
+def write_qml(m, path):
+    """QGIS: категоризированный стиль (одно поле — по полю, два — по выражению concat)."""
+    import xml.etree.ElementTree as ET
+    fields, entries = style_entries(m)
+    if len(fields) == 1:
+        attr = fields[0]
+        vtype = {"integer": "long", "double": "double"}.get(m.field_types.get(fields[0]), "string")
+    else:
+        attr = f'concat("{fields[0]}", \'{QGIS_DELIM}\', "{fields[1]}")'
+        vtype = "string"
+
+    def symbol(parent, name, h):
+        sym = ET.SubElement(parent, "symbol", {"name": name, "type": "fill", "alpha": "1",
+                                               "clip_to_extent": "1", "force_rhr": "0",
+                                               "is_animated": "0", "frame_rate": "10"})
+        ET.SubElement(sym, "data_defined_properties")
+        lay = ET.SubElement(sym, "layer", {"class": "SimpleFill", "enabled": "1", "locked": "0",
+                                           "pass": "0"})
+        r_, g_, b_ = _rgb255(h)
+        props = {"border_width_map_unit_scale": "3x:0,0,0,0,0,0",
+                 "color": f"{r_},{g_},{b_},255", "joinstyle": "bevel",
+                 "offset": "0,0", "offset_map_unit_scale": "3x:0,0,0,0,0,0", "offset_unit": "MM",
+                 "outline_color": ",".join(map(str, OUTLINE_RGB)) + ",255",
+                 "outline_style": "solid", "outline_width": "0.26", "outline_width_unit": "MM",
+                 "style": "solid"}
+        opt = ET.SubElement(lay, "Option", {"type": "Map"})
+        for k, v in props.items():
+            ET.SubElement(opt, "Option", {"name": k, "type": "QString", "value": v})
+        for k, v in props.items():           # для QGIS 3.0–3.14
+            ET.SubElement(lay, "prop", {"k": k, "v": v})
+        ET.SubElement(lay, "data_defined_properties")
+        return sym
+
+    root = ET.Element("qgis", {"version": "3.28.0", "styleCategories": "Symbology"})
+    rend = ET.SubElement(root, "renderer-v2", {"type": "categorizedSymbol", "attr": attr,
+                                               "forceraster": "0", "symbollevels": "0",
+                                               "enableorderby": "0", "referencescale": "-1"})
+    cats = ET.SubElement(rend, "categories")
+    syms = ET.SubElement(rend, "symbols")
+    i = 0
+    for e in entries:
+        for vals in e["values"]:
+            val = vals[0] if len(fields) == 1 else QGIS_DELIM.join(vals)
+            ET.SubElement(cats, "category", {"symbol": str(i), "value": val, "label": e["label"],
+                                             "render": "true", "type": vtype, "uuid": f"c{i}"})
+            symbol(syms, str(i), e["hex"])
+            i += 1
+    src = ET.SubElement(rend, "source-symbol")
+    symbol(src, "0", "#cccccc")
+    ET.SubElement(rend, "rotation")
+    ET.SubElement(rend, "sizescale")
+    ET.SubElement(root, "blendMode").text = "0"
+    ET.SubElement(root, "featureBlendMode").text = "0"
+    ET.SubElement(root, "layerOpacity").text = "1"
+    ET.indent(root)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("<!DOCTYPE qgis PUBLIC 'http://mrcc.com/qgis.dtd' 'SYSTEM'>\n")
+        f.write(ET.tostring(root, encoding="unicode"))
+    return path
+
+
+def _cim_color(h, alpha=100):
+    return {"type": "CIMRGBColor", "values": _rgb255(h) + [alpha]}
+
+
+def _cim_polygon(h):
+    return {"type": "CIMSymbolReference", "symbol": {
+        "type": "CIMPolygonSymbol",
+        "symbolLayers": [
+            {"type": "CIMSolidStroke", "enable": True, "capStyle": "Round", "joinStyle": "Round",
+             "lineStyle3D": "Strip", "miterLimit": 10, "width": 0.4,
+             "color": {"type": "CIMRGBColor", "values": list(OUTLINE_RGB) + [100]}},
+            {"type": "CIMSolidFill", "enable": True, "color": _cim_color(h)}]}}
+
+
+def _cim_data_connection(path, layer):
+    p = os.path.abspath(path)
+    ext = os.path.splitext(p)[1].lower()
+    if ext == ".shp":
+        return {"type": "CIMStandardDataConnection",
+                "workspaceConnectionString": "DATABASE=" + os.path.dirname(p),
+                "workspaceFactory": "Shapefile",
+                "dataset": os.path.splitext(os.path.basename(p))[0],
+                "datasetType": "esriDTFeatureClass"}
+    if ext in (".gpkg", ".sqlite"):
+        return {"type": "CIMStandardDataConnection",
+                "workspaceConnectionString": "AUTHENTICATION_MODE=OSA;DATABASE=" + p,
+                "workspaceFactory": "Sql",
+                "dataset": "main." + (layer or os.path.splitext(os.path.basename(p))[0]),
+                "datasetType": "esriDTFeatureClass"}
+    return None
+
+
+def write_lyrx(m, path):
+    """ArcGIS Pro: слой с символикой «Уникальные значения» по одному или двум полям.
+    Применяется инструментом «Применить символы из слоя» (Apply Symbology From Layer)
+    или кнопкой «Импорт» на панели «Символы»; источник данных можно переназначить."""
+    fields, entries = style_entries(m)
+    name = os.path.splitext(os.path.basename(path))[0]
+    classes = []
+    for e in entries:
+        classes.append({"type": "CIMUniqueValueClass", "label": e["label"], "patch": "Default",
+                        "symbol": _cim_polygon(e["hex"]), "visible": True, "editable": True,
+                        "values": [{"type": "CIMUniqueValue", "fieldValues": list(v)}
+                                   for v in e["values"]]})
+    renderer = {"type": "CIMUniqueValueRenderer", "fields": fields,
+                "groups": [{"type": "CIMUniqueValueGroup", "classes": classes,
+                            "heading": ", ".join(fields)}],
+                "defaultLabel": "<прочие значения>", "defaultSymbol": _cim_polygon("#cccccc"),
+                "defaultSymbolPatch": "Default", "useDefaultSymbol": False,
+                "polygonSymbolColorTarget": "Fill"}
+    uri = f"CIMPATH=map/{re.sub(r'[^0-9A-Za-z_]', '_', name)}.json"
+    table = {"type": "CIMFeatureTable", "displayField": fields[0], "editable": True,
+             "studyAreaSpatialRel": "esriSpatialRelUndefined", "searchOrder": "esriSearchOrderSpatial"}
+    dc = _cim_data_connection(m.source.get("path", ""), m.source.get("layer"))
+    if dc:
+        table["dataConnection"] = dc
+    layer = {"type": "CIMFeatureLayer", "name": name, "uRI": uri,
+             "sourceModifiedTime": {"type": "TimeInstant"}, "useSourceMetadata": True,
+             "layerType": "Operational", "showLegends": True, "visibility": True,
+             "displayCacheType": "Permanent", "maxDisplayCacheAge": 5, "showPopups": True,
+             "serviceLayerID": -1, "refreshRate": -1, "refreshRateUnit": "esriTimeUnitsSeconds",
+             "autoGenerateFeatureTemplates": True, "featureElevationExpression": "0",
+             "featureTable": table, "htmlPopupEnabled": True, "selectable": True,
+             "featureCacheType": "Session", "renderer": renderer, "scaleSymbols": True,
+             "snappable": True}
+    doc = {"type": "CIMLayerDocument", "version": "2.6.0", "build": 24783,
+           "layers": [uri], "layerDefinitions": [layer]}
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(doc, f, ensure_ascii=False, indent=2)
+    return path
+
+
+def arcmap_layer_definition(m):
+    """Определение слоя (layerDefinition) в формате веб-карты ArcGIS для
+    arcpy.mapping.Layer.updateLayerFromJSON (ArcMap 10.x)."""
+    fields, entries = style_entries(m)
+
+    def sfs(h):
+        return {"type": "esriSFS", "style": "esriSFSSolid", "color": _rgb255(h) + [255],
+                "outline": {"type": "esriSLS", "style": "esriSLSSolid",
+                            "color": list(OUTLINE_RGB) + [255], "width": 0.4}}
+    infos = []
+    for e in entries:
+        for v in e["values"]:
+            infos.append({"value": ARCMAP_DELIM.join(v), "label": e["label"], "description": "",
+                          "symbol": sfs(e["hex"])})
+    rend = {"type": "uniqueValue", "field1": fields[0], "defaultSymbol": sfs("#cccccc"),
+            "defaultLabel": "Прочие значения", "uniqueValueInfos": infos}
+    if len(fields) == 2:
+        rend["field2"] = fields[1]
+        rend["fieldDelimiter"] = ARCMAP_DELIM
+    return {"drawingInfo": {"renderer": rend}}
+
+
+ARCMAP_TEMPLATE = r'''# -*- coding: utf-8 -*-
+"""
+Матричная легенда для ArcMap 10.8 (создано 09_MatrixLegend.py, %(date)s).
+
+ArcMap не позволяет создать файл .lyr вне программы, поэтому раскраска
+применяется этим скриптом внутри ArcMap и затем сохраняется в .lyr:
+
+1. Откройте ArcMap и добавьте полигональный слой с полями: %(fields_txt)s.
+2. Откройте окно Python (Геообработка → Python) и выполните:
+       execfile(r"%(script)s")
+   или щёлкните в окне Python правой кнопкой → Загрузить… → этот файл → Enter.
+3. Слой раскрасится; рядом будет сохранён файл слоя
+       %(lyr)s
+   Его можно применять к другим слоям: Свойства слоя → Символы → Импорт.
+
+Если в таблице содержания несколько подходящих слоёв, укажите имя нужного
+в LAYER_NAME ниже.
+"""
+from __future__ import print_function
+import json
+import os
+import arcpy
+
+LAYER_NAME = u""            # имя слоя в таблице содержания; пусто — первый слой с нужными полями
+FIELDS = %(fields)s
+OUT_LYR = r"%(lyr)s"
+LAYER_DEFINITION = json.loads(r"""%(json)s""")
+
+
+def _find_layer(mxd):
+    for lyr in arcpy.mapping.ListLayers(mxd):
+        if lyr.isGroupLayer or not lyr.isFeatureLayer:
+            continue
+        if LAYER_NAME and lyr.name != LAYER_NAME:
+            continue
+        names = [f.name.lower() for f in arcpy.ListFields(lyr)]
+        if all(f.lower() in names for f in FIELDS):
+            return lyr
+    return None
+
+
+def main():
+    mxd = arcpy.mapping.MapDocument("CURRENT")
+    lyr = _find_layer(mxd)
+    if lyr is None:
+        raise RuntimeError(u"Не найден слой с полями %%s" %% u", ".join(FIELDS))
+    lyr.updateLayerFromJSON(json.dumps(LAYER_DEFINITION))
+    arcpy.RefreshActiveView()
+    arcpy.RefreshTOC()
+    out = OUT_LYR
+    if not os.path.isdir(os.path.dirname(out)):
+        try:
+            out = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.path.basename(out))
+        except NameError:
+            out = os.path.join(arcpy.env.scratchFolder, os.path.basename(out))
+    try:
+        lyr.saveACopy(out, "10.8")
+    except Exception:
+        lyr.saveACopy(out)
+    print(u"Слой «%%s» раскрашен, файл слоя: %%s" %% (lyr.name, out))
+
+
+main()
+'''
+
+
+def write_arcmap_script(m, path, lyr_path):
+    fields, _ = style_entries(m)
+    js = json.dumps(arcmap_layer_definition(m), ensure_ascii=True)
+    txt = ARCMAP_TEMPLATE % {
+        "date": datetime.now().strftime("%d.%m.%Y %H:%M"),
+        "fields_txt": ", ".join(fields), "fields": repr([str(f) for f in fields]) if all(
+            f.isascii() for f in fields) else "[" + ", ".join(f"u{f!r}" for f in fields) + "]",
+        "script": os.path.abspath(path), "lyr": os.path.abspath(lyr_path), "json": js}
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(txt)
+    return path
+
+
+def save_styles(m, xlsx_path):
+    """Файлы стилей рядом с XLSX: <база>_qgis.qml, <база>_arcgispro.lyrx,
+    <база>_arcmap108.py (создаёт <база>_arcmap108.lyr в ArcMap)."""
+    base = os.path.splitext(os.path.abspath(xlsx_path))[0]
+    return [write_qml(m, base + "_qgis.qml"),
+            write_lyrx(m, base + "_arcgispro.lyrx"),
+            write_arcmap_script(m, base + "_arcmap108.py", base + "_arcmap108.lyr")]
+
+
 def _num(k):
     try:
         f = float(k)
@@ -993,6 +1307,9 @@ class App:
             row=1, column=0, columnspan=3, sticky="w", **pad)
         ttk.Button(f6, text="Загрузить раскраску из XLSX…", command=self._load_state).grid(
             row=2, column=0, columnspan=3, sticky="w", **pad)
+        self.v_styles = tk.BooleanVar(value=True)
+        ttk.Checkbutton(f6, text="Стили: QGIS, ArcGIS Pro, ArcMap 10.8",
+                        variable=self.v_styles).grid(row=4, column=0, columnspan=3, sticky="w", **pad)
         ttk.Label(f6, text="Файл XLSX").grid(row=3, column=0, sticky="w", **pad)
         self.v_out = tk.StringVar()
         ttk.Entry(f6, textvariable=self.v_out, width=24).grid(row=3, column=1, sticky="we", **pad)
@@ -1634,6 +1951,7 @@ class App:
             out += ".xlsx"
         try:
             save_xlsx(self.m, out)
+            styles = save_styles(self.m, out) if self.v_styles.get() else []
         except PermissionError:
             messagebox.showerror("Ошибка записи", f"Файл занят (открыт в Excel?):\n{out}", parent=self.win)
             return
@@ -1641,8 +1959,10 @@ class App:
             messagebox.showerror("Ошибка записи", str(ex), parent=self.win)
             return
         self.v_out.set(out)
-        self.status.set(f"Сохранено: {out}")
+        self.status.set(f"Сохранено: {out}" + (f" + стили ({len(styles)})" if styles else ""))
         log(f"Сохранено: {out}")
+        for sp in styles:
+            log(f"Стиль: {sp}")
 
     def run(self):
         self.redraw()
@@ -1705,6 +2025,7 @@ def main(argv=None):
     p.add_argument("--labels", choices=[k for k, _ in LABEL_MODES], default="name",
                    help="подписи строк/столбцов: name — название, num_name — номер — название, num — номер")
     p.add_argument("--area-unit", choices=list(AREA_UNITS), default="га")
+    p.add_argument("--no-styles", action="store_true", help="не создавать файлы стилей QGIS / ArcGIS")
     p.add_argument("--out", default=None)
     a = p.parse_args(argv)
 
@@ -1732,9 +2053,12 @@ def main(argv=None):
         log(m.source["area_note"])
     out = a.out or default_out_path(a.path, a.layer)
     save_xlsx(m, out)
+    styles = [] if a.no_styles else save_styles(m, out)
     log(f"Матрица {len(m.v_keys)} × {len(m.h_keys)}, сочетаний: {len(m.counts)}, "
         f"нераспознанных значений: {sum(m.skipped.values())}")
     log(f"Сохранено: {out}")
+    for sp in styles:
+        log(f"Стиль: {sp}")
 
 
 if __name__ == "__main__":
