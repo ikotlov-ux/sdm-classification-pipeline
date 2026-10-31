@@ -15,6 +15,19 @@
    Чайкин, Douglas-Peucker, разбиение без зазоров внутри тайла (repair),
    параллельные процессы (workers).
 
+3) КЛАССЫ БЕЗ РАСШИРЕНИЯ ГРАНИЦ (--no-expand, в окне — поле «Классы без
+   расширения границ»): сглаживание Чайкина и repair выпуклые дуги границы
+   могут вынести за пределы пикселей класса (типичная жалоба — «вода
+   выступает за берег»). Для перечисленных классов (например, вода) итоговая
+   геометрия обрезается по пиксельным границам класса в очищенном растре:
+   полигон не может выйти за пределы своих пикселей — ни на шаг сглаживания,
+   ни на упрощение DP. Пикселизация при этом по-прежнему сглаживается:
+   обрезается только выступ, внутри границы кривые Чайкина сохраняются.
+   Допуск --expand-tol (в пикселях, по умолчанию 0 — строго) разрешает
+   выступ не более заданной величины, если нужна совсем гладкая граница.
+   Побочный эффект: обрезанные выступы (не шире полпикселя) остаются
+   микрозазорами между классами; их убирает 08_Topology.
+
 Запуск из папки проекта:
     %run 07_generalization.py        # Jupyter — откроется окно
     python 07_generalization.py      # терминал — откроется окно
@@ -27,14 +40,14 @@
     если не отмечен флажок «Сохранить очищенный растр».
 
 Выход: 07_GENERALIZATION/<ддммгг_ччмм><_vXXX источника>/
-    <base>_sieveN_cM_smK.gpkg     слой classes: class_value, class_name, area
-    <base>_sieveN_cM_smK_cat.tif  только по флажку
+    <base>_sieveN_cM_smK_nxCLS.gpkg   (nx — классы без расширения, если заданы)
+    <base>_sieveN_cM_smK_nxCLS_cat.tif  только по флажку
     run_info.txt
 
 Без tkinter/дисплея — консольный режим. CLI сохранён:
     python 07_generalization.py class.tif --min-size 5 --connectivity 4 \
         --out-raster class_sieved.tif --out-vector class.gpkg --smooth 2 \
-        --tile 256 --workers 8
+        --tile 256 --workers 8 --no-expand 6 --expand-tol 0.25
 
 Производительность (растр 6174x6408, 25 классов, 2 ядра): sieve ~2.5 мин;
 тайл 256 px с repair ~4 c, 512 px ~46 c — тайл с repair не увеличивать.
@@ -597,8 +610,127 @@ def _tile_worker(task):
     return tid, len(rows_geom), time.time() - t0
 
 
+def _class_footprints(path, classes, verbose=True):
+    """
+    Пиксельные границы (footprint) классов: class -> список полигонов
+    (по одному на связную область, вершины — по краям пикселей).
+
+    Растр читается окнами, поэтому память не зависит от его размера.
+    """
+    import rasterio
+    from rasterio import features
+    from rasterio.windows import Window
+    from shapely.geometry import shape
+
+    classes = [int(c) for c in classes]
+    out = {c: [] for c in classes}
+    with rasterio.open(path) as src:
+        H, W = src.height, src.width
+        nodata = src.nodata
+        step = 2048
+        for r0 in range(0, H, step):
+            for c0 in range(0, W, step):
+                win = Window(c0, r0, min(step, W - c0), min(step, H - r0))
+                arr = src.read(1, window=win)
+                ok = np.ones(arr.shape, bool)
+                if nodata is not None:
+                    ok &= ~(np.isnan(arr) if np.isnan(nodata)
+                            else (arr == nodata))
+                for cls in classes:
+                    m = (arr == cls) & ok
+                    if not m.any():
+                        continue
+                    for g, v in features.shapes(
+                            m.astype(np.uint8), mask=m,
+                            transform=src.window_transform(win)):
+                        if v == 1:
+                            out[cls].append(shape(g))
+    if verbose:
+        for cls in classes:
+            n = len(out[cls])
+            if n:
+                print(f"[keep] класс {cls}: {n} областей в пиксельных границах")
+            else:
+                print(f"[keep] класс {cls}: пикселей нет — ограничение не действует")
+    return out
+
+
+def _clip_no_expand(gdf, path, no_expand, expand_tol=0.0, verbose=True):
+    """
+    Обрезать полигоны перечисленных классов по пиксельным границам класса.
+
+    Гарантия: полигон класса из no_expand не выходит за пределы пикселей
+    этого класса в очищенном растре (с допуском expand_tol пикселей, если
+    он > 0). Возвращает (gdf, число обрезанных полигонов, срезанная площадь).
+    """
+    import rasterio
+    from shapely import STRtree
+    from shapely.geometry import MultiPolygon
+    from shapely.ops import unary_union
+
+    no_expand = [int(c) for c in no_expand]
+    fps = _class_footprints(path, no_expand, verbose=verbose)
+    with rasterio.open(path) as src:
+        px = abs(src.transform.a)
+    tol = max(float(expand_tol), 0.0) * px
+
+    trees, comps = {}, {}
+    for cls in no_expand:
+        comps[cls] = fps[cls]
+        trees[cls] = STRtree(fps[cls]) if fps[cls] else None
+
+    n_clip = 0
+    area_cut = 0.0
+    new_geom, keep = [], []
+    for cls_val, g in zip(gdf["class_value"], gdf.geometry):
+        cls_val = int(cls_val)
+        if (cls_val not in trees or trees[cls_val] is None
+                or g is None or g.is_empty):
+            new_geom.append(g)
+            keep.append(True)
+            continue
+        tree, cl = trees[cls_val], comps[cls_val]
+        if tol > 0:
+            cand = [cl[i].buffer(tol) for i in tree.query(g)]
+        else:
+            cand = [cl[i] for i in tree.query(g)]
+        if not cand:
+            new_geom.append(g)
+            keep.append(True)
+            continue
+        lim = cand[0] if len(cand) == 1 else unary_union(cand)
+        diff = g.difference(lim)
+        if diff.is_empty or diff.area <= 1e-9:
+            new_geom.append(g)
+            keep.append(True)
+            continue
+        parts = _polygons(g.intersection(lim))
+        if not parts:                       # полигон целиком за границей
+            area_cut += float(g.area)
+            n_clip += 1
+            keep.append(False)
+            continue
+        g2 = parts[0] if len(parts) == 1 else MultiPolygon(parts)
+        if not g2.is_valid:
+            g2 = g2.buffer(0)
+        area_cut += float(diff.area)
+        n_clip += 1
+        new_geom.append(g2)
+        keep.append(True)
+
+    gdf = gdf.copy()
+    gdf["geometry"] = new_geom
+    gdf = gdf[np.array(keep)]
+    gdf = gdf[~gdf.geometry.is_empty].reset_index(drop=True)
+    if verbose:
+        print(f"[keep] обрезано полигонов {n_clip}, срезано выступов "
+              f"{area_cut:.1f} (единиц CRS²)")
+    return gdf, n_clip, area_cut
+
+
 def vectorize_raster_tiled(path, out_vector, tile=256, margin=16, smooth=0,
                            simplify=0.0, edge_mode="full", repair=True,
+                           no_expand=None, expand_tol=0.0,
                            workers=1, output_mode="patch", layer="classes",
                            parts_dir=None, resume=False, verbose=True):
     """
@@ -610,6 +742,10 @@ def vectorize_raster_tiled(path, out_vector, tile=256, margin=16, smooth=0,
       'class' — одна строка на класс (мультиполигон);
       'raw'   — как посчитано по тайлам, без слияния (самый быстрый и самый
                 экономный по памяти; видны разрезы по границам тайлов).
+
+    no_expand — список классов, границы которых нельзя расширять: их
+                полигоны после сборки обрезаются по пиксельным границам
+                класса (с допуском expand_tol пикселей).
     """
     import geopandas as gpd
     import pandas as pd
@@ -692,6 +828,10 @@ def vectorize_raster_tiled(path, out_vector, tile=256, margin=16, smooth=0,
         gdf["geometry"] = gdf.geometry.simplify(simplify, preserve_topology=True)
         gdf = gdf[~gdf.geometry.is_empty]
 
+    if no_expand:
+        gdf, n_clip, area_cut = _clip_no_expand(gdf, path, no_expand,
+                                                expand_tol, verbose=verbose)
+
     gdf["area"] = gdf.geometry.area
     if str(out_vector).lower().endswith(".gpkg"):
         gdf.to_file(out_vector, layer=layer, driver="GPKG")
@@ -710,7 +850,8 @@ def vectorize_raster_tiled(path, out_vector, tile=256, margin=16, smooth=0,
 
 def run(in_raster, min_size=3, connectivity=8, out_raster=None,
         out_vector=None, smooth=0, simplify=0.0, edge_mode="full",
-        repair=True, tile=256, margin=16, workers=1, output_mode="patch",
+        repair=True, tile=256, margin=16, no_expand=None, expand_tol=0.0,
+        workers=1, output_mode="patch",
         layer="classes", skip_vector=False, resume=False, verbose=True):
     import rasterio
 
@@ -751,7 +892,8 @@ def run(in_raster, min_size=3, connectivity=8, out_raster=None,
         vectorize_raster_tiled(
             src_for_vector, out_vector, tile=tile, margin=margin,
             smooth=smooth, simplify=simplify, edge_mode=edge_mode,
-            repair=repair, workers=workers, output_mode=output_mode,
+            repair=repair, no_expand=no_expand, expand_tol=expand_tol,
+            workers=workers, output_mode=output_mode,
             layer=layer, resume=resume, verbose=verbose,
         )
 
@@ -906,6 +1048,8 @@ def _default_params() -> dict:
         "workers": 1 if _in_notebook() else min(cap, 8),
         "output_mode": "patch",
         "save_raster": False,   # по умолчанию только вектор
+        "no_expand": [],        # классы, границы которых нельзя расширять
+        "expand_tol": 0.0,      # допуск расширения, пикселей (0 = строго)
     }
 
 
@@ -920,6 +1064,10 @@ def _make_tag(p: dict) -> str:
         tag += f"_dp{p['simplify']:g}"
     if not p["repair"]:
         tag += "_norep"
+    if p.get("no_expand"):
+        tag += "_nx" + "-".join(str(int(c)) for c in p["no_expand"])
+        if p.get("expand_tol", 0.0) > 0:
+            tag += f"t{p['expand_tol']:g}"
     return tag
 
 
@@ -974,6 +1122,8 @@ def generalize_files(files: list[str], params: dict, out_base: str) -> list[str]
                 repair=params["repair"],
                 tile=params["tile"],
                 margin=params["margin"],
+                no_expand=params.get("no_expand") or None,
+                expand_tol=params.get("expand_tol", 0.0),
                 workers=params["workers"],
                 output_mode=params["output_mode"],
                 layer="classes",
@@ -1117,6 +1267,8 @@ def _gui_dialog(root_dir: str):
         "workers": tk.StringVar(value=str(d["workers"])),
         "output_mode": tk.StringVar(value=d["output_mode"]),
         "save_raster": tk.BooleanVar(value=d["save_raster"]),
+        "no_expand": tk.StringVar(value=""),
+        "expand_tol": tk.StringVar(value="0"),
     }
 
     def radio(parent, var, opts):
@@ -1151,6 +1303,10 @@ def _gui_dialog(root_dir: str):
          lambda p: ttk.Spinbox(p, from_=0, to=256, textvariable=v["margin"], width=10)),
         ("Процессов" + (" (в Jupyter надёжно только 1)" if _in_notebook() else ""),
          lambda p: ttk.Spinbox(p, from_=1, to=64, textvariable=v["workers"], width=10)),
+        ("Классы без расширения границ (вода и т.п.), через запятую/пробел",
+         lambda p: ttk.Entry(p, textvariable=v["no_expand"], width=24)),
+        ("Допуск расширения, пикс. (0 — строго; 0.2-0.5 — глаже)",
+         lambda p: ttk.Entry(p, textvariable=v["expand_tol"], width=12)),
     ]
     for r, (label, make) in enumerate(rows):
         ttk.Label(fr_v, text=label).grid(row=r, column=0, sticky="w", padx=6, pady=3)
@@ -1194,9 +1350,15 @@ def _gui_dialog(root_dir: str):
                 "workers": max(int(v["workers"].get()), 1),
                 "output_mode": v["output_mode"].get(),
                 "save_raster": bool(v["save_raster"].get()),
+                "no_expand": [int(x) for x in re.split(r"[,;\s]+", v["no_expand"].get())
+                              if x.strip()],
+                "expand_tol": max(float(v["expand_tol"].get().replace(",", ".")), 0.0),
             }
         except (ValueError, tk.TclError):
-            messagebox.showerror("Ошибка", "Проверьте числовые параметры.", parent=win)
+            messagebox.showerror("Ошибка",
+                                 "Проверьте числовые параметры.\n"
+                                 "Классы — целые числа через запятую, "
+                                 "допуск — число пикселей.", parent=win)
             return
         result.update(files=list(files), params=params,
                       out_base=v_out.get().strip() or os.path.join(root_dir, OUT_BASE_NAME))
@@ -1229,6 +1391,11 @@ def _console_dialog(root_dir: str):
     p["simplify"] = _prompt_float("simplify (Douglas-Peucker, 0 = выкл)", d["simplify"])
     p["repair"] = _prompt_yes("repair (без зазоров; дольше)", d["repair"])
     p["workers"] = _prompt_int("workers (процессов)", d["workers"])
+    raw = input("  классы без расширения границ (вода и т.п.; через запятую, "
+                "Enter = нет): ").strip()
+    p["no_expand"] = [int(x) for x in re.split(r"[,;\s]+", raw) if x.strip()]
+    p["expand_tol"] = _prompt_float("expand_tol (допуск расширения, пикс.; 0 = строго)",
+                                    d["expand_tol"])
     p["save_raster"] = _prompt_yes("сохранить очищенный растр", False)
     return files, p, os.path.join(root_dir, OUT_BASE_NAME)
 
@@ -1286,6 +1453,11 @@ def main(argv=None):
                    help="запас вокруг тайла в пикселях (>= 8 при smooth > 0)")
     p.add_argument("--workers", type=int, default=1)
     p.add_argument("--output-mode", choices=["patch", "class", "raw"], default="patch")
+    p.add_argument("--no-expand", default="",
+                   help="классы, границы которых нельзя расширять (через запятую), "
+                        "например 6 или 6,12 — обычно вода")
+    p.add_argument("--expand-tol", type=float, default=0.0,
+                   help="допуск расширения в пикселях (0 = строго; 0.2-0.5 — глаже)")
     p.add_argument("--layer", default="classes")
     p.add_argument("--skip-vector", action="store_true")
     p.add_argument("--resume", action="store_true",
@@ -1296,8 +1468,10 @@ def main(argv=None):
     if not a.out_raster and not a.out_vector:
         p.error("укажите --out-raster и/или --out-vector")
 
+    no_expand = [int(x) for x in re.split(r"[,;\s]+", a.no_expand) if x.strip()]
     run(a.input, a.min_size, a.connectivity, a.out_raster, a.out_vector,
         a.smooth, a.simplify, a.edge_mode, not a.no_repair, a.tile, a.margin,
+        no_expand, a.expand_tol,
         a.workers, a.output_mode, a.layer, a.skip_vector, a.resume,
         verbose=not a.quiet)
 
