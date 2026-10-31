@@ -13,7 +13,10 @@
 2) ВЕКТОРИЗАЦИЯ тайлами (marching squares, уровень 0.5 по маске класса):
    узлы контура лежат между центрами пикселей, граница не «лестничная».
    Чайкин, Douglas-Peucker, разбиение без зазоров внутри тайла (repair),
-   параллельные процессы (workers).
+   параллельные процессы (workers). Упрощение DP применяется к СЕТИ ЛИНИЙ
+   внутри тайла, а не к полигонам по отдельности: общая граница двух
+   классов упрощается один раз, поэтому наложений между классами не
+   возникает (проверено попарно).
 
 3) НЕГЕНЕРАЛИЗУЕМЫЕ СЛОИ (вода, болота и т.п.): векторные полигоны
    замещают собой классификацию и не генерализуются — их границы остаются
@@ -406,12 +409,18 @@ def _polygons(geom):
     return []
 
 
-def _repair_topology(feats, arr, transform, frame, nodata_mask=None):
+def _repair_topology(feats, arr, transform, frame, nodata_mask=None,
+                     simplify=0.0):
     """
     Строгое разбиение без зазоров и перекрытий: все границы классов + рамка
     объединяются в линейную сеть, сеть разбивается на элементарные грани
     (polygonize), каждая грань получает класс по значению растра в её
     представительной точке, затем грани сливаются по классам.
+
+    simplify > 0: упрощение Douglas-Peucker применяется к СЕТИ ЛИНИЙ
+    (общая граница двух классов — одна линия, упрощается один раз), а не
+    к полигонам по отдельности — иначе общие границы соседних классов
+    расходятся и появляются наложения. Разбиение остаётся строгим.
 
     Вызывается ТОЛЬКО в пределах одного тайла — на весь растр эта операция
     неподъёмна.
@@ -423,7 +432,12 @@ def _repair_topology(feats, arr, transform, frame, nodata_mask=None):
 
     lines = [g.boundary for _, g in feats]
     lines.append(frame.exterior)
-    faces = list(polygonize(unary_union(lines)))
+    net = unary_union(lines)
+    if simplify and simplify > 0 and not net.is_empty:
+        net = net.simplify(simplify)
+        if net.is_empty:
+            return feats
+    faces = list(polygonize(net))
     if not faces:
         return feats
 
@@ -453,7 +467,7 @@ def _repair_topology(feats, arr, transform, frame, nodata_mask=None):
 
 def vectorize_window(arr, transform, nodata_mask=None, smooth=0,
                      edge_flags=(False, False, False, False),
-                     edge_mode="full", repair=True):
+                     edge_mode="full", repair=True, simplify=0.0):
     """
     Векторизация одного окна методом marching squares.
 
@@ -518,7 +532,17 @@ def vectorize_window(arr, transform, nodata_mask=None, smooth=0,
             results.append((int(cls), geom))
 
     if repair:
-        results = _repair_topology(results, arr, transform, frame, nodata_mask)
+        results = _repair_topology(results, arr, transform, frame, nodata_mask,
+                                   simplify=simplify)
+    elif simplify and simplify > 0:
+        # без repair упрощаем каждый полигон отдельно: у соседних классов
+        # общие границы могут разойтись (возможны наложения/зазоры)
+        out = []
+        for cls, g in results:
+            g = g.simplify(simplify, preserve_topology=True)
+            if not g.is_empty:
+                out.append((cls, g))
+        results = out
     return results
 
 
@@ -553,9 +577,10 @@ def _clamp_workers(workers, n_tasks, verbose=True):
     return w
 
 
-def _init_worker(path, margin, smooth, edge_mode, repair, parts_dir):
+def _init_worker(path, margin, smooth, edge_mode, repair, simplify, parts_dir):
     _JOB.update(path=path, margin=margin, smooth=smooth,
-                edge_mode=edge_mode, repair=repair, parts_dir=parts_dir)
+                edge_mode=edge_mode, repair=repair, simplify=simplify,
+                parts_dir=parts_dir)
 
 
 def _tile_worker(task):
@@ -601,7 +626,7 @@ def _tile_worker(task):
     edge_flags = (r0 == 0, r1 == H, c0 == 0, c1 == W)
     feats = vectorize_window(arr, wt, nd_mask, smooth=j["smooth"],
                              edge_flags=edge_flags, edge_mode=j["edge_mode"],
-                             repair=j["repair"])
+                             repair=j["repair"], simplify=j.get("simplify", 0.0))
 
     rows_cls, rows_geom = [], []
     for cls, g in feats:
@@ -923,7 +948,7 @@ def vectorize_raster_tiled(path, out_vector, tile=256, margin=16, smooth=0,
     n_geom = 0
 
     if workers <= 1:
-        _init_worker(path, margin, smooth, edge_mode, repair, parts_dir)
+        _init_worker(path, margin, smooth, edge_mode, repair, simplify, parts_dir)
         for t in tasks:
             _, n, dt = _tile_worker(t)
             done += 1
@@ -936,7 +961,8 @@ def vectorize_raster_tiled(path, out_vector, tile=256, margin=16, smooth=0,
     else:
         with ProcessPoolExecutor(
             max_workers=workers, initializer=_init_worker,
-            initargs=(path, margin, smooth, edge_mode, repair, parts_dir),
+            initargs=(path, margin, smooth, edge_mode, repair, simplify,
+                      parts_dir),
         ) as ex:
             futs = [ex.submit(_tile_worker, t) for t in tasks]
             for f in as_completed(futs):
@@ -970,9 +996,8 @@ def vectorize_raster_tiled(path, out_vector, tile=256, margin=16, smooth=0,
         if output_mode == "patch":
             gdf = gdf.explode(index_parts=False, ignore_index=True)
 
-    if simplify and simplify > 0:
-        gdf["geometry"] = gdf.geometry.simplify(simplify, preserve_topology=True)
-        gdf = gdf[~gdf.geometry.is_empty]
+    # упрощение DP выполняется внутри тайлов (по сети линий, если repair) —
+    # глобальное упрощение полигонов создало бы наложения соседних классов
 
     if no_expand:
         gdf, n_clip, area_cut = _clip_no_expand(gdf, path, no_expand,
