@@ -15,18 +15,21 @@
    Чайкин, Douglas-Peucker, разбиение без зазоров внутри тайла (repair),
    параллельные процессы (workers).
 
-3) КЛАССЫ БЕЗ РАСШИРЕНИЯ ГРАНИЦ (--no-expand, в окне — поле «Классы без
-   расширения границ»): сглаживание Чайкина и repair выпуклые дуги границы
-   могут вынести за пределы пикселей класса (типичная жалоба — «вода
-   выступает за берег»). Для перечисленных классов (например, вода) итоговая
-   геометрия обрезается по пиксельным границам класса в очищенном растре:
-   полигон не может выйти за пределы своих пикселей — ни на шаг сглаживания,
-   ни на упрощение DP. Пикселизация при этом по-прежнему сглаживается:
-   обрезается только выступ, внутри границы кривые Чайкина сохраняются.
-   Допуск --expand-tol (в пикселях, по умолчанию 0 — строго) разрешает
-   выступ не более заданной величины, если нужна совсем гладкая граница.
-   Побочный эффект: обрезанные выступы (не шире полпикселя) остаются
-   микрозазорами между классами; их убирает 08_Topology.
+3) НЕГЕНЕРАЛИЗУЕМЫЕ СЛОИ (вода, болота и т.п.): векторные полигоны
+   замещают собой классификацию и не генерализуются — их границы остаются
+   точно такими, как во входном слое. Остальные категории подстраиваются:
+   их полигоны обрезаются по границам негенерализуемых слоёв. Слоёв можно
+   добавить несколько («Добавить ещё…»): файл + (для GPKG) имя слоя + номер
+   класса в классификации. Слои, пересекающиеся между собой: приоритет у
+   верхнего в списке. При другом CRS слой перепроецируется в CRS растра;
+   за пределы растра полигоны обрезаются.
+
+   Если у класса есть такой слой, классифицированные пиксели этого класса
+   остаются только там, где их не накрывает слой.
+
+4) КЛАССЫ БЕЗ РАСШИРЕНИЯ ГРАНИЦ (--no-expand): полигоны перечисленных
+   классов обрезаются по пиксельным границам класса (с допуском
+   --expand-tol пикселей) — для классов, у которых нет векторного слоя.
 
 Запуск из папки проекта:
     %run 07_generalization.py        # Jupyter — откроется окно
@@ -40,14 +43,15 @@
     если не отмечен флажок «Сохранить очищенный растр».
 
 Выход: 07_GENERALIZATION/<ддммгг_ччмм><_vXXX источника>/
-    <base>_sieveN_cM_smK_nxCLS.gpkg   (nx — классы без расширения, если заданы)
+    <base>_sieveN_cM_smK_ref6-7.gpkg   (ref — номера негенерализуемых классов)
     <base>_sieveN_cM_smK_nxCLS_cat.tif  только по флажку
     run_info.txt
 
 Без tkinter/дисплея — консольный режим. CLI сохранён:
     python 07_generalization.py class.tif --min-size 5 --connectivity 4 \
         --out-raster class_sieved.tif --out-vector class.gpkg --smooth 2 \
-        --tile 256 --workers 8 --no-expand 6 --expand-tol 0.25
+        --tile 256 --workers 8 --ref "D:\\geo\\lakes.gpkg|water|6" \\
+        --ref "D:\\geo\\bogs.gpkg|7"
 
 Производительность (растр 6174x6408, 25 классов, 2 ядра): sieve ~2.5 мин;
 тайл 256 px с repair ~4 c, 512 px ~46 c — тайл с repair не увеличивать.
@@ -610,6 +614,145 @@ def _tile_worker(task):
     return tid, len(rows_geom), time.time() - t0
 
 
+def _parse_ref_spec(spec: str) -> dict:
+    """'файл|класс' или 'файл|слой|класс' -> {path, layer, class_value}."""
+    parts = [p for p in str(spec).split("|")]
+    if len(parts) == 2:
+        path, cls = parts
+        layer = None
+    elif len(parts) == 3:
+        path, layer, cls = parts
+    else:
+        raise ValueError(f"Слой-эталон «{spec}»: ожидается файл|класс "
+                         f"или файл|имя слоя|класс")
+    path = path.strip()
+    cls = cls.strip()
+    if not path or not cls:
+        raise ValueError(f"Слой-эталон «{spec}»: не заданы файл или класс")
+    try:
+        cv = int(float(cls))
+    except ValueError:
+        raise ValueError(f"Слой-эталон «{spec}»: номер класса должен быть "
+                         f"числом, получено «{cls}»")
+    return {"path": path, "layer": layer or None, "class_value": cv}
+
+
+def _apply_ref_layers(gdf, path, refs, verbose=True):
+    """
+    Негенерализуемые слои: замещают классификацию, границы не меняются.
+
+    refs — список {path, layer, class_value} в порядке приоритета: верхний
+    слой в списке главнее (при пересечении из нижнего вычитается верхний).
+    Возвращает (gdf, суммарная площадь слоёв).
+    """
+    import geopandas as gpd
+    import pandas as pd
+    import rasterio
+    from shapely import STRtree
+    from shapely.geometry import MultiPolygon
+    from shapely.ops import unary_union
+
+    refs = list(refs)
+    with rasterio.open(path) as src:
+        bbox = src.bounds
+        crs = src.crs
+    frame = MultiPolygon() if False else None
+    from shapely.geometry import box
+    frame = box(*bbox)
+
+    kept = []          # [(class_value, geom)]
+    total_area = 0.0
+    cumulative = None
+    for i, ref in enumerate(refs, 1):
+        try:
+            r = gpd.read_file(ref["path"], layer=ref.get("layer") or None)
+        except Exception as e:
+            raise RuntimeError(f"Не удалось прочитать слой-эталон "
+                               f"{ref['path']}: {e}")
+        if r.crs is not None and r.crs != crs:
+            r = r.to_crs(crs)
+        geoms = [g for g in r.geometry if g is not None and not g.is_empty]
+        if not geoms:
+            if verbose:
+                print(f"[ref] слой {i}: {ref['path']} — пустая геометрия, "
+                      f"пропущен", flush=True)
+            continue
+        g = unary_union(geoms).intersection(frame)
+        if g.is_empty:
+            if verbose:
+                print(f"[ref] слой {i}: {ref['path']} — вне растра, пропущен",
+                      flush=True)
+            continue
+        if cumulative is not None:
+            g = g.difference(cumulative)
+            if g.is_empty:
+                if verbose:
+                    print(f"[ref] слой {i}: {ref['path']} — полностью перекрыт "
+                          f"слоями выше, пропущен", flush=True)
+                continue
+        cumulative = g if cumulative is None else unary_union([cumulative, g])
+        total_area += float(g.area)
+        n = len(getattr(g, "geoms", [g]))
+        if verbose:
+            print(f"[ref] слой {i}: {os.path.basename(ref['path'])}"
+                  + (f" ({ref['layer']})" if ref.get("layer") else "")
+                  + f" -> класс {ref['class_value']}: {n} полигонов, "
+                  f"{g.area:.1f} (единиц CRS²)", flush=True)
+        kept.append((int(ref["class_value"]), g))
+
+    if not kept:
+        return gdf, 0.0
+
+    ref_union = cumulative
+    comps = list(getattr(ref_union, "geoms", [ref_union]))
+    tree = STRtree(comps)
+
+    # 1) классификация подстраивается: вычитаем эталон из всех полигонов
+    new_geom, keep = [], []
+    n_cut = 0
+    area_cut = 0.0
+    for cls_val, g in zip(gdf["class_value"], gdf.geometry):
+        if g is None or g.is_empty:
+            new_geom.append(g)
+            keep.append(True)
+            continue
+        cand = [comps[i] for i in tree.query(g)]
+        if not cand:
+            new_geom.append(g)
+            keep.append(True)
+            continue
+        lim = cand[0] if len(cand) == 1 else unary_union(cand)
+        diff = g.difference(lim)
+        if diff.is_empty or diff.area <= 1e-9:
+            new_geom.append(None)
+            keep.append(False)
+            continue
+        parts = _polygons(diff)
+        if not parts:
+            new_geom.append(None)
+            keep.append(False)
+            continue
+        area_cut += float(g.area - diff.area)
+        n_cut += 1
+        new_geom.append(parts[0] if len(parts) == 1 else MultiPolygon(parts))
+        keep.append(True)
+    gdf = gdf.copy()
+    gdf["geometry"] = new_geom
+    gdf = gdf[np.array(keep)]
+    gdf = gdf[~gdf.geometry.is_empty].reset_index(drop=True)
+    if verbose:
+        print(f"[ref] классификация подстроена: обрезано полигонов {n_cut}, "
+              f"изъято {area_cut:.1f} (единиц CRS²)", flush=True)
+
+    # 2) эталоны вставляются как есть, граница не меняется
+    rows = [{"class_value": cv, "geometry": g} for cv, g in kept]
+    ref_gdf = gpd.GeoDataFrame(rows, crs=gdf.crs)
+    gdf = gpd.GeoDataFrame(
+        pd.concat([ref_gdf, gdf], ignore_index=True), geometry="geometry",
+        crs=gdf.crs)
+    return gdf, total_area
+
+
 def _class_footprints(path, classes, verbose=True):
     """
     Пиксельные границы (footprint) классов: class -> список полигонов
@@ -730,7 +873,7 @@ def _clip_no_expand(gdf, path, no_expand, expand_tol=0.0, verbose=True):
 
 def vectorize_raster_tiled(path, out_vector, tile=256, margin=16, smooth=0,
                            simplify=0.0, edge_mode="full", repair=True,
-                           no_expand=None, expand_tol=0.0,
+                           no_expand=None, expand_tol=0.0, refs=None,
                            workers=1, output_mode="patch", layer="classes",
                            parts_dir=None, resume=False, verbose=True):
     """
@@ -746,6 +889,9 @@ def vectorize_raster_tiled(path, out_vector, tile=256, margin=16, smooth=0,
     no_expand — список классов, границы которых нельзя расширять: их
                 полигоны после сборки обрезаются по пиксельным границам
                 класса (с допуском expand_tol пикселей).
+    refs      — негенерализуемые слои [{path, layer, class_value}, ...]:
+                замещают классификацию, границы не меняются, остальные
+                классы обрезаются по ним (приоритет — порядок в списке).
     """
     import geopandas as gpd
     import pandas as pd
@@ -832,6 +978,9 @@ def vectorize_raster_tiled(path, out_vector, tile=256, margin=16, smooth=0,
         gdf, n_clip, area_cut = _clip_no_expand(gdf, path, no_expand,
                                                 expand_tol, verbose=verbose)
 
+    if refs:
+        gdf, ref_area = _apply_ref_layers(gdf, path, refs, verbose=verbose)
+
     gdf["area"] = gdf.geometry.area
     if str(out_vector).lower().endswith(".gpkg"):
         gdf.to_file(out_vector, layer=layer, driver="GPKG")
@@ -851,7 +1000,7 @@ def vectorize_raster_tiled(path, out_vector, tile=256, margin=16, smooth=0,
 def run(in_raster, min_size=3, connectivity=8, out_raster=None,
         out_vector=None, smooth=0, simplify=0.0, edge_mode="full",
         repair=True, tile=256, margin=16, no_expand=None, expand_tol=0.0,
-        workers=1, output_mode="patch",
+        refs=None, workers=1, output_mode="patch",
         layer="classes", skip_vector=False, resume=False, verbose=True):
     import rasterio
 
@@ -893,7 +1042,7 @@ def run(in_raster, min_size=3, connectivity=8, out_raster=None,
             src_for_vector, out_vector, tile=tile, margin=margin,
             smooth=smooth, simplify=simplify, edge_mode=edge_mode,
             repair=repair, no_expand=no_expand, expand_tol=expand_tol,
-            workers=workers, output_mode=output_mode,
+            refs=refs, workers=workers, output_mode=output_mode,
             layer=layer, resume=resume, verbose=verbose,
         )
 
@@ -1050,6 +1199,7 @@ def _default_params() -> dict:
         "save_raster": False,   # по умолчанию только вектор
         "no_expand": [],        # классы, границы которых нельзя расширять
         "expand_tol": 0.0,      # допуск расширения, пикселей (0 = строго)
+        "refs": [],             # негенерализуемые слои [{path, layer, class_value}]
     }
 
 
@@ -1068,6 +1218,8 @@ def _make_tag(p: dict) -> str:
         tag += "_nx" + "-".join(str(int(c)) for c in p["no_expand"])
         if p.get("expand_tol", 0.0) > 0:
             tag += f"t{p['expand_tol']:g}"
+    if p.get("refs"):
+        tag += "_ref" + "-".join(str(int(r_["class_value"])) for r_ in p["refs"])
     return tag
 
 
@@ -1124,6 +1276,7 @@ def generalize_files(files: list[str], params: dict, out_base: str) -> list[str]
                 margin=params["margin"],
                 no_expand=params.get("no_expand") or None,
                 expand_tol=params.get("expand_tol", 0.0),
+                refs=params.get("refs") or None,
                 workers=params["workers"],
                 output_mode=params["output_mode"],
                 layer="classes",
@@ -1315,6 +1468,107 @@ def _gui_dialog(root_dir: str):
                     variable=v["repair"]).grid(row=len(rows), column=0, columnspan=2,
                                                sticky="w", padx=6, pady=3)
 
+    # --- негенерализуемые слои ---
+    fr_ref = ttk.LabelFrame(
+        win, text="Негенерализуемые слои (вода, болота): замещают классификацию, границы не меняются")
+    fr_ref.pack(fill="x", **pad)
+    ref_entries: list[dict] = []          # [{path, layer, class_value}]
+
+    lb_ref = tk.Listbox(fr_ref, height=4, activestyle="dotbox")
+    lb_ref.pack(fill="x", padx=6, pady=(6, 2))
+
+    fr_rf1 = ttk.Frame(fr_ref)
+    fr_rf1.pack(fill="x", padx=6)
+    ttk.Label(fr_rf1, text="Файл").grid(row=0, column=0, sticky="w", pady=2)
+    v_ref_path = tk.StringVar()
+    ttk.Entry(fr_rf1, textvariable=v_ref_path, width=58).grid(
+        row=0, column=1, columnspan=3, sticky="we", padx=4)
+    def browse_ref():
+        pth = filedialog.askopenfilename(
+            parent=win, title="Слой негенерализуемых полигонов",
+            filetypes=[("Векторные слои", "*.gpkg *.shp *.geojson *.fgb"),
+                       ("Все файлы", "*.*")])
+        if pth:
+            v_ref_path.set(pth)
+            try:
+                import pyogrio
+                layers = [l[0] for l in pyogrio.list_layers(pth)]
+                if len(layers) == 1:
+                    v_ref_layer.set(layers[0])
+                cb_ref_layer.configure(values=layers)
+            except Exception:
+                pass
+    ttk.Button(fr_rf1, text="Обзор…", command=browse_ref).grid(row=0, column=4, padx=4)
+
+    ttk.Label(fr_rf1, text="Слой (GPKG)").grid(row=1, column=0, sticky="w", pady=2)
+    v_ref_layer = tk.StringVar()
+    cb_ref_layer = ttk.Combobox(fr_rf1, textvariable=v_ref_layer, width=24)
+    cb_ref_layer.grid(row=1, column=1, sticky="w", padx=4)
+    ttk.Label(fr_rf1, text="Номер класса").grid(row=1, column=2, sticky="e", padx=(10, 0))
+    v_ref_cls = tk.StringVar()
+    ttk.Entry(fr_rf1, textvariable=v_ref_cls, width=8).grid(row=1, column=3, sticky="w", padx=4)
+
+    def _ref_item(e):
+        return (f"{os.path.basename(e['path'])}"
+                + (f" | {e['layer']}" if e.get("layer") else "")
+                + f" | класс {e['class_value']}")
+    def _ref_refresh():
+        lb_ref.delete(0, "end")
+        for e in ref_entries:
+            lb_ref.insert("end", _ref_item(e))
+    def _ref_fields(e):
+        v_ref_path.set(e["path"])
+        v_ref_layer.set(e.get("layer") or "")
+        v_ref_cls.set(str(e["class_value"]))
+    def _ref_from_fields():
+        pth = v_ref_path.get().strip()
+        cls = v_ref_cls.get().strip()
+        if not pth:
+            messagebox.showwarning("Слой", "Выберите файл слоя.", parent=win)
+            return None
+        try:
+            cv = int(float(cls))
+        except ValueError:
+            messagebox.showwarning("Слой", "Номер класса должен быть числом.",
+                                   parent=win)
+            return None
+        return {"path": pth, "layer": v_ref_layer.get().strip() or None,
+                "class_value": cv}
+    def ref_add():
+        e = _ref_from_fields()
+        if e is None:
+            return
+        ref_entries.append(e)
+        _ref_refresh()
+        lb_ref.see("end")
+        v_ref_path.set(""); v_ref_layer.set(""); v_ref_cls.set("")
+    def ref_change():
+        sel = lb_ref.curselection()
+        if not sel:
+            return
+        e = _ref_from_fields()
+        if e is None:
+            return
+        ref_entries[sel[0]] = e
+        _ref_refresh()
+    def ref_del():
+        for i in reversed(lb_ref.curselection()):
+            ref_entries.pop(i)
+        _ref_refresh()
+    def ref_edit(_ev):
+        sel = lb_ref.curselection()
+        if sel:
+            _ref_fields(ref_entries[sel[0]])
+    lb_ref.bind("<Double-Button-1>", ref_edit)
+
+    fr_rf2 = ttk.Frame(fr_ref)
+    fr_rf2.pack(fill="x", padx=6, pady=(2, 6))
+    ttk.Button(fr_rf2, text="Добавить ещё", command=ref_add).pack(side="left")
+    ttk.Button(fr_rf2, text="Изменить", command=ref_change).pack(side="left", padx=6)
+    ttk.Button(fr_rf2, text="Удалить выбранные", command=ref_del).pack(side="left")
+    ttk.Label(fr_rf2, text="двойной щелчок — правка строки; верхний слой в списке главнее"
+              ).pack(side="right")
+
     # --- вывод ---
     fr_o = ttk.LabelFrame(win, text="Результаты")
     fr_o.pack(fill="x", **pad)
@@ -1353,6 +1607,7 @@ def _gui_dialog(root_dir: str):
                 "no_expand": [int(x) for x in re.split(r"[,;\s]+", v["no_expand"].get())
                               if x.strip()],
                 "expand_tol": max(float(v["expand_tol"].get().replace(",", ".")), 0.0),
+                "refs": list(ref_entries),
             }
         except (ValueError, tk.TclError):
             messagebox.showerror("Ошибка",
@@ -1396,6 +1651,19 @@ def _console_dialog(root_dir: str):
     p["no_expand"] = [int(x) for x in re.split(r"[,;\s]+", raw) if x.strip()]
     p["expand_tol"] = _prompt_float("expand_tol (допуск расширения, пикс.; 0 = строго)",
                                     d["expand_tol"])
+    refs = []
+    while True:
+        raw = input("  негенерализуемый слой: файл (Enter = больше не добавлять): ").strip()
+        if not raw:
+            break
+        layer = input("    имя слоя в файле (Enter = первый/единственный): ").strip()
+        cls = input("    номер класса в классификации (например 6): ").strip()
+        try:
+            refs.append({"path": raw, "layer": layer or None,
+                         "class_value": int(float(cls))})
+        except ValueError:
+            print("    ! номер класса должен быть числом — слой пропущен")
+    p["refs"] = refs
     p["save_raster"] = _prompt_yes("сохранить очищенный растр", False)
     return files, p, os.path.join(root_dir, OUT_BASE_NAME)
 
@@ -1458,6 +1726,9 @@ def main(argv=None):
                         "например 6 или 6,12 — обычно вода")
     p.add_argument("--expand-tol", type=float, default=0.0,
                    help="допуск расширения в пикселях (0 = строго; 0.2-0.5 — глаже)")
+    p.add_argument("--ref", action="append", default=[], metavar="ФАЙЛ|СЛОЙ|КЛАСС",
+                   help="негенерализуемый слой: замещает классификацию, границы не "
+                        "меняются (можно несколько раз; СЛОЙ можно опустить: ФАЙЛ|КЛАСС)")
     p.add_argument("--layer", default="classes")
     p.add_argument("--skip-vector", action="store_true")
     p.add_argument("--resume", action="store_true",
@@ -1469,9 +1740,10 @@ def main(argv=None):
         p.error("укажите --out-raster и/или --out-vector")
 
     no_expand = [int(x) for x in re.split(r"[,;\s]+", a.no_expand) if x.strip()]
+    refs = [_parse_ref_spec(spec) for spec in a.ref]
     run(a.input, a.min_size, a.connectivity, a.out_raster, a.out_vector,
         a.smooth, a.simplify, a.edge_mode, not a.no_repair, a.tile, a.margin,
-        no_expand, a.expand_tol,
+        no_expand, a.expand_tol, refs,
         a.workers, a.output_mode, a.layer, a.skip_vector, a.resume,
         verbose=not a.quiet)
 
