@@ -77,7 +77,7 @@ python classification/02_classification.py         # выбор предикто
 python classification/03_tune_models.py            # обучение RF / CatBoost / LightGBM / XGBoost / Ridge / LDA / QDA
 python classification/04_predict_map.py            # финальная растровая карта + QGIS-проект
 python classification/05_classwise_importance.py   # per-class permutation importance + GAM-отклики
-python classification/07_generalization.py        # генерализация: sieve + сглаженный вектор (окно выбора файлов)
+python classification/07_generalization.py        # генерализация: sieve + сглаженный вектор; негенерализуемые слои (вода OSM) со стиранием классов растра
 python classification/08_Topology.py              # замена классов объектами целевых слоёв (OSM) + исправление топологии
 python classification/09_MatrixLegend.py          # матричная легенда: цвет × тон, XLSX + стили .qml / .lyrx / ArcMap
 ```

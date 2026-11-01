@@ -27,6 +27,15 @@
    верхнего в списке. При другом CRS слой перепроецируется в CRS растра;
    за пределы растра полигоны обрезаются.
 
+   СТИРАНИЕ КЛАССОВ РАСТРА («стираемые классы» у каждого слоя): пиксели
+   перечисленных классов растра передаются ПРЕОБЛАДАЮЩЕМУ соседнему классу
+   (механизм sieve), поэтому генерализация по ним не проводится и дыр
+   не остаётся; категорию предоставляют только полигоны слоя. Пример:
+   слой «озёра OSM» с классом 400 и стираемыми классами 1400,2400,3400,4400
+   убирает из классификации ВСЮ растровую воду (включая «бахрому» вдоль
+   берегов, которую сглаживание превращало в артефакты) — вода в карте
+   остаётся только по контурам OSM. По умолчанию стирается сам класс слоя.
+
    Если у класса есть такой слой, классифицированные пиксели этого класса
    остаются только там, где их не накрывает слой.
 
@@ -112,7 +121,7 @@ def _pair_slices(dr, dc, shape):
 
 
 def _sieve_pass_window(out, valid, r0, r1, inner_lo, inner_hi, min_size,
-                       struct, shifts, stage=0):
+                       struct, shifts, stage=0, force_classes=None):
     """
     Один проход по окну строк [r0, r1) массива out.
 
@@ -143,12 +152,15 @@ def _sieve_pass_window(out, valid, r0, r1, inner_lo, inner_hi, min_size,
     if classes.size < 2:
         return 0, 0
     n_cls = classes.size
+    force = (set(int(c) for c in force_classes) if force_classes else set()
+    ) & set(int(c) for c in classes)
     lut_off = int(classes.min())
     lut = np.zeros(int(classes.max()) - lut_off + 1, np.int32)
     lut[classes - lut_off] = np.arange(n_cls, dtype=np.int32)
 
     # нумерация связных областей по всем классам окна
     lab = np.zeros((hh, ww), np.int32)
+    force_lbl = np.zeros(0, dtype=np.int64)
     offset = 0
     for c in classes:
         m = (win == c) & vw
@@ -157,9 +169,15 @@ def _sieve_pass_window(out, valid, r0, r1, inner_lo, inner_hi, min_size,
         l, n = ndi.label(m, structure=struct)
         if n:
             lab[m] = l[m] + offset
+            if c in force:
+                force_lbl = np.r_[force_lbl,
+                                  np.arange(offset + 1, offset + n + 1)]
             offset += n
     if offset == 0:
         return 0, 0
+    forced = np.zeros(offset + 1, dtype=bool)
+    if force_lbl.size:
+        forced[force_lbl] = True
 
     flat = lab.ravel()
     sizes = np.bincount(flat, minlength=offset + 1)
@@ -170,6 +188,7 @@ def _sieve_pass_window(out, valid, r0, r1, inner_lo, inner_hi, min_size,
     first_row[ulab] = (ufirst // ww).astype(np.int32)
 
     ok = (sizes > 0) & (sizes < min_size)
+    ok |= forced                      # классы на стирание — любого размера
     ok[0] = False
     ok &= (first_row >= inner_lo) & (first_row < inner_hi)
     small_lbl = np.nonzero(ok)[0]
@@ -254,10 +273,14 @@ def sieve_majority_fast(arr: np.ndarray,
                         nodata_mask: np.ndarray | None = None,
                         max_iter: int = 30,
                         chunk_rows: int = 1024,
+                        force_classes=None,
                         verbose: bool = True) -> np.ndarray:
     """
     Группы связных пикселей одного класса площадью < min_size получают
     ПРЕОБЛАДАЮЩИЙ соседний класс (голосование по числу примыкающих пикселей).
+
+    force_classes — классы, чьи группы передаются соседям ЛЮБОГО размера
+    (стирание класса из растра перед заменой его векторным слоем).
 
     Отличия от версии v1:
       * нет Python-цикла по компонентам (при 13.7 млн групп это часы) —
@@ -268,7 +291,8 @@ def sieve_majority_fast(arr: np.ndarray,
     Отличие от gdal.SieveFilter: там группа отдаётся самому БОЛЬШОМУ соседу,
     здесь — соседу с наибольшей длиной общей границы.
     """
-    if min_size is None or min_size <= 1:
+    only_force = bool(force_classes) and (min_size is None or min_size <= 1)
+    if (min_size is None or min_size <= 1) and not only_force:
         if verbose:
             print("[sieve] min_size <= 1 — фильтрация пропущена")
         return arr.copy()
@@ -278,7 +302,7 @@ def sieve_majority_fast(arr: np.ndarray,
     struct = _structure(connectivity)
     shifts = _shifts(connectivity)
     H = out.shape[0]
-    ov = max(min_size + 2, 3)
+    ov = max((min_size if min_size and min_size > 1 else 1) + 2, 3)
     step = max(chunk_rows, ov * 4)
 
     stage = 0
@@ -291,12 +315,14 @@ def sieve_majority_fast(arr: np.ndarray,
             r0 = max(0, lo - ov)
             r1 = min(H, hi + ov)
             ch, un = _sieve_pass_window(out, valid, r0, r1, lo - r0, hi - r0,
-                                        min_size, struct, shifts, stage)
+                                        min_size, struct, shifts, stage,
+                                        force_classes=force_classes)
             changed += ch
             unresolved += un
         if verbose:
             tag = "" if stage == 0 else " [резервный режим]"
-            print(f"[sieve] итерация {it}{tag}: переназначено {changed}, "
+            tag2 = " (стирание классов)" if force_classes else ""
+            print(f"[sieve] итерация {it}{tag}{tag2}: переназначено {changed}, "
                   f"осталось групп без крупного соседа {unresolved}, "
                   f"{time.time() - t0:.1f} c")
         if changed == 0 and unresolved == 0:
@@ -640,16 +666,30 @@ def _tile_worker(task):
 
 
 def _parse_ref_spec(spec: str) -> dict:
-    """'файл|класс' или 'файл|слой|класс' -> {path, layer, class_value}."""
+    """'файл|класс' | 'файл|слой|класс' | 'файл|слой|класс|стираемые'
+    -> {path, layer, class_value, erase}.
+
+    стираемые — коды классов растра через запятую: их пиксели передаются
+    преобладающему соседнему классу ещё до sieve (генерализация по ним не
+    проводится, категорию даёт только сам слой). Пустой слой:
+    'файл||класс|стираемые'."""
     parts = [p for p in str(spec).split("|")]
+    erase = None
+    if len(parts) == 4:
+        *parts, er = parts
+        try:
+            erase = [int(x) for x in re.split(r"[,;\s]+", er) if x.strip()]
+        except ValueError:
+            raise ValueError(f"Слой-эталон «{spec}»: стираемые классы — "
+                             f"целые числа через запятую, получено «{er}»")
     if len(parts) == 2:
         path, cls = parts
         layer = None
     elif len(parts) == 3:
         path, layer, cls = parts
     else:
-        raise ValueError(f"Слой-эталон «{spec}»: ожидается файл|класс "
-                         f"или файл|имя слоя|класс")
+        raise ValueError(f"Слой-эталон «{spec}»: ожидается файл|класс, "
+                         f"файл|имя слоя|класс или файл|слой|класс|стираемые")
     path = path.strip()
     cls = cls.strip()
     if not path or not cls:
@@ -659,7 +699,8 @@ def _parse_ref_spec(spec: str) -> dict:
     except ValueError:
         raise ValueError(f"Слой-эталон «{spec}»: номер класса должен быть "
                          f"числом, получено «{cls}»")
-    return {"path": path, "layer": layer or None, "class_value": cv}
+    return {"path": path, "layer": layer or None, "class_value": cv,
+            "erase": erase}
 
 
 def _apply_ref_layers(gdf, path, refs, verbose=True):
@@ -1031,7 +1072,10 @@ def run(in_raster, min_size=3, connectivity=8, out_raster=None,
 
     src_for_vector = in_raster
 
-    if min_size and min_size > 1:
+    erase_classes = sorted({int(c) for ref in (refs or []) for c in
+                            (ref.get("erase") or [ref["class_value"]])})
+
+    if (min_size and min_size > 1) or erase_classes:
         with rasterio.open(in_raster) as src:
             arr = src.read(1)
             profile = src.profile
@@ -1047,8 +1091,16 @@ def run(in_raster, min_size=3, connectivity=8, out_raster=None,
             print(f"[io] растр {arr.shape}, классов {np.unique(arr).size}, "
                   f"dtype={arr.dtype}")
 
+        if erase_classes:
+            before = int(np.isin(arr, erase_classes).sum())
+            print(f"[erase] классы растра {erase_classes}: {before} пикс. "
+                  f"передаётся преобладающим соседям")
         cleaned = sieve_majority_fast(arr, min_size, connectivity, nd,
+                                      force_classes=erase_classes or None,
                                       verbose=verbose)
+        if erase_classes and verbose:
+            print(f"[erase] остаток стираемых классов в растре: "
+                  f"{int(np.isin(cleaned, erase_classes).sum())} пикс.")
         if out_raster:
             profile.update(count=1, dtype=cleaned.dtype, compress="lzw",
                            tiled=True, blockxsize=512, blockysize=512)
@@ -1059,7 +1111,8 @@ def run(in_raster, min_size=3, connectivity=8, out_raster=None,
             src_for_vector = out_raster
         elif not skip_vector:
             raise SystemExit("для тайловой векторизации нужен --out-raster "
-                             "(тайлы читаются с диска)")
+                             "(тайлы читаются с диска; при --sieve "
+                             "или стираемых классах)")
         del arr, cleaned
 
     if out_vector and not skip_vector:
@@ -1275,7 +1328,9 @@ def generalize_files(files: list[str], params: dict, out_base: str) -> list[str]
         base = re.sub(r"_sieve\d+_c\d+_sm\d+(_dp[\d.]+)?(_norep)?$", "", base)
         out_vector = os.path.join(out_dir, f"{base}_{tag}.gpkg")
 
-        do_sieve = params["min_size"] > 1
+        # refs по умолчанию стирают свой класс (см. run) — нужен растр на диске
+        do_sieve = (params["min_size"] > 1
+                    or bool(params.get("refs")))
         out_raster = None
         tmp_raster = False
         if do_sieve:
@@ -1533,10 +1588,20 @@ def _gui_dialog(root_dir: str):
     v_ref_cls = tk.StringVar()
     ttk.Entry(fr_rf1, textvariable=v_ref_cls, width=8).grid(row=1, column=3, sticky="w", padx=4)
 
+    ttk.Label(fr_rf1, text="Стираемые классы растра").grid(
+        row=2, column=0, sticky="w", pady=2)
+    v_ref_erase = tk.StringVar()
+    ttk.Entry(fr_rf1, textvariable=v_ref_erase, width=24).grid(
+        row=2, column=1, sticky="w", padx=4)
+    ttk.Label(fr_rf1, text="через запятую; пусто = только класс слоя").grid(
+        row=2, column=2, columnspan=2, sticky="w", padx=(10, 0))
+
     def _ref_item(e):
         return (f"{os.path.basename(e['path'])}"
                 + (f" | {e['layer']}" if e.get("layer") else "")
-                + f" | класс {e['class_value']}")
+                + f" | класс {e['class_value']}"
+                + (f" | стирает {','.join(str(int(c)) for c in e['erase'])}"
+                   if e.get("erase") else ""))
     def _ref_refresh():
         lb_ref.delete(0, "end")
         for e in ref_entries:
@@ -1545,6 +1610,8 @@ def _gui_dialog(root_dir: str):
         v_ref_path.set(e["path"])
         v_ref_layer.set(e.get("layer") or "")
         v_ref_cls.set(str(e["class_value"]))
+        v_ref_erase.set(",".join(str(int(c)) for c in e["erase"])
+                        if e.get("erase") else "")
     def _ref_from_fields():
         pth = v_ref_path.get().strip()
         cls = v_ref_cls.get().strip()
@@ -1557,8 +1624,19 @@ def _gui_dialog(root_dir: str):
             messagebox.showwarning("Слой", "Номер класса должен быть числом.",
                                    parent=win)
             return None
+        erase = None
+        raw_er = v_ref_erase.get().strip()
+        if raw_er:
+            try:
+                erase = [int(x) for x in re.split(r"[,;\s]+", raw_er)
+                         if x.strip()]
+            except ValueError:
+                messagebox.showwarning(
+                    "Слой", "Стираемые классы — целые числа через запятую.",
+                    parent=win)
+                return None
         return {"path": pth, "layer": v_ref_layer.get().strip() or None,
-                "class_value": cv}
+                "class_value": cv, "erase": erase}
     def ref_add():
         e = _ref_from_fields()
         if e is None:
@@ -1567,6 +1645,7 @@ def _gui_dialog(root_dir: str):
         _ref_refresh()
         lb_ref.see("end")
         v_ref_path.set(""); v_ref_layer.set(""); v_ref_cls.set("")
+        v_ref_erase.set("")
     def ref_change():
         sel = lb_ref.curselection()
         if not sel:
@@ -1683,11 +1762,23 @@ def _console_dialog(root_dir: str):
             break
         layer = input("    имя слоя в файле (Enter = первый/единственный): ").strip()
         cls = input("    номер класса в классификации (например 6): ").strip()
+        raw_er = input("    стираемые классы растра через запятую "
+                       "(Enter = только класс слоя): ").strip()
         try:
-            refs.append({"path": raw, "layer": layer or None,
-                         "class_value": int(float(cls))})
+            cv = int(float(cls))
         except ValueError:
             print("    ! номер класса должен быть числом — слой пропущен")
+            continue
+        erase = None
+        if raw_er:
+            try:
+                erase = [int(x) for x in re.split(r"[,;\s]+", raw_er)
+                         if x.strip()]
+            except ValueError:
+                print("    ! стираемые классы должны быть числами — "
+                      "стирается только класс слоя")
+        refs.append({"path": raw, "layer": layer or None,
+                     "class_value": cv, "erase": erase})
     p["refs"] = refs
     p["save_raster"] = _prompt_yes("сохранить очищенный растр", False)
     return files, p, os.path.join(root_dir, OUT_BASE_NAME)
@@ -1751,9 +1842,13 @@ def main(argv=None):
                         "например 6 или 6,12 — обычно вода")
     p.add_argument("--expand-tol", type=float, default=0.0,
                    help="допуск расширения в пикселях (0 = строго; 0.2-0.5 — глаже)")
-    p.add_argument("--ref", action="append", default=[], metavar="ФАЙЛ|СЛОЙ|КЛАСС",
+    p.add_argument("--ref", action="append", default=[],
+                   metavar="ФАЙЛ|СЛОЙ|КЛАСС|СТИРАЕМЫЕ",
                    help="негенерализуемый слой: замещает классификацию, границы не "
-                        "меняются (можно несколько раз; СЛОЙ можно опустить: ФАЙЛ|КЛАСС)")
+                        "меняются (можно несколько раз; СЛОЙ можно опустить: "
+                        "ФАЙЛ|КЛАСС; СТИРАЕМЫЕ — классы растра, чьи пиксели "
+                        "передаются соседям до генерализации, через запятую: "
+                        "ФАЙЛ|СЛОЙ|400|1400,2400,3400,4400)")
     p.add_argument("--layer", default="classes")
     p.add_argument("--skip-vector", action="store_true")
     p.add_argument("--resume", action="store_true",
