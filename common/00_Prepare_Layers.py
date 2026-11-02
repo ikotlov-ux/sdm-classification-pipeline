@@ -30,6 +30,7 @@
 import os
 import sys
 import glob
+import tempfile
 import math
 import warnings
 import numpy as np
@@ -1597,12 +1598,39 @@ def main():
     plots_dir = os.path.join(output_dir, "plots")
     os.makedirs(plots_dir, exist_ok=True)
 
-    # v3.1: TEMP выносим за пределы Yandex.Disk / OneDrive, иначе
+    # v5: TEMP выносим за пределы Yandex.Disk / OneDrive, иначе
     # облачный клиент перехватывает I/O и запись aligned-файлов
-    # блокируется до завершения выгрузки. Если I:\ — SSD, оставляем
-    # там же, но в корне диска.
-    temp_dir = r"I:\TEMP_terra_align"
-    os.makedirs(temp_dir, exist_ok=True)
+    # блокируется до завершения выгрузки. Раньше диск был жёстко
+    # прописан как I: — и скрипт падал (WinError 3), если диска I:
+    # в текущей сессии нет. Теперь диск выбирается автоматически:
+    #   1) I:\TEMP_terra_align, если диск I: доступен (SSD, как раньше);
+    #   2) TEMP_terra_align в корне диска со скриптом (вне папки
+    #      облачной синхронизации);
+    #   3) системная временная папка (TEMP на C:).
+    temp_dir = None
+    had_i_drive = os.path.exists("I:\\")
+    temp_candidates = []
+    if had_i_drive:
+        temp_candidates.append(r"I:\TEMP_terra_align")
+    script_drive = os.path.splitdrive(os.path.abspath(root_dir))[0]
+    if script_drive:
+        temp_candidates.append(os.path.join(script_drive + os.sep,
+                                            "TEMP_terra_align"))
+    temp_candidates.append(os.path.join(tempfile.gettempdir(),
+                                        "TEMP_terra_align"))
+    for cand in temp_candidates:
+        try:
+            os.makedirs(cand, exist_ok=True)
+            temp_dir = cand
+            break
+        except OSError as e:
+            print(f"  TEMP {cand} недоступен ({e}); пробую следующий вариант…")
+    if temp_dir is None:
+        raise SystemExit("Не удалось создать временную папку ни на одном диске "
+                         "(I:, корень диска со скриптом, системный TEMP). "
+                         "Укажите TEMP вручную.")
+    if not had_i_drive:
+        print("  диск I: недоступен — TEMP размещён на " + temp_dir)
 
     print(f"INPUT : {input_dir}")
     print(f"OUTPUT: {output_dir}")
