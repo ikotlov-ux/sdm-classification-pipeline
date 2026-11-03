@@ -1547,10 +1547,110 @@ def filter_layers_by_correlation(
 # ОСНОВНОЙ СКРИПТ (main)
 # ============================================================================
 
+def run_correlation_and_filtering(composite_path, layer_names, output_dir,
+                                  plots_dir, ref_table):
+    """Финальная часть пайплайна: анализ корреляции слоёв → выбор порога →
+    Composite_filtered.tif. Выделена в отдельную функцию, чтобы её можно было
+    вызвать повторно при возобновлении остановленного запуска."""
+    # ═══════════════════════════════════════════════
+    # АНАЛИЗ КОРРЕЛЯЦИИ И ФИЛЬТРАЦИЯ СЛОЁВ
+    # ═══════════════════════════════════════════════
+
+    keep_names = filter_layers_by_correlation(
+        composite_path=composite_path,
+        band_names=layer_names,
+        output_dir=output_dir,
+        plots_dir=plots_dir,
+        ref_table=ref_table,
+        thresholds=[round(t, 1) for t in np.arange(0.9, 0.0, -0.1)],
+    )
+
+    # Сохранение отфильтрованного композита
+    filtered_path = os.path.join(output_dir, "Composite_filtered.tif")
+    print("Сохраняю Composite_filtered...")
+
+    keep_indices = [layer_names.index(nm) + 1 for nm in keep_names]  # 1-based
+
+    with rasterio.open(composite_path) as src:
+        prof = src.profile.copy()
+        # v2: ZSTD + PREDICTOR=3 + BAND interleave
+        prof.update(
+            count=len(keep_indices),
+            compress="zstd",
+            zstd_level=3,
+            predictor=3,
+            tiled=True,
+            blockxsize=512,
+            blockysize=512,
+            interleave="band",
+        )
+        if _needs_bigtiff(len(keep_indices), src.height, src.width, str(prof.get("dtype", "float32"))):
+            prof["BIGTIFF"] = "YES"
+        with rasterio.open(filtered_path, "w", **prof) as dst:
+            for new_idx, old_idx in enumerate(keep_indices, 1):
+                dst.write(src.read(old_idx), new_idx)
+                dst.set_band_description(new_idx, layer_names[old_idx - 1])
+
+    print(f"✓ Composite_filtered сохранён: {os.path.basename(filtered_path)}")
+    print(f"  Слоёв: {len(keep_names)}\n")
+
+    print("════════════════════════════════════════════════════════")
+    print("✓ ГОТОВО! Все результаты в папке:")
+    print(f"  {output_dir}")
+    print("════════════════════════════════════════════════════════\n")
+
+
+def _resume_run(output_dir):
+    """Возобновление остановленного запуска: переиспользует уже собранный
+    Composite.tif и таблицу эталонов, пропуская выравнивание, объединение,
+    извлечение пикселей, KW-тесты и боксплоты (они уже готовы в папке
+    запуска). Продолжает с анализа корреляции и фильтрации слоёв →
+    Composite_filtered.tif. Результаты дописываются в ту же папку."""
+    composite_path = os.path.join(output_dir, "Composite.tif")
+    plots_dir = os.path.join(output_dir, "plots")
+    os.makedirs(plots_dir, exist_ok=True)
+
+    with rasterio.open(composite_path) as src:
+        descr = list(src.descriptions)
+        n_bands = src.count
+    if not descr or any(d is None for d in descr):
+        raise SystemExit("В Composite.tif не записаны имена слоёв — "
+                         "возобновление невозможно")
+    layer_names = [str(d) for d in descr]
+    if len(layer_names) != n_bands:
+        raise SystemExit("Число описаний слоёв не совпадает с числом каналов "
+                         "Composite.tif — возобновление невозможно")
+
+    ref_table = None
+    ref_csv = os.path.join(output_dir, "reference_points_table.csv")
+    if os.path.isfile(ref_csv):
+        ref_table = pd.read_csv(ref_csv)
+        print(f"✓ Таблица эталонов загружена: {os.path.basename(ref_csv)} "
+              f"({len(ref_table):,} пикселей)".replace(",", " "))
+    else:
+        print("⚠ reference_points_table.csv не найден — корреляция будет "
+              "считаться по пикселям растра")
+
+    size_mb = os.path.getsize(composite_path) / (1024 ** 2)
+    print(f"\nВОЗОБНОВЛЕНИЕ ЗАПУСКА")
+    print(f"  Папка:    {output_dir}")
+    print(f"  Композит: {os.path.basename(composite_path)} "
+          f"({n_bands} слоёв, {size_mb:.0f} МБ)\n")
+
+    run_correlation_and_filtering(
+        composite_path=composite_path,
+        layer_names=layer_names,
+        output_dir=output_dir,
+        plots_dir=plots_dir,
+        ref_table=ref_table,
+    )
+
+
 def main():
     print("\n════════════════════════════════════════════════════════")
     print("Объединение TIF растров в один файл")
-    print("ВЕРСИЯ v62 (Python) — ZSTD+PREDICTOR=3, потоковое объединение")
+    print("ВЕРСИЯ v63 (Python) — ZSTD+PREDICTOR=3, потоковое объединение")
+    print("v63: возобновление остановленного запуска (переиспользование Composite.tif)")
     print("С ВЫБОРОМ ПРОЕКЦИИ, МАСКОЙ, КОРРЕЛЯЦИЯМИ, KRUSKAL-WALLIS И ФИЛЬТРАЦИЕЙ СЛОЁВ")
     print("════════════════════════════════════════════════════════\n")
 
@@ -1574,6 +1674,38 @@ def main():
 
     base_output_dir = os.path.join(root_dir, "00_PREPARE_LAYERS")
     os.makedirs(base_output_dir, exist_ok=True)
+
+    # v6: предложение возобновить остановленный запуск
+    resumable = []
+    for name in sorted(os.listdir(base_output_dir), reverse=True):
+        cand = os.path.join(base_output_dir, name)
+        comp = os.path.join(cand, "Composite.tif")
+        if os.path.isdir(cand) and os.path.isfile(comp):
+            resumable.append(cand)
+
+    if resumable:
+        print("════════════════════════════════════════════════════════")
+        print("НАЙДЕНЫ ПРЕДЫДУЩИЕ ЗАПУСКИ (Composite.tif уже собран)")
+        print("════════════════════════════════════════════════════════\n")
+        for i, cand in enumerate(resumable, 1):
+            with rasterio.open(os.path.join(cand, "Composite.tif")) as src:
+                n_b = src.count
+            size_mb = os.path.getsize(os.path.join(cand, "Composite.tif")) / (1024 ** 2)
+            has_ft = os.path.isfile(os.path.join(cand, "Composite_filtered.tif"))
+            tag = "  [Composite_filtered уже есть]" if has_ft else ""
+            print(f"  [{i}] {os.path.basename(cand)}  "
+                  f"({n_b} слоёв, {size_mb:,.0f} МБ){tag}".replace(",", " "))
+        print("  [0] Новый запуск — пересобрать композит с нуля\n")
+        choice = input("Продолжить запуск № (Enter = новый запуск): ").strip()
+        if choice:
+            try:
+                idx = int(choice)
+            except ValueError:
+                idx = 0
+            if 1 <= idx <= len(resumable):
+                _resume_run(resumable[idx - 1])
+                return
+            print("⚠ Нет такого номера — начинаю новый запуск.\n")
 
     # счётчик запусков
     counter_file = os.path.join(base_output_dir, "prepare_run_counter.txt")
@@ -1948,48 +2080,13 @@ def main():
     # АНАЛИЗ КОРРЕЛЯЦИИ И ФИЛЬТРАЦИЯ СЛОЁВ
     # ═══════════════════════════════════════════════
 
-    keep_names = filter_layers_by_correlation(
+    run_correlation_and_filtering(
         composite_path=composite_path,
-        band_names=layer_names,
+        layer_names=layer_names,
         output_dir=output_dir,
         plots_dir=plots_dir,
         ref_table=ref_table,
-        thresholds=[round(t, 1) for t in np.arange(0.9, 0.0, -0.1)],
     )
-
-    # Сохранение отфильтрованного композита
-    filtered_path = os.path.join(output_dir, "Composite_filtered.tif")
-    print("Сохраняю Composite_filtered...")
-
-    keep_indices = [layer_names.index(nm) + 1 for nm in keep_names]  # 1-based
-
-    with rasterio.open(composite_path) as src:
-        prof = src.profile.copy()
-        # v2: ZSTD + PREDICTOR=3 + BAND interleave
-        prof.update(
-            count=len(keep_indices),
-            compress="zstd",
-            zstd_level=3,
-            predictor=3,
-            tiled=True,
-            blockxsize=512,
-            blockysize=512,
-            interleave="band",
-        )
-        if _needs_bigtiff(len(keep_indices), src.height, src.width, str(prof.get("dtype", "float32"))):
-            prof["BIGTIFF"] = "YES"
-        with rasterio.open(filtered_path, "w", **prof) as dst:
-            for new_idx, old_idx in enumerate(keep_indices, 1):
-                dst.write(src.read(old_idx), new_idx)
-                dst.set_band_description(new_idx, layer_names[old_idx - 1])
-
-    print(f"✓ Composite_filtered сохранён: {os.path.basename(filtered_path)}")
-    print(f"  Слоёв: {len(keep_names)}\n")
-
-    print("════════════════════════════════════════════════════════")
-    print("✓ ГОТОВО! Все результаты в папке:")
-    print(f"  {output_dir}")
-    print("════════════════════════════════════════════════════════\n")
 
 
 # Запуск
