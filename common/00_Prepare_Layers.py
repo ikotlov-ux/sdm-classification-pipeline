@@ -1610,6 +1610,8 @@ def _resume_run(output_dir):
     plots_dir = os.path.join(output_dir, "plots")
     os.makedirs(plots_dir, exist_ok=True)
 
+    print("Открываю Composite.tif (большой файл на Яндекс.Диске — "
+          "может занять до минуты)…")
     with rasterio.open(composite_path) as src:
         descr = list(src.descriptions)
         n_bands = src.count
@@ -1650,7 +1652,7 @@ def main():
     print("\n════════════════════════════════════════════════════════")
     print("Объединение TIF растров в один файл")
     print("ВЕРСИЯ v63 (Python) — ZSTD+PREDICTOR=3, потоковое объединение")
-    print("v63: возобновление остановленного запуска (переиспользование Composite.tif)")
+    print("v64: возобновление запуска; меню запусков без открытия композитов (мгновенно)")
     print("С ВЫБОРОМ ПРОЕКЦИИ, МАСКОЙ, КОРРЕЛЯЦИЯМИ, KRUSKAL-WALLIS И ФИЛЬТРАЦИЕЙ СЛОЁВ")
     print("════════════════════════════════════════════════════════\n")
 
@@ -1688,13 +1690,13 @@ def main():
         print("НАЙДЕНЫ ПРЕДЫДУЩИЕ ЗАПУСКИ (Composite.tif уже собран)")
         print("════════════════════════════════════════════════════════\n")
         for i, cand in enumerate(resumable, 1):
-            with rasterio.open(os.path.join(cand, "Composite.tif")) as src:
-                n_b = src.count
-            size_mb = os.path.getsize(os.path.join(cand, "Composite.tif")) / (1024 ** 2)
+            comp = os.path.join(cand, "Composite.tif")
+            size_mb = os.path.getsize(comp) / (1024 ** 2)
             has_ft = os.path.isfile(os.path.join(cand, "Composite_filtered.tif"))
             tag = "  [Composite_filtered уже есть]" if has_ft else ""
             print(f"  [{i}] {os.path.basename(cand)}  "
-                  f"({n_b} слоёв, {size_mb:,.0f} МБ){tag}".replace(",", " "))
+                  f"({size_mb:,.0f} МБ){tag}".replace(",", " "))
+            print(f"      {os.path.basename(comp)}")
         print("  [0] Новый запуск — пересобрать композит с нуля\n")
         choice = input("Продолжить запуск № (Enter = новый запуск): ").strip()
         if choice:
