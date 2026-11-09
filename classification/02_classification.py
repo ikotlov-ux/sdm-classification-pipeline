@@ -286,7 +286,9 @@ def _plot_spatial_blocks(
     print(f"  ✓ Сохранён: {os.path.basename(png1)}")
 
     # --- График 2: Фолды ---
-    cmap_folds = plt.cm.get_cmap("tab10", n_folds)
+    cmap_folds = (plt.cm.get_cmap("tab10", n_folds)
+                       if hasattr(plt.cm, "get_cmap")
+                       else plt.matplotlib.colormaps["tab10"].resampled(n_folds))
     fig2, ax2 = plt.subplots(figsize=(10, 8))
     scatter2 = ax2.scatter(
         coords[:, 0],

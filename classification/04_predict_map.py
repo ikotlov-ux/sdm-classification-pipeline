@@ -14,6 +14,17 @@
 # - Проект QGIS (.qgs) с готовой раскраской категориального растра
 # - Сохранение данных для 05 (final_model.pkl, samples_df.pkl, etc.)
 #
+# ИЗМЕНЕНИЯ В v6:
+# - Поле value в _cat.tif теперь содержит ИСХОДНЫЕ коды классов
+#   (метки классов, например 110/132/224), а не последовательные
+#   индексы 0..n-1 — растр открывается с «родной» нумерацией классов
+#   в QGIS и ArcGIS, справочник соответствия не нужен.
+#   Если метки класса нечисловые (текст) — fallback на индекс 0..n-1
+#   с предупреждением.
+# - Палитра/QML/QGS: value = исходный код класса, цвет — по позиции
+#   класса в class_levels (i-й класс → i+1 цвет фиксированной палитры).
+#   nodata = -9999 (не пересекается с реальными кодами).
+#
 # ИЗМЕНЕНИЯ В v5:
 # - Нумерация категорий в растре теперь 0-based (ID класса = индекс в
 #   class_levels, БЕЗ +1). Значения растра: 0..(n_classes-1).
@@ -59,8 +70,8 @@ warnings.filterwarnings("ignore")
 # =============================================================================
 # Ключ — номер класса НА ИСХОДНОЙ ПАЛИТРЕ (1..24, как на картинке).
 # Значение — HEX-цвет заливки.
-# В растре v5 нумерация 0-based, поэтому классу палитры k
-# соответствует значение растра (k-1) — см. _build_palette_for_raster().
+# В растре v6 value = исходный код класса (метка); цвет i-го класса
+# class_levels — i+1 цвет палитры — см. _build_palette_for_raster().
 PALETTE_HEX = {
     1:  "#FF99FF",
     2:  "#FF99FF",
@@ -658,24 +669,41 @@ def _hex_to_rgb(hex_color: str) -> tuple[int, int, int]:
     return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
 
 
+def _class_value(label, class_levels: list) -> int:
+    """
+    Значение value для класса: исходный код класса (если метка числовая),
+    иначе fallback — индекс позиции в class_levels (0-based).
+    """
+    s = str(label)
+    if s.lstrip("-").isdigit():
+        return int(s)
+    try:
+        return class_levels.index(label)
+    except ValueError:
+        return 0
+
+
 def _build_palette_for_raster(class_levels: list) -> list[dict]:
     """
-    Сопоставляет каждому ЗНАЧЕНИЮ растра (0-based) цвет и метку.
+    Сопоставляет каждому ЗНАЧЕНИЮ растра цвет и метку.
 
-    Растр v5: value = index в class_levels (0..n-1).
-    Исходная палитра пронумерована 1..24, поэтому
-    для value=v берём цвет класса палитры (v+1).
+    Растр v6: value = ИСХОДНЫЙ код класса (метка, например 110),
+    а не последовательный индекс. Цвет — по позиции класса в
+    class_levels (i-й класс -> i+1 цвет фиксированной палитры 1..24,
+    дальше PALETTE_FALLBACK). Если метки нечисловые — value = индекс
+    0..n-1 (fallback, с предупреждением в вызывающем коде).
 
     Возвращает список словарей: {value, label, hex, r, g, b}.
     """
     entries = []
-    for value, name in enumerate(class_levels):
-        palette_key = value + 1                       # 0-based value -> 1-based класс палитры
+    for pos, name in enumerate(class_levels):
+        value = _class_value(name, class_levels)
+        palette_key = pos + 1                         # i-й класс -> i+1 цвет палитры
         hex_color = PALETTE_HEX.get(palette_key, PALETTE_FALLBACK)
         r, g, b = _hex_to_rgb(hex_color)
         entries.append({
             "value": value,
-            "label": f"{value} - {name}",
+            "label": f"{name}",
             "hex": hex_color,
             "r": r, "g": g, "b": b,
         })
@@ -919,15 +947,17 @@ def _predict_raster_blockwise(
             raise RuntimeError("Внутренняя ошибка сопоставления band-ов и предикторов.")
 
     # Создаём выходные файлы (temp)
+    # v6: driver="GTiff" явно — иначе при входном .vrt профиль копирует
+    # driver="VRT" и запись в temp-файлы падает
     cat_profile = profile.copy()
     cat_profile.update(
-        count=1, dtype="int16", nodata=-9999,
+        driver="GTiff", count=1, dtype="int16", nodata=-9999,
         compress="lzw", tiled=True, blockxsize=256, blockysize=256,
     )
 
     prob_profile = profile.copy()
     prob_profile.update(
-        count=1, dtype="float32", nodata=-9999.0,
+        driver="GTiff", count=1, dtype="float32", nodata=-9999.0,
         compress="lzw", tiled=True, blockxsize=256, blockysize=256,
     )
 
@@ -970,11 +1000,17 @@ def _predict_raster_blockwise(
                 y_pred = model.predict(X_valid)
                 # Обратно в строковые метки -> int ID
                 y_labels = le.inverse_transform(y_pred)
-                # ID = индекс в class_levels (0-based, БЕЗ +1)
+                # v6: value = исходный код класса (метка), не индекс.
+                # Нечисловые метки -> fallback на индекс 0..n-1.
                 cat_vals = np.array(
-                    [class_levels.index(lbl) for lbl in y_labels],
+                    [_class_value(lbl, class_levels)
+                     for lbl in y_labels],
                     dtype=np.int16,
                 )
+                if any(not str(lbl).lstrip("-").isdigit()
+                       for lbl in y_labels):
+                    print("  ВНИМАНИЕ: часть меток классов нечисловые — "
+                          "для них value = индекс 0..n-1")
                 cat_block[valid_mask] = cat_vals
 
                 # Вероятности -> макс.
@@ -1229,13 +1265,17 @@ def main():
         print(f"Использую папку 00_PREPARE_LAYERS: {prep_dir}")
 
         import glob
-        tif_files = sorted(glob.glob(os.path.join(prep_dir, "*.tif")))
+        # v6: .vrt (виртуальный композит из 00 v66) читается как обычный растр
+        tif_files = sorted(
+            glob.glob(os.path.join(prep_dir, "*.tif")) +
+            glob.glob(os.path.join(prep_dir, "*.vrt"))
+        )
         if not tif_files:
             raise FileNotFoundError(
-                "TIF не найдены в соответствующей подпапке 00_PREPARE_LAYERS!"
+                "TIF/VRT не найдены в соответствующей подпапке 00_PREPARE_LAYERS!"
             )
 
-        print("Найдены TIF:")
+        print("Найдены TIF/VRT:")
         for i, tf in enumerate(tif_files, 1):
             fsize = os.path.getsize(tf) / (1024 ** 2)
             try:

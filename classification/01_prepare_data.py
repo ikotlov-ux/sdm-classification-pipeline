@@ -1,5 +1,8 @@
 # ============================================================================
-# 01_prepare_data_v12.py
+# 01_prepare_data_v13.py (workspace: 01_prepare_data_v7.py)
+# ИЗМЕНЕНИЯ: в списке растров запуска 00 видны и .vrt — виртуальные
+# композиты (Composite.vrt / Composite_filtered.vrt из 00 v66) читаются
+# как обычные растры.
 # СКРИПТ 01: ПОДГОТОВКА ДАННЫХ И ИЗВЛЕЧЕНИЕ ОБУЧАЮЩИХ ОБРАЗЦОВ
 #
 # Функционал:
@@ -25,15 +28,24 @@ import rasterio
 from rasterio.mask import mask as rio_mask
 from shapely.geometry import mapping
 
+# Отключаем буферизацию stdout (важно для Jupyter/IPython через %run)
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except Exception:
+    pass
+
 
 # ============================================================================
 # ГЛАВНАЯ ФУНКЦИЯ
 # ============================================================================
 
 def main():
-    print("\n============================")
-    print("  01 - PREPARE DATA")
-    print("============================\n")
+    print("\n============================", flush=True)
+    print("  01 - PREPARE DATA", flush=True)
+    print("============================\n", flush=True)
+    print(f"Рабочая папка: {os.getcwd()}", flush=True)
+    print(f"Python: {sys.executable}", flush=True)
+    print(flush=True)
 
     root_dir = os.getcwd()
 
@@ -126,10 +138,15 @@ def main():
     print("[ШАГ 1] ВЫБОР РАСТРА")
     print("================================================================\n")
 
-    print("-- INPUT (TIF) --")
-    tif_files = sorted(glob.glob(os.path.join(selected_prev_dir, "*.tif")))
+    print("-- INPUT (TIF / VRT) --")
+    # v7: .vrt (виртуальный композит из 00 v66) читается как обычный растр
+    tif_files = sorted(
+        glob.glob(os.path.join(selected_prev_dir, "*.tif")) +
+        glob.glob(os.path.join(selected_prev_dir, "*.vrt"))
+    )
     if not tif_files:
-        raise FileNotFoundError("TIF не найдены в выбранной подпапке 00_PREPARE_LAYERS!")
+        raise FileNotFoundError(
+            "TIF/VRT не найдены в выбранной подпапке 00_PREPARE_LAYERS!")
 
     print(f"00_PREPARE_LAYERS ({selected_prev_name}):")
     for i, tf in enumerate(tif_files, 1):
@@ -287,6 +304,40 @@ def main():
     training_poly = training_poly.to_crs(raster_crs)
     print("  ✓ Система координат согласована\n")
 
+    # --- ПРАВКА (a): стабильный polygon_id ---
+    # Если в исходнике есть свое поле polygon_id / ID / OBJECTID / FID с уникальными
+    # значениями — уважаем его. Иначе создаём свой через reset_index,
+    # чтобы polygon_id не зависел от внешней сортировки/фильтрации.
+    _pid_candidates = ["polygon_id", "ID", "OBJECTID", "FID"]
+    _pid_source = None
+    for _c in _pid_candidates:
+        if _c in training_poly.columns and training_poly[_c].is_unique:
+            _pid_source = _c
+            break
+    if _pid_source is not None:
+        training_poly = training_poly.copy()
+        training_poly["polygon_id"] = training_poly[_pid_source].astype(int)
+        print(f"  ✓ polygon_id взят из исходного поля '{_pid_source}'")
+    else:
+        training_poly = training_poly.reset_index(drop=True).copy()
+        training_poly["polygon_id"] = training_poly.index.astype(int)
+        print("  ✓ polygon_id сгенерирован автоматически (0..N-1)")
+
+    # --- ПРАВКА (a-bis): геометрия — определение типа (точки/полигоны) ---
+    _geom_types = set(training_poly.geometry.geom_type.unique())
+    _has_points = bool(_geom_types & {"Point", "MultiPoint"})
+    _has_polys = bool(_geom_types & {"Polygon", "MultiPolygon"})
+    if _has_points and _has_polys:
+        print(
+            "  ⚠ Смешанная геометрия (точки + полигоны) — будет "
+            "обработано через rio_mask для всех геометрий единообразно."
+        )
+    elif _has_points:
+        print("  ✓ Геометрия: точки (1 точка = 1 пиксель)")
+    else:
+        print("  ✓ Геометрия: полигоны (много пикселей на полигон)")
+    print()
+
     # ================================================================
     # ШАГ 3: ИЗВЛЕЧЕНИЕ ЗНАЧЕНИЙ ИЗ РАСТРА ПО ПОЛИГОНАМ
     # ================================================================
@@ -298,16 +349,21 @@ def main():
     print("  (это может занять время в зависимости от размера данных)\n")
 
     samples_list = []
+    # Статистика по polygon_id: сколько пикселей извлечено (ПРАВКА b)
+    n_pixels_by_pid = {}
+    n_skipped_empty = 0
+    n_skipped_error = 0
     with rasterio.open(selected_tif) as src:
         transform = src.transform
 
         for idx_row, row in training_poly.iterrows():
             cls = row[class_field]
+            pid = int(row["polygon_id"])  # ПРАВКА (a): берём из колонки
             geom = [mapping(row.geometry)]
 
             print(
-                f"\r  Полигон {idx_row + 1}/{len(training_poly)} "
-                f"(класс: {cls})...   ",
+                f"\r  Геометрия {idx_row + 1}/{len(training_poly)} "
+                f"(polygon_id={pid}, класс: {cls})...   ",
                 end="",
                 flush=True,
             )
@@ -317,15 +373,18 @@ def main():
                     src, geom, crop=True, all_touched=True, nodata=np.nan
                 )
             except Exception:
+                n_skipped_error += 1
                 continue
 
             # out_image: (n_bands, h, w)
             # маска валидных пикселей — все бенды конечные
             valid_mask = np.all(np.isfinite(out_image), axis=0)
             if not valid_mask.any():
+                n_skipped_empty += 1
                 continue
 
             coords = np.argwhere(valid_mask)  # (row, col) внутри кропа
+            n_pixels_by_pid[pid] = int(len(coords))
             for rc in coords:
                 r, c = rc[0], rc[1]
                 vals = out_image[:, r, c]
@@ -336,10 +395,34 @@ def main():
                 for bi, bn in enumerate(band_descriptions):
                     row_dict[bn] = float(vals[bi])
                 row_dict["class_name"] = str(cls)
-                row_dict["polygon_id"] = int(idx_row)
+                row_dict["polygon_id"] = pid  # стабильный ID
+                row_dict["n_pixels"] = int(len(coords))  # ПРАВКА (b)
                 row_dict["x"] = x_coord
                 row_dict["y"] = y_coord
                 samples_list.append(row_dict)
+
+    # Диагностика отброшенных геометрий (ПРАВКА b)
+    print()
+    if n_skipped_error > 0:
+        print(f"  ⚠ Отброшено по ошибке rio_mask: {n_skipped_error} геометрий")
+    if n_skipped_empty > 0:
+        print(
+            f"  ⚠ Отброшено без валидных пикселей (NaN во всех бендах): "
+            f"{n_skipped_empty} геометрий"
+        )
+    if n_pixels_by_pid:
+        _counts = np.array(list(n_pixels_by_pid.values()))
+        print(
+            f"  ✓ Пикселей на полигон: min={_counts.min()}, "
+            f"median={int(np.median(_counts))}, mean={_counts.mean():.1f}, "
+            f"max={_counts.max()}"
+        )
+        _tiny = int((_counts <= 2).sum())
+        _huge = int((_counts > 500).sum())
+        if _tiny > 0:
+            print(f"    • мелких (≤2 пикс.): {_tiny}")
+        if _huge > 0:
+            print(f"    • крупных (>500 пикс.): {_huge}")
 
     print("\n")
 
@@ -350,7 +433,7 @@ def main():
 
     # --- Определяем бенд-колонки ---
     service_cols = {
-        "ID", "cell", "x", "y", "class_name", "polygon_id",
+        "ID", "cell", "x", "y", "class_name", "polygon_id", "n_pixels",
         "FID", "fid", "OBJECTID", "GID", "gid",
     }
     band_cols = [
@@ -358,6 +441,34 @@ def main():
         for c in samples_df.columns
         if c not in service_cols and pd.api.types.is_numeric_dtype(samples_df[c])
     ]
+
+    # --- ПРАВКА (c): де-конфликт case-insensitive имён ---
+    # GPKG/Shapefile приводят имена полей к единому регистру. Если в растре
+    # есть 'S2_BAI' и 'S2_BaI' драйвер падает с "Error adding field...".
+    # Найдём такие пары и переименуем второе вхождение → добавим суффикс.
+    _seen_lower = {}
+    _rename_map = {}
+    for _bc in band_cols:
+        _low = _bc.lower()
+        if _low in _seen_lower:
+            # Конфликт — генерируем уникальное имя
+            _n = 2
+            while f"{_bc}_{_n}".lower() in _seen_lower:
+                _n += 1
+            _new = f"{_bc}_{_n}"
+            _rename_map[_bc] = _new
+            _seen_lower[_new.lower()] = _new
+            print(
+                f"  ⚠ Конфликт имён (case-insensitive): '{_bc}' vs "
+                f"'{_seen_lower[_low]}' → переименовано в '{_new}'"
+            )
+        else:
+            _seen_lower[_low] = _bc
+    if _rename_map:
+        samples_df = samples_df.rename(columns=_rename_map)
+        band_cols = [_rename_map.get(c, c) for c in band_cols]
+        # Сообщаем наружу, чтобы band_descriptions в raster_info тоже обновить
+        band_descriptions = [_rename_map.get(bn, bn) for bn in band_descriptions]
 
     # Проверка соответствия числа бандов
     if len(band_cols) != n_layers:
@@ -371,8 +482,8 @@ def main():
             f"{n_layers} слоёв растра"
         )
 
-    # Оставляем бенды + class_name + polygon_id + x + y
-    keep_cols = band_cols + ["class_name", "polygon_id", "x", "y"]
+    # Оставляем бенды + class_name + polygon_id + n_pixels + x + y (ПРАВКА b)
+    keep_cols = band_cols + ["class_name", "polygon_id", "n_pixels", "x", "y"]
     extra_cols = [c for c in samples_df.columns if c not in keep_cols]
     if extra_cols:
         print(f"  Удалены лишние поля: {', '.join(extra_cols)}")
@@ -406,10 +517,43 @@ def main():
     gpkg_path = os.path.join(output_dir, "samples.gpkg")
     if os.path.exists(gpkg_path):
         os.remove(gpkg_path)
-    samples_gdf.to_file(gpkg_path, layer="samples", driver="GPKG")
+    # --- ПРАВКА (c-bis): финальный барьер против case-insensitive дублей ---
+    _final_lower = {}
+    _dup_final = []
+    for _c in samples_gdf.columns:
+        _l = _c.lower()
+        if _l in _final_lower and _final_lower[_l] != _c:
+            _dup_final.append((_final_lower[_l], _c))
+        else:
+            _final_lower[_l] = _c
+    if _dup_final:
+        print(
+            f"  ⚠ Обнаружены оставшиеся case-insensitive дубли перед записью: "
+            f"{_dup_final}"
+        )
+    try:
+        samples_gdf.to_file(gpkg_path, layer="samples", driver="GPKG")
+    except Exception as _e:
+        # Fallback: принудительно все имена в lower_case_uniq
+        print(f"  ⚠ Ошибка записи GPKG: {_e}. Пробуем fallback (все имена → lower).")
+        _fallback_map = {}
+        _used = set()
+        for _c in samples_gdf.columns:
+            _base = _c.lower()
+            _n = _base
+            _i = 2
+            while _n in _used:
+                _n = f"{_base}_{_i}"
+                _i += 1
+            _fallback_map[_c] = _n
+            _used.add(_n)
+        samples_gdf = samples_gdf.rename(columns=_fallback_map)
+        samples_gdf.to_file(gpkg_path, layer="samples", driver="GPKG")
+        print("  ✓ GPKG сохранён через fallback")
     print(
         f" ✓ {os.path.basename(gpkg_path)} "
-        f"({len(samples_gdf)} точек, поля: {', '.join(band_cols)} + class_name + polygon_id)"
+        f"({len(samples_gdf)} строк, поля: {len(band_cols)} бандов + "
+        f"class_name + polygon_id + n_pixels)"
     )
 
     # --- CSV (с координатами для справки) ---
@@ -440,7 +584,7 @@ def main():
     print("Файлы в 01_PREPARE_DATA:")
     print(
         f"  1. samples.gpkg - обучающие образцы "
-        f"({len(samples_gdf)} точек, {len(band_cols)} бандов + polygon_id)"
+        f"({len(samples_gdf)} строк, {len(band_cols)} бандов + polygon_id + n_pixels)"
     )
     print("  2. samples.csv - обучающие образцы (таблица)")
     print("  3. raster_info.pkl - информация о растре")
