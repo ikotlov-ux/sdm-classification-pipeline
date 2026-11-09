@@ -31,6 +31,7 @@ import os
 import sys
 import glob
 import tempfile
+import shutil
 import math
 import warnings
 import numpy as np
@@ -1560,6 +1561,103 @@ def filter_layers_by_correlation(
 # ОСНОВНОЙ СКРИПТ (main)
 # ============================================================================
 
+def write_vrt(vrt_path, width, height, crs, transform, band_specs):
+    """Пишет VRT (виртуальный растр): XML со ссылками на каналы исходных
+    файлов. Данные не копируются — файл весит килобайты. band_specs:
+    [{file, band, name, src_w, src_h, rel}, ...] в порядке каналов."""
+    from xml.sax.saxutils import escape as _esc
+    gt = transform.to_gdal()
+    parts = [
+        f'<VRTDataset rasterXSize="{width}" rasterYSize="{height}">',
+        f'<SRS>{_esc(crs.to_wkt())}</SRS>',
+        f'<GeoTransform>{", ".join(str(float(v)) for v in gt)}</GeoTransform>',
+    ]
+    for idx, spec in enumerate(band_specs, 1):
+        rel = "1" if spec.get("rel", True) else "0"
+        parts += [
+            f'<VRTRasterBand dataType="Float32" band="{idx}">',
+            f'<Description>{_esc(spec["name"])}</Description>',
+            '<NoDataValue>nan</NoDataValue>',
+            '<SimpleSource>',
+            f'<SourceFilename relativeToVRT="{rel}">{_esc(spec["file"])}</SourceFilename>',
+            f'<SourceBand>{spec["band"]}</SourceBand>',
+            f'<SrcRect xOff="0" yOff="0" xSize="{spec["src_w"]}" ySize="{spec["src_h"]}"/>',
+            f'<DstRect xOff="0" yOff="0" xSize="{width}" ySize="{height}"/>',
+            '</SimpleSource>',
+            '</VRTRasterBand>',
+        ]
+    parts.append('</VRTDataset>')
+    with open(vrt_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(parts))
+
+
+def _read_vrt_specs(vrt_path):
+    """Читает VRT: возвращает список spec-ов каналов
+    [{file, band, name, src_w, src_h, rel}, ...] в порядке каналов."""
+    import xml.etree.ElementTree as ET
+    root = ET.parse(vrt_path).getroot()
+    specs = []
+    for band in root.findall("VRTRasterBand"):
+        src = band.find("SimpleSource")
+        fn_el = src.find("SourceFilename")
+        rect = src.find("SrcRect")
+        specs.append({
+            "file": fn_el.text,
+            "rel": fn_el.get("relativeToVRT") == "1",
+            "band": int(src.findtext("SourceBand")),
+            "name": band.findtext("Description") or "",
+            "src_w": int(rect.get("xSize")),
+            "src_h": int(rect.get("ySize")),
+        })
+    return specs
+
+
+def build_vrt_composite(aligned_files, layer_names, output_dir, target_crs,
+                        tpl, temp_dir):
+    """Собирает виртуальный композит Composite.vrt: XML со ссылками на
+    каналы выровненных растров — без копирования данных (секунды вместо
+    часов записи гигабайт). Файлы из temp_dir переносится в
+    output_dir/vrt_sources, чтобы VRT остался рабочим после очистки TEMP
+    и при переносе папки проекта. Возвращает путь к VRT."""
+    src_dir = os.path.join(output_dir, "vrt_sources")
+    temp_real = os.path.realpath(temp_dir)
+    specs = []
+    bi = 0
+    n_moved = 0
+    for af in aligned_files:
+        af_real = os.path.realpath(af)
+        if af_real.startswith(temp_real + os.sep):
+            os.makedirs(src_dir, exist_ok=True)
+            tgt = os.path.join(src_dir, os.path.basename(af))
+            if os.path.abspath(af) != os.path.abspath(tgt):
+                shutil.move(af, tgt)
+                n_moved += 1
+            af_use = tgt
+        else:
+            af_use = af_real
+        # относительный путь от папки VRT — проект переносим целиком
+        try:
+            rel_path = os.path.relpath(af_use, output_dir)
+            rel = True
+        except ValueError:          # разные диски (Windows) — абсолютный путь
+            rel_path = af_use
+            rel = False
+        with rasterio.open(af_use) as src:
+            for b in range(1, src.count + 1):
+                bi += 1
+                name = (layer_names[bi - 1] if bi - 1 < len(layer_names)
+                        else f"band_{bi}")
+                specs.append({"file": rel_path, "band": b, "name": name,
+                              "src_w": src.width, "src_h": src.height,
+                              "rel": rel})
+    vrt_path = os.path.join(output_dir, "Composite.vrt")
+    write_vrt(vrt_path, tpl["width"], tpl["height"], target_crs,
+             tpl["transform"], specs)
+    print(f"   Источников: {len(aligned_files)} файлов "
+          f"(перенесено из TEMP в vrt_sources: {n_moved})")
+    return vrt_path
+
+
 def run_correlation_and_filtering(composite_path, layer_names, output_dir,
                                   plots_dir, ref_table):
     """Финальная часть пайплайна: анализ корреляции слоёв → выбор порога →
@@ -1579,33 +1677,67 @@ def run_correlation_and_filtering(composite_path, layer_names, output_dir,
     )
 
     # Сохранение отфильтрованного композита
-    filtered_path = os.path.join(output_dir, "Composite_filtered.tif")
-    print("Сохраняю Composite_filtered...")
+    is_vrt = str(composite_path).lower().endswith(".vrt")
+    if is_vrt:
+        # v66: отфильтрованный композит — тоже VRT: мгновенно, без копирования
+        filtered_path = os.path.join(output_dir, "Composite_filtered.vrt")
+        print("Сохраняю Composite_filtered (виртуально, без копирования)…")
+        specs = _read_vrt_specs(composite_path)
+        with rasterio.open(composite_path) as src:
+            v_w, v_h, v_crs, v_tr = (src.width, src.height,
+                                     src.crs, src.transform)
+        keep_specs = [specs[layer_names.index(nm)] for nm in keep_names]
+        write_vrt(filtered_path, v_w, v_h, v_crs, v_tr, keep_specs)
+        print(f"✓ Composite_filtered сохранён: {os.path.basename(filtered_path)}")
+        print(f"  Слоёв: {len(keep_names)} (мгновенно, данные не копировались)\n")
+        ans = input("Материализовать в TIFF (долго, гигабайты)? д/н "
+                    "(Enter = нет): ").strip().lower()
+        if ans in ("д", "да", "y", "yes"):
+            print("Материализую Composite_filtered.tif…")
+            with rasterio.open(filtered_path) as src:
+                prof = src.profile.copy()
+                prof.update(driver="GTiff", compress="zstd", zstd_level=3,
+                            predictor=3, tiled=True, blockxsize=512,
+                            blockysize=512, interleave="band")
+                if _needs_bigtiff(src.count, src.height, src.width,
+                                  "float32"):
+                    prof["BIGTIFF"] = "YES"
+                tif_path = os.path.join(output_dir, "Composite_filtered.tif")
+                with rasterio.open(tif_path, "w", **prof) as dst:
+                    for b in range(1, src.count + 1):
+                        dst.write(src.read(b), b)
+                        nm = keep_names[b - 1] if b - 1 < len(keep_names) else None
+                        if nm:
+                            dst.set_band_description(b, nm)
+            print("✓ Composite_filtered.tif записан\n")
+    else:
+        filtered_path = os.path.join(output_dir, "Composite_filtered.tif")
+        print("Сохраняю Composite_filtered...")
 
-    keep_indices = [layer_names.index(nm) + 1 for nm in keep_names]  # 1-based
+        keep_indices = [layer_names.index(nm) + 1 for nm in keep_names]  # 1-based
 
-    with rasterio.open(composite_path) as src:
-        prof = src.profile.copy()
-        # v2: ZSTD + PREDICTOR=3 + BAND interleave
-        prof.update(
-            count=len(keep_indices),
-            compress="zstd",
-            zstd_level=3,
-            predictor=3,
-            tiled=True,
-            blockxsize=512,
-            blockysize=512,
-            interleave="band",
-        )
-        if _needs_bigtiff(len(keep_indices), src.height, src.width, str(prof.get("dtype", "float32"))):
-            prof["BIGTIFF"] = "YES"
-        with rasterio.open(filtered_path, "w", **prof) as dst:
-            for new_idx, old_idx in enumerate(keep_indices, 1):
-                dst.write(src.read(old_idx), new_idx)
-                dst.set_band_description(new_idx, layer_names[old_idx - 1])
+        with rasterio.open(composite_path) as src:
+            prof = src.profile.copy()
+            # v2: ZSTD + PREDICTOR=3 + BAND interleave
+            prof.update(
+                count=len(keep_indices),
+                compress="zstd",
+                zstd_level=3,
+                predictor=3,
+                tiled=True,
+                blockxsize=512,
+                blockysize=512,
+                interleave="band",
+            )
+            if _needs_bigtiff(len(keep_indices), src.height, src.width, str(prof.get("dtype", "float32"))):
+                prof["BIGTIFF"] = "YES"
+            with rasterio.open(filtered_path, "w", **prof) as dst:
+                for new_idx, old_idx in enumerate(keep_indices, 1):
+                    dst.write(src.read(old_idx), new_idx)
+                    dst.set_band_description(new_idx, layer_names[old_idx - 1])
 
-    print(f"✓ Composite_filtered сохранён: {os.path.basename(filtered_path)}")
-    print(f"  Слоёв: {len(keep_names)}\n")
+        print(f"✓ Composite_filtered сохранён: {os.path.basename(filtered_path)}")
+        print(f"  Слоёв: {len(keep_names)}\n")
 
     print("════════════════════════════════════════════════════════")
     print("✓ ГОТОВО! Все результаты в папке:")
@@ -1619,12 +1751,19 @@ def _resume_run(output_dir):
     извлечение пикселей, KW-тесты и боксплоты (они уже готовы в папке
     запуска). Продолжает с анализа корреляции и фильтрации слоёв →
     Composite_filtered.tif. Результаты дописываются в ту же папку."""
-    composite_path = os.path.join(output_dir, "Composite.tif")
+    composite_path = None
+    for cn in ("Composite.tif", "Composite.vrt"):
+        p2 = os.path.join(output_dir, cn)
+        if os.path.isfile(p2):
+            composite_path = p2
+            break
+    if composite_path is None:
+        raise SystemExit("В папке запуска нет Composite.tif / Composite.vrt")
     plots_dir = os.path.join(output_dir, "plots")
     os.makedirs(plots_dir, exist_ok=True)
 
-    print("Открываю Composite.tif (большой файл на Яндекс.Диске — "
-          "может занять до минуты)…")
+    print(f"Открываю {os.path.basename(composite_path)} "
+          "(большой файл на Яндекс.Диске — может занять до минуты)…")
     with rasterio.open(composite_path) as src:
         descr = list(src.descriptions)
         n_bands = src.count
@@ -1665,7 +1804,7 @@ def main():
     print("\n════════════════════════════════════════════════════════")
     print("Объединение TIF растров в один файл")
     print("ВЕРСИЯ v63 (Python) — ZSTD+PREDICTOR=3, потоковое объединение")
-    print("v65: полигоны вне растра пропускаются по одному, класс не теряется")
+    print("v66: виртуальный композит VRT — быстро и без места на диске; полигоны вне растра не теряют класс")
     print("С ВЫБОРОМ ПРОЕКЦИИ, МАСКОЙ, КОРРЕЛЯЦИЯМИ, KRUSKAL-WALLIS И ФИЛЬТРАЦИЕЙ СЛОЁВ")
     print("════════════════════════════════════════════════════════\n")
 
@@ -1694,21 +1833,32 @@ def main():
     resumable = []
     for name in sorted(os.listdir(base_output_dir), reverse=True):
         cand = os.path.join(base_output_dir, name)
-        comp = os.path.join(cand, "Composite.tif")
-        if os.path.isdir(cand) and os.path.isfile(comp):
-            resumable.append(cand)
+        if not os.path.isdir(cand):
+            continue
+        comp = None
+        for cn in ("Composite.tif", "Composite.vrt"):
+            p2 = os.path.join(cand, cn)
+            if os.path.isfile(p2):
+                comp = p2
+                break
+        if comp:
+            resumable.append((cand, comp))
 
     if resumable:
         print("════════════════════════════════════════════════════════")
         print("НАЙДЕНЫ ПРЕДЫДУЩИЕ ЗАПУСКИ (Composite.tif уже собран)")
         print("════════════════════════════════════════════════════════\n")
-        for i, cand in enumerate(resumable, 1):
-            comp = os.path.join(cand, "Composite.tif")
+        for i, (cand, comp) in enumerate(resumable, 1):
             size_mb = os.path.getsize(comp) / (1024 ** 2)
-            has_ft = os.path.isfile(os.path.join(cand, "Composite_filtered.tif"))
+            has_ft = (os.path.isfile(os.path.join(cand, "Composite_filtered.tif"))
+                      or os.path.isfile(os.path.join(cand, "Composite_filtered.vrt")))
             tag = "  [Composite_filtered уже есть]" if has_ft else ""
-            print(f"  [{i}] {os.path.basename(cand)}  "
-                  f"({size_mb:,.0f} МБ){tag}".replace(",", " "))
+            if size_mb >= 1:
+                print(f"  [{i}] {os.path.basename(cand)}  "
+                      f"({size_mb:,.0f} МБ){tag}".replace(",", " "))
+            else:
+                print(f"  [{i}] {os.path.basename(cand)}  "
+                      f"({size_mb * 1024:,.0f} КБ){tag}".replace(",", " "))
             print(f"      {os.path.basename(comp)}")
         print("  [0] Новый запуск — пересобрать композит с нуля\n")
         choice = input("Продолжить запуск № (Enter = новый запуск): ").strip()
@@ -1718,7 +1868,7 @@ def main():
             except ValueError:
                 idx = 0
             if 1 <= idx <= len(resumable):
-                _resume_run(resumable[idx - 1])
+                _resume_run(resumable[idx - 1][0])
                 return
             print("⚠ Нет такого номера — начинаю новый запуск.\n")
 
@@ -1993,84 +2143,115 @@ def main():
     aligned_files = alignment["aligned_files"]
     tpl = alignment["template_profile"]
 
+    # v66: выбор формата композита — виртуальный (VRT) или TIFF
+    print("════════════════════════════════════════════════════════")
+    print("ВЫБОР ФОРМАТА КОМПОЗИТА")
+    print("════════════════════════════════════════════════════════\n")
+    print(" [1] Виртуальный (VRT) — XML-ссылки на исходные слои:")
+    print("     создаётся за секунды, НЕ занимает места на диске,")
+    print("     читается как обычный растр (QGIS, rasterio, GDAL)")
+    print(" [2] Обычный TIFF — материальный файл (гигабайты, долго)\n")
+    fmt_choice = input("Формат (Enter = 1): ").strip() or "1"
+    virtual_mode = fmt_choice != "2"
+    if virtual_mode and mask_gdf is not None:
+        print("\n⚠ AOI-маску нельзя «запечь» в VRT (ограничение формата):")
+        m = input("  [1] продолжить без маски (VRT, Enter)   [2] собрать TIFF с маской: ").strip() or "1"
+        if m == "2":
+            virtual_mode = False
+            print("  → собираю обычный TIFF с маской\n")
+
     # --- Объединение ---
     print("════════════════════════════════════════════════════════")
-    print("ОБЪЕДИНЕНИЕ РАСТРОВ (потоковое)")
+    print("ОБЪЕДИНЕНИЕ РАСТРОВ"
+          + (" (виртуальное, VRT)" if virtual_mode else " (потоковое)"))
     print("════════════════════════════════════════════════════════\n")
 
     output_name = "Composite"
     output_path = os.path.join(output_dir, f"{output_name}.tif")
     composite_path = output_path
 
-    # v2: пишем композит послойно (band-by-band) — без полной загрузки
-    # в RAM. Экономит десятки ГБ памяти (302 слоя × 6339×6116×4 б ≈ 47 ГБ).
     total_bands = sum(rasterio.open(af).count for af in aligned_files)
     if total_bands != len(layer_names):
         print(
             f" ⚠ Несоответствие: слоёв в файлах {total_bands}, имён {len(layer_names)}"
         )
 
-    profile = tpl.copy()
-    # v2: финальный композит — ZSTD+PREDICTOR=3+BAND interleave
-    profile.update(
-        count=total_bands,
-        dtype="float32",
-        compress="zstd",
-        zstd_level=3,
-        predictor=3,
-        tiled=True,
-        blockxsize=512,
-        blockysize=512,
-        interleave="band",
-        nodata=np.nan,
-    )
-    if _needs_bigtiff(total_bands, tpl["height"], tpl["width"]):
-        profile["BIGTIFF"] = "YES"
-        print(" ℹ Размер > 4 ГБ — используется BigTIFF")
-
-    print("Сохранение композитного растра...")
-    print(f" File: {os.path.basename(output_path)}")
-    print(f" Datatype: float32 (FLT4S), слоёв: {total_bands}")
-
-    # Маска применяется послойно (расстризуем однократно)
-    mask_array_2d = None
-    if mask_gdf is not None:
-        from rasterio.features import geometry_mask
-        mask_array_2d = geometry_mask(
-            mask_gdf.geometry,
-            out_shape=(tpl["height"], tpl["width"]),
-            transform=tpl["transform"],
-            invert=True,
+    if virtual_mode:
+        composite_path = build_vrt_composite(
+            aligned_files, layer_names, output_dir, target_crs,
+            tpl, temp_dir,
         )
+        vrt_size_kb = os.path.getsize(composite_path) / 1024
+        print(" ✓ Виртуальный композит собран\n")
+        print("COMPOSITE RASTER (виртуальный):")
+        print(f" File: {os.path.basename(composite_path)} ({vrt_size_kb:.1f} КБ)")
+        print(f" Layers: {total_bands}")
+        print(" Datatype: float32")
+        print(f" CRS: {target_crs}\n")
+        print(" ⚠ VRT — это ссылки: не удаляйте исходные INPUT-растры и папку")
+        print("   vrt_sources в папке запуска. Место на диске не занимается.\n")
+    else:
+        profile = tpl.copy()
+        # v2: финальный композит — ZSTD+PREDICTOR=3+BAND interleave
+        profile.update(
+            count=total_bands,
+            dtype="float32",
+            compress="zstd",
+            zstd_level=3,
+            predictor=3,
+            tiled=True,
+            blockxsize=512,
+            blockysize=512,
+            interleave="band",
+            nodata=np.nan,
+        )
+        if _needs_bigtiff(total_bands, tpl["height"], tpl["width"]):
+            profile["BIGTIFF"] = "YES"
+            print(" ℹ Размер > 4 ГБ — используется BigTIFF")
 
-    out_band_idx = 1
-    with rasterio.open(output_path, "w", **profile) as dst:
-        for af_idx, af in enumerate(aligned_files):
-            with rasterio.open(af) as src:
-                for band in range(1, src.count + 1):
-                    arr = src.read(band).astype(np.float32)
-                    if mask_array_2d is not None:
-                        arr = np.where(mask_array_2d, arr, np.nan).astype(np.float32)
-                    dst.write(arr, out_band_idx)
-                    if out_band_idx - 1 < len(layer_names):
-                        dst.set_band_description(
-                            out_band_idx, layer_names[out_band_idx - 1]
-                        )
-                    if out_band_idx % 20 == 0 or out_band_idx == total_bands:
-                        print(f"   Слой {out_band_idx}/{total_bands}")
-                    out_band_idx += 1
+        print("Сохранение композитного растра...")
+        print(f" File: {os.path.basename(output_path)}")
+        print(f" Datatype: float32 (FLT4S), слоёв: {total_bands}")
 
-    print(f" ✓ Композит записан\n")
+        # Маска применяется послойно (расстризуем однократно)
+        mask_array_2d = None
+        if mask_gdf is not None:
+            from rasterio.features import geometry_mask
+            mask_array_2d = geometry_mask(
+                mask_gdf.geometry,
+                out_shape=(tpl["height"], tpl["width"]),
+                transform=tpl["transform"],
+                invert=True,
+            )
 
-    file_size_mb = os.path.getsize(output_path) / (1024 ** 2)
-    with rasterio.open(composite_path) as src:
-        n_bands = src.count
-    print("COMPOSITE RASTER:")
-    print(f" File: {os.path.basename(output_path)}")
-    print(f" Size: {file_size_mb:.2f} MB")
-    print(f" Layers: {n_bands}")
-    print(f" Datatype: float32 (FLT4S)")
-    print(f" CRS: {target_crs}\n")
+        out_band_idx = 1
+        with rasterio.open(output_path, "w", **profile) as dst:
+            for af_idx, af in enumerate(aligned_files):
+                with rasterio.open(af) as src:
+                    for band in range(1, src.count + 1):
+                        arr = src.read(band).astype(np.float32)
+                        if mask_array_2d is not None:
+                            arr = np.where(mask_array_2d, arr, np.nan).astype(np.float32)
+                        dst.write(arr, out_band_idx)
+                        if out_band_idx - 1 < len(layer_names):
+                            dst.set_band_description(
+                                out_band_idx, layer_names[out_band_idx - 1]
+                            )
+                        if out_band_idx % 20 == 0 or out_band_idx == total_bands:
+                            print(f"   Слой {out_band_idx}/{total_bands}")
+                        out_band_idx += 1
+
+        print(f" ✓ Композит записан\n")
+
+        file_size_mb = os.path.getsize(output_path) / (1024 ** 2)
+        with rasterio.open(composite_path) as src:
+            n_bands = src.count
+        print("COMPOSITE RASTER:")
+        print(f" File: {os.path.basename(output_path)}")
+        print(f" Size: {file_size_mb:.2f} MB")
+        print(f" Layers: {n_bands}")
+        print(" Datatype: float32 (FLT4S)")
+        print(f" CRS: {target_crs}\n")
 
     # ═══════════════════════════════════════════════
     # ЭТАЛОНЫ, KRUSKAL-WALLIS
