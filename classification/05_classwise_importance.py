@@ -1,5 +1,5 @@
 # =============================================================================
-# 05_classwise_importance_v7.py
+# 05_classwise_importance_v10.py
 #
 # СКРИПТ 5: CLASS-WISE PERMUTATION IMPORTANCE + SCATTERPLOTS (ТОП-ПАРЫ)
 #
@@ -14,6 +14,17 @@
 #   5. *_gam_<CLS>_<FEAT>.png     — scatter: GAM + CI (топ-пары)
 #   6. *_cwimp_table.csv     — таблица importance
 #
+# v10: исправлен базовый F1=0 — централизованный мэппинг code→name
+#      применён к base_pred и perm_pred ДО расчёта macro/per-class F1.
+#      Модель (LightGBM/XGBoost) внутри использует LabelEncoder и
+#      возвращает числовые коды; раньше они сравнивались со строковыми
+#      именами классов, что давало F1=0 и нулевые importance.
+# v9: надёжное сопоставление имён классов с колонками predict_proba
+#     через 3 стратегии: строки → class_table.pkl → позиция.
+#     Исправляет ошибку 'Класс X не найден в prob', когда модель
+#     обучена на числовых кодах (LabelEncoder), а классы в данных — строки.
+# v8: поддержка Variant 3 — целевая колонка 'class_name' и фильтрация
+#     служебных колонок (polygon_id, n_pixels, x, y, ID) из предикторов.
 # v7: scatter/GAM строятся только для топ-пар (предиктор, класс)
 #     с наибольшей permutation importance (≥ 10 пар, мин. 1 на класс).
 #     Каждый график — отдельный PNG. GAM через pygam.
@@ -53,12 +64,23 @@ except ImportError:
     STATSMODELS_AVAILABLE = False
 
 print("=" * 60)
-print("  CLASS-WISE PERMUTATION IMPORTANCE  (v7)")
+print("  CLASS-WISE PERMUTATION IMPORTANCE  (v11)")
 print("=" * 60)
 print()
 
 # --- Рабочая директория ---
-script_dir = os.path.dirname(os.path.abspath(__file__))
+# Безопасное определение директории скрипта:
+# — при запуске через `python script.py`  __file__ определён;
+# — в Jupyter/IPython/exec()  __file__ МОЖЕТ НЕ существовать —
+#   тогда берём текущую рабочую директорию.
+try:
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+except NameError:
+    script_dir = os.getcwd()
+    print(
+        "⚠ Запуск в интерактивном режиме (Jupyter/IPython/exec).\n"
+        f"  Использую текущую рабочую директорию: {script_dir}"
+    )
 os.chdir(script_dir)
 root_dir = os.getcwd()
 print(f"Рабочая директория: {root_dir}\n")
@@ -265,6 +287,7 @@ print("[ШАГ 2] Загрузка данных...")
 model_path = os.path.join(selected_dir, "final_model.pkl")
 samples_path = os.path.join(selected_dir, "samples_df.pkl")
 meta_path = os.path.join(selected_dir, "run_meta.pkl")
+class_table_path = os.path.join(selected_dir, "class_table.pkl")
 
 if not os.path.isfile(model_path):
     sys.exit(f"final_model.pkl не найден в {selected_dir}")
@@ -276,6 +299,19 @@ with open(model_path, "rb") as f:
 
 with open(samples_path, "rb") as f:
     samples_df = pickle.load(f)
+
+# Таблица классов (опционально) — DataFrame с колонками ID (1..N) и Class.
+# Нужна для сопоставления имён классов с кодами в final_model.classes_,
+# если модель обучена на числовых кодах вместо строк.
+class_table = None
+if os.path.isfile(class_table_path):
+    try:
+        with open(class_table_path, "rb") as f:
+            class_table = pickle.load(f)
+        print(f"  V class_table.pkl загружена ({len(class_table)} классов)")
+    except Exception as e:
+        print(f"  ! Не удалось загрузить class_table.pkl: {e}")
+        class_table = None
 
 model_name = "model"
 base_name = "model"
@@ -302,20 +338,36 @@ else:
         model_name = type(final_model).__name__
 
 # Определяем целевой столбец
+# Порядок поиска (Variant 3): class_name -> class -> .outcome
 if isinstance(samples_df, pd.DataFrame):
-    if "class" in samples_df.columns:
+    if "class_name" in samples_df.columns:
+        y_col = "class_name"
+    elif "class" in samples_df.columns:
         y_col = "class"
     elif ".outcome" in samples_df.columns:
         y_col = ".outcome"
     else:
-        sys.exit("Не найден столбец 'class' или '.outcome' в samples_df")
+        sys.exit("Не найден столбец 'class_name', 'class' или '.outcome' в samples_df")
 else:
     sys.exit("samples_df не является DataFrame")
 
+# Служебные колонки Variant 3 — НИКОГДА не входят в предикторы
+SERVICE_COLS = {"polygon_id", "n_pixels", "x", "y", "ID",
+                "class_name", "class", ".outcome",
+                ".weights", ".modelWeights"}
+
 if predictors is None:
-    exclude = {y_col, ".weights", ".modelWeights"}
+    exclude = set(SERVICE_COLS)
+    exclude.add(y_col)
     exclude.update(c for c in samples_df.columns if c.startswith("."))
     predictors = [c for c in samples_df.columns if c not in exclude]
+else:
+    # Даже если предикторы заданы из run_meta, дополнительно отфильтруем
+    # на случай, если в старых run_meta служебные колонки случайно попали
+    bad = [p for p in predictors if p in SERVICE_COLS]
+    if bad:
+        print(f"  ! Удаляю служебные колонки из списка предикторов: {bad}")
+        predictors = [p for p in predictors if p not in SERVICE_COLS]
 
 X_data = samples_df[predictors].copy()
 y_data = samples_df[y_col].astype(str).values
@@ -325,6 +377,91 @@ n_feats = len(predictors)
 
 print(f"  V Наблюдений: {len(X_data)} | Предикторов: {n_feats} | Классов: {n_classes}")
 print(f"    Классы: {', '.join(class_levels)}")
+
+# ============================================================================
+# МЭППИНГ КОДОВ МОДЕЛИ → ИМЕНА КЛАССОВ
+# ============================================================================
+# Модель может быть обучена:
+#   – на строковых именах (RF, CatBoost) — тогда model.classes_ = ['A','G',...].
+#   – на числовых кодах LabelEncoder (LightGBM, XGBoost) — тогда
+#     model.classes_ = [0..N-1], и порядок в LabelEncoder — алфавитный по уникальным
+#     строковым именам. Оба варианта дают model.classes_[i] ↔ sorted_names[i].
+#
+# Строим мэппинги:
+#   code2name: что возвращает model.predict() → имя класса
+#   name2col:  имя класса → номер колонки в model.predict_proba()
+
+model_classes = None
+if hasattr(final_model, "classes_"):
+    model_classes = list(final_model.classes_)
+elif hasattr(final_model, "named_steps"):
+    last_step = list(final_model.named_steps.values())[-1]
+    if hasattr(last_step, "classes_"):
+        model_classes = list(last_step.classes_)
+
+code2name = {}
+name2col = {}
+mapping_strategy = None
+
+if model_classes is not None:
+    model_classes_str = [str(c) for c in model_classes]
+
+    # Стратегия A: строковые имена уже в model.classes_
+    if set(class_levels).issubset(set(model_classes_str)):
+        for i, name in enumerate(model_classes_str):
+            code2name[model_classes[i]] = name
+            name2col[name] = i
+        mapping_strategy = "A: model.classes_ = строковые имена"
+
+    # Стратегия B: числовые коды — сопоставляем по порядку с sorted(class_levels)
+    # Это корректно для любого sklearn-подобного классификатора и
+    # внутреннего LabelEncoder LightGBM/XGBoost.
+    elif len(model_classes) == len(class_levels):
+        # Приоритетно: если есть class_table, выверим по ней
+        # (но на практике порядок = sorted(class_levels))
+        for i, code in enumerate(model_classes):
+            name = class_levels[i]
+            code2name[code] = name
+            code2name[str(code)] = name  # на случай строкового предсказания
+            name2col[name] = i
+        mapping_strategy = (
+            "B: model.classes_ = числовые коды → sorted(class_levels) по позиции"
+        )
+else:
+    # Модель без classes_ — делаем тоже позиционный мэппинг
+    for i, name in enumerate(class_levels):
+        code2name[i] = name
+        code2name[str(i)] = name
+        name2col[name] = i
+    mapping_strategy = "C: model.classes_ отсутствует — позиционный fallback"
+
+print(f"  V Стратегия сопоставления классов: {mapping_strategy}")
+if model_classes is not None:
+    print(f"    model.classes_ ({type(model_classes[0]).__name__}): {model_classes}")
+print(f"    code\u2192name: {code2name}")
+print(f"    name\u2192col:  {name2col}")
+
+
+def map_pred_to_names(pred):
+    """Преобразует predict() модели в массив строковых имён классов.
+    Работает как для числовых, так и для строковых кодов.
+    Если код не найден — возвращает str(исходного кода)."""
+    arr = np.asarray(pred).flatten()
+    out = np.empty(len(arr), dtype=object)
+    for i, v in enumerate(arr):
+        if v in code2name:
+            out[i] = code2name[v]
+        elif str(v) in code2name:
+            out[i] = code2name[str(v)]
+        else:
+            try:
+                if int(v) in code2name:
+                    out[i] = code2name[int(v)]
+                else:
+                    out[i] = str(v)
+            except (ValueError, TypeError):
+                out[i] = str(v)
+    return out
 
 
 # ============================================================================
@@ -386,7 +523,8 @@ X_arr = X_data.values if hasattr(X_data, "values") else X_data
 base_pred = predict_model(final_model, X_data)
 if hasattr(base_pred, "values"):
     base_pred = base_pred.values
-base_pred = np.asarray(base_pred).flatten().astype(str)
+# Преобразуем выход модели (может быть числовым) в имена классов
+base_pred = map_pred_to_names(base_pred)
 
 base_f1_overall = macro_f1(y_data, base_pred, class_levels)
 base_f1_class = {cls: class_f1(y_data, base_pred, cls) for cls in class_levels}
@@ -412,7 +550,7 @@ for f_idx, feat in enumerate(predictors):
         perm_pred = predict_model(final_model, X_perm)
         if hasattr(perm_pred, "values"):
             perm_pred = perm_pred.values
-        perm_pred = np.asarray(perm_pred).flatten().astype(str)
+        perm_pred = map_pred_to_names(perm_pred)
 
         f1_drops_overall[p] = base_f1_overall - macro_f1(y_data, perm_pred, class_levels)
         for c_idx, cls in enumerate(class_levels):
@@ -702,26 +840,11 @@ prob_train = predict_proba_model(final_model, X_data)
 
 if prob_train is not None:
     prob_train = np.asarray(prob_train)
+    print(f"  V {prob_train.shape[1]} колонок вероятностей x {prob_train.shape[0]} наблюдений")
 
-    # Определяем порядок классов в prob_train
-    if hasattr(final_model, "classes_"):
-        class_names_prob = [str(c) for c in final_model.classes_]
-    elif hasattr(final_model, "named_steps"):
-        # Pipeline — ищем classes_ у последнего estimator
-        last_step = list(final_model.named_steps.values())[-1]
-        if hasattr(last_step, "classes_"):
-            class_names_prob = [str(c) for c in last_step.classes_]
-        else:
-            class_names_prob = class_levels
-    else:
-        class_names_prob = class_levels
-
-    print(f"  V {len(class_names_prob)} классов x {prob_train.shape[0]} наблюдений\n")
-
-    # Словарь: класс → индекс столбца в prob_train
-    cls_to_prob_col = {}
-    for i, cn in enumerate(class_names_prob):
-        cls_to_prob_col[cn] = i
+    # Используем уже построенный name2col (см. блок мэппинга после ШАГА 2)
+    cls_to_prob_col = dict(name2col)
+    print(f"    Мэппинг класс → колонка prob: {cls_to_prob_col}\n")
 
     # ---- Цикл по отобранным парам ----
     for _, pair_row in selected_pairs.iterrows():

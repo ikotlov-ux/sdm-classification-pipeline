@@ -586,6 +586,92 @@ def _build_estimator(algo_key: str, ncores: int):
 # ГЛАВНАЯ ФУНКЦИЯ
 # =============================================================================
 
+
+def _load_samples_safe(data_dir: str, need_xy: bool = True) -> pd.DataFrame:
+    """Надёжное чтение обучающей выборки из папки 01_PREPARE_DATA.
+
+    Защищает от ошибки SQLite/GDAL 'attempt to write a readonly database'
+    на Яндекс.Диске (когда у samples.gpkg включён WAL или файл удерживается
+    синхронизацией):
+      1) прямое чтение samples.gpkg;
+      2) копирование samples.gpkg в локальный TEMP + сброс флага WAL в заголовке;
+      3) резервное чтение samples.csv из той же папки.
+    """
+    import tempfile as _tempfile, shutil as _shutil, sqlite3 as _sqlite3
+    samples_path = os.path.join(data_dir, "samples.gpkg")
+    csv_path = os.path.join(data_dir, "samples.csv")
+    if not os.path.exists(samples_path) and not os.path.exists(csv_path):
+        raise FileNotFoundError(
+            f"Файлы samples.gpkg и samples.csv не найдены в {data_dir}!\n"
+            f"Сначала запустите 01_prepare_data.py"
+        )
+    gdf = None
+    if os.path.exists(samples_path):
+        try:
+            gdf = gpd.read_file(samples_path, layer="samples")
+        except Exception as e1:
+            print(f"  ℹ Прямое чтение samples.gpkg не удалось ({e1}); "
+                  f"открываю через локальный TEMP...")
+            tmp_dir = _tempfile.mkdtemp(prefix="gpkg_read_")
+            try:
+                tmp_gpkg = os.path.join(tmp_dir, "samples.gpkg")
+                _shutil.copyfile(samples_path, tmp_gpkg)
+                for ext in ("-wal", "-shm", "-journal"):
+                    if os.path.exists(samples_path + ext):
+                        try:
+                            _shutil.copyfile(samples_path + ext, tmp_gpkg + ext)
+                        except Exception:
+                            pass
+                try:
+                    _con = _sqlite3.connect(tmp_gpkg)
+                    _con.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                    _con.execute("PRAGMA journal_mode=DELETE;")
+                    _con.close()
+                except Exception:
+                    pass
+                try:
+                    with open(tmp_gpkg, "r+b") as _fh:
+                        _hdr = bytearray(_fh.read(32))
+                        if len(_hdr) >= 20 and (_hdr[18] == 2 or _hdr[19] == 2):
+                            _hdr[18] = 1
+                            _hdr[19] = 1
+                            _fh.seek(0)
+                            _fh.write(_hdr)
+                except Exception:
+                    pass
+                gdf = gpd.read_file(tmp_gpkg, layer="samples")
+                # Попробуем починить заголовок исходного samples.gpkg на диске
+                try:
+                    with open(samples_path, "r+b") as _fh:
+                        _hdr = bytearray(_fh.read(32))
+                        if len(_hdr) >= 20 and (_hdr[18] == 2 or _hdr[19] == 2):
+                            _hdr[18] = 1
+                            _hdr[19] = 1
+                            _fh.seek(0)
+                            _fh.write(_hdr)
+                except Exception:
+                    pass
+            except Exception as e2:
+                print(f"  ⚠ Чтение локальной копии samples.gpkg не удалось ({e2}); "
+                      f"перехожу на samples.csv...")
+            finally:
+                _shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    if gdf is not None:
+        df = pd.DataFrame(gdf.drop(columns="geometry"))
+        if need_xy:
+            df["x"] = gdf.geometry.x.values
+            df["y"] = gdf.geometry.y.values
+        return df
+
+    if os.path.exists(csv_path):
+        df = pd.read_csv(csv_path)
+        print(f"  ✓ Данные загружены из samples.csv ({len(df)} строк)")
+        return df
+
+    raise RuntimeError(f"Не удалось прочитать обучающие данные из {data_dir}")
+
+
 def main():
     print("\n============================================================")
     print(" 03 - ТЮНИНГ МОДЕЛЕЙ КЛАССИФИКАЦИИ")
@@ -642,14 +728,7 @@ def main():
     print(" ШАГ 1: ЗАГРУЗКА ДАННЫХ")
     print("============================================================\n")
 
-    samples_path = os.path.join(prepare_dir, "samples.gpkg")
-    if not os.path.exists(samples_path):
-        raise FileNotFoundError(
-            "Файл samples.gpkg не найден в соответствующей подпапке 01_PREPARE_DATA!"
-        )
-
-    samples_gdf = gpd.read_file(samples_path, layer="samples")
-    samples_df = pd.DataFrame(samples_gdf.drop(columns="geometry"))
+    samples_df = _load_samples_safe(prepare_dir, need_xy=False)
 
     # --- Определяем поле классов ---
     if "class_name" not in samples_df.columns:
@@ -666,7 +745,7 @@ def main():
             samples_df = samples_df.rename(columns={candidates[0]: "class_name"})
 
     samples_df["class_name"] = samples_df["class_name"].astype(str)
-    service_cols = {"class_name", "x", "y", "ID", "polygon_id"}
+    service_cols = {"class_name", "x", "y", "ID", "polygon_id", "n_pixels"}
     predictor_cols = [
         c for c in samples_df.columns
         if c not in service_cols and pd.api.types.is_numeric_dtype(samples_df[c])

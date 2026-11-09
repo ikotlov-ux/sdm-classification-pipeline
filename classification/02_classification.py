@@ -26,7 +26,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import seaborn as sns
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import StratifiedKFold, StratifiedGroupKFold, GroupKFold
 from sklearn.cluster import KMeans
 
 try:
@@ -89,6 +89,7 @@ def _spatial_block_cv(
     n_folds: int = 10,
     block_multiplier: int = 5,
     random_state: int = 42,
+    groups: np.ndarray | None = None,
 ) -> tuple[dict, dict, np.ndarray]:
     """
     Spatial Block Cross-Validation со стратификацией.
@@ -124,16 +125,41 @@ def _spatial_block_cv(
     unique_classes = np.unique(y)
     n_classes = len(unique_classes)
 
-    # Ограничиваем число блоков (не больше числа образцов)
-    n_blocks = min(n_blocks, n_samples)
-
-    print(f"    KMeans кластеризация: {n_blocks} пространственных блоков...")
-
-    # --- Шаг 1: KMeans по координатам ---
-    kmeans = KMeans(
-        n_clusters=n_blocks, random_state=random_state, n_init=10, max_iter=300
-    )
-    block_labels = kmeans.fit_predict(coords)
+    # --- Шаг 1: KMeans кластеризация (с учётом groups=polygon_id) ---
+    if groups is not None:
+        # Групповой режим (вариант B): все пиксели одного polygon_id
+        # ОБЯЗАНЫ оказаться в одном блоке. Кластеризуем НЕ пиксели, а
+        # центроиды полигонов, затем метку блока полигона раздаём всем
+        # его пикселям.
+        uniq_groups, first_idx = np.unique(groups, return_index=True)
+        # Центроид каждого полигона — среднее координат его пикселей
+        group_centroids = np.array([
+            coords[groups == g].mean(axis=0) for g in uniq_groups
+        ])
+        n_groups = len(uniq_groups)
+        n_blocks = min(n_blocks, n_groups)
+        print(
+            f"    Групповой режим: {n_groups} полигонов → "
+            f"KMeans на центроидах (не пикселях)"
+        )
+        print(f"    Кластеризация: {n_blocks} пространственных блоков...")
+        kmeans = KMeans(
+            n_clusters=n_blocks, random_state=random_state,
+            n_init=10, max_iter=300,
+        )
+        group_block_labels = kmeans.fit_predict(group_centroids)
+        # Маппинг group_id -> block_id
+        g2b = dict(zip(uniq_groups, group_block_labels))
+        block_labels = np.array([g2b[g] for g in groups])
+    else:
+        # Обычный пиксельный режим
+        n_blocks = min(n_blocks, n_samples)
+        print(f"    KMeans кластеризация: {n_blocks} пространственных блоков...")
+        kmeans = KMeans(
+            n_clusters=n_blocks, random_state=random_state,
+            n_init=10, max_iter=300,
+        )
+        block_labels = kmeans.fit_predict(coords)
 
     # --- Сводка по блокам ---
     block_ids = np.unique(block_labels)
@@ -365,6 +391,92 @@ def _plot_spatial_blocks(
 # ГЛАВНАЯ ФУНКЦИЯ
 # ============================================================================
 
+
+def _load_samples_safe(data_dir: str, need_xy: bool = True) -> pd.DataFrame:
+    """Надёжное чтение обучающей выборки из папки 01_PREPARE_DATA.
+
+    Защищает от ошибки SQLite/GDAL 'attempt to write a readonly database'
+    на Яндекс.Диске (когда у samples.gpkg включён WAL или файл удерживается
+    синхронизацией):
+      1) прямое чтение samples.gpkg;
+      2) копирование samples.gpkg в локальный TEMP + сброс флага WAL в заголовке;
+      3) резервное чтение samples.csv из той же папки.
+    """
+    import tempfile as _tempfile, shutil as _shutil, sqlite3 as _sqlite3
+    samples_path = os.path.join(data_dir, "samples.gpkg")
+    csv_path = os.path.join(data_dir, "samples.csv")
+    if not os.path.exists(samples_path) and not os.path.exists(csv_path):
+        raise FileNotFoundError(
+            f"Файлы samples.gpkg и samples.csv не найдены в {data_dir}!\n"
+            f"Сначала запустите 01_prepare_data.py"
+        )
+    gdf = None
+    if os.path.exists(samples_path):
+        try:
+            gdf = gpd.read_file(samples_path, layer="samples")
+        except Exception as e1:
+            print(f"  ℹ Прямое чтение samples.gpkg не удалось ({e1}); "
+                  f"открываю через локальный TEMP...")
+            tmp_dir = _tempfile.mkdtemp(prefix="gpkg_read_")
+            try:
+                tmp_gpkg = os.path.join(tmp_dir, "samples.gpkg")
+                _shutil.copyfile(samples_path, tmp_gpkg)
+                for ext in ("-wal", "-shm", "-journal"):
+                    if os.path.exists(samples_path + ext):
+                        try:
+                            _shutil.copyfile(samples_path + ext, tmp_gpkg + ext)
+                        except Exception:
+                            pass
+                try:
+                    _con = _sqlite3.connect(tmp_gpkg)
+                    _con.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                    _con.execute("PRAGMA journal_mode=DELETE;")
+                    _con.close()
+                except Exception:
+                    pass
+                try:
+                    with open(tmp_gpkg, "r+b") as _fh:
+                        _hdr = bytearray(_fh.read(32))
+                        if len(_hdr) >= 20 and (_hdr[18] == 2 or _hdr[19] == 2):
+                            _hdr[18] = 1
+                            _hdr[19] = 1
+                            _fh.seek(0)
+                            _fh.write(_hdr)
+                except Exception:
+                    pass
+                gdf = gpd.read_file(tmp_gpkg, layer="samples")
+                # Попробуем починить заголовок исходного samples.gpkg на диске
+                try:
+                    with open(samples_path, "r+b") as _fh:
+                        _hdr = bytearray(_fh.read(32))
+                        if len(_hdr) >= 20 and (_hdr[18] == 2 or _hdr[19] == 2):
+                            _hdr[18] = 1
+                            _hdr[19] = 1
+                            _fh.seek(0)
+                            _fh.write(_hdr)
+                except Exception:
+                    pass
+            except Exception as e2:
+                print(f"  ⚠ Чтение локальной копии samples.gpkg не удалось ({e2}); "
+                      f"перехожу на samples.csv...")
+            finally:
+                _shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    if gdf is not None:
+        df = pd.DataFrame(gdf.drop(columns="geometry"))
+        if need_xy:
+            df["x"] = gdf.geometry.x.values
+            df["y"] = gdf.geometry.y.values
+        return df
+
+    if os.path.exists(csv_path):
+        df = pd.read_csv(csv_path)
+        print(f"  ✓ Данные загружены из samples.csv ({len(df)} строк)")
+        return df
+
+    raise RuntimeError(f"Не удалось прочитать обучающие данные из {data_dir}")
+
+
 def main():
     print("\n============================================================")
     print(" КЛАССИФИКАЦИЯ С МАШИННЫМ ОБУЧЕНИЕМ")
@@ -394,20 +506,8 @@ def main():
     print("\n[ШАГ 1] Загрузка обучающих данных...")
 
     samples_path = os.path.join(DATA_DIR, "samples.gpkg")
-    if not os.path.exists(samples_path):
-        raise FileNotFoundError(
-            f"Файл samples.gpkg не найден в {DATA_DIR}!\n"
-            f"Сначала запустите 01_prepare_data.py"
-        )
-
-    samples_gdf = gpd.read_file(samples_path, layer="samples")
-    samples_df = pd.DataFrame(samples_gdf.drop(columns="geometry"))
-
-    # Извлекаем координаты из геометрии
-    coords_x = samples_gdf.geometry.x.values
-    coords_y = samples_gdf.geometry.y.values
-    samples_df["x"] = coords_x
-    samples_df["y"] = coords_y
+    samples_df = _load_samples_safe(DATA_DIR, need_xy=True)
+    plots_dir = DATA_DIR if os.access(DATA_DIR, os.W_OK) else OUTPUT_DIR
 
     # Определяем поле классов
     if "class_name" in samples_df.columns:
@@ -429,7 +529,7 @@ def main():
         samples_df = samples_df.rename(columns={class_col: "class_name"})
 
     samples_df["class_name"] = samples_df["class_name"].astype(str)
-    service_cols = {"class_name", "x", "y", "polygon_id"}
+    service_cols = {"class_name", "x", "y", "polygon_id", "n_pixels"}
     predictor_cols = [
         c
         for c in samples_df.columns
@@ -457,18 +557,60 @@ def main():
     print("[ШАГ 2] Настройка кросс-валидации")
     print("============================================================\n")
 
+    # --- Проверка наличия polygon_id (группы пикселей одного полигона) ---
+    has_polygon_id = "polygon_id" in samples_df.columns
+    if has_polygon_id:
+        n_unique_pids = samples_df["polygon_id"].nunique()
+        n_total = len(samples_df)
+        # Считаем, что стоит включать групповые опции, если
+        # в среднем в группе > 1 пикселя (т.е. вариант B)
+        avg_per_group = n_total / max(n_unique_pids, 1)
+        group_mode_available = (avg_per_group > 1.05) and (n_unique_pids >= 10)
+    else:
+        n_unique_pids = 0
+        group_mode_available = False
+
     print("  Доступные методы CV:\n")
     print("  [1] Стратифицированная KFold (классический)")
     print("      Пиксели перемешиваются случайно, классы сбалансированы.")
-    print("      Не учитывает пространственную автокорреляцию.\n")
-    print("  [2] Spatial Block CV + стратификация (Рекомендуется)")
+    print("      НЕ учитывает автокорреляцию внутри полигонов (утечка!).\n")
+    print("  [2] Spatial Block CV + стратификация")
     print("      KMeans по координатам → пространственные блоки.")
     print("      Блоки распределяются по фолдам с балансировкой классов.")
-    print("      Учитывает пространственную автокорреляцию.\n")
+    print("      Учитывает пространственную автокорреляцию (но не внутриполигонную).\n")
 
-    cv_choice = input("Выберите метод CV (Enter = 2): ").strip()
+    if group_mode_available:
+        print(
+            f"  Обнаружен polygon_id: {n_unique_pids} полигонов, "
+            f"~{avg_per_group:.1f} пикселей на полигон.\n"
+        )
+        print("  [3] Stratified GroupKFold по polygon_id (вариант B, Рекомендуется)")
+        print("      Все пиксели одного полигона → в один фолд.")
+        print("      Устраняет утечку train/test внутри полигонов.\n")
+        print("  [4] Spatial Block CV по polygon_id (вариант B, самый строгий)")
+        print("      KMeans по центроидам полигонов → блоки; полигоны целиком в фолды.")
+        print("      Учитывает и внутриполигонную, и пространственную автокорреляцию.\n")
+        default_choice = "3"
+    else:
+        if has_polygon_id:
+            if n_unique_pids < 10 and avg_per_group > 1.05:
+                print(
+                    f"  polygon_id обнаружен ({n_unique_pids} полигонов), но для 10-fold GroupCV нужно ≥10 полигонов.\n"
+                )
+            else:
+                print(
+                    "  polygon_id обнаружен, но в среднем ≤1 пикселя на полигон\n"
+                    "  (это Variant 3 — усреднённые полигоны), групповые методы [3]/[4] не нужны.\n"
+                )
+        default_choice = "2"
+
+    cv_choice = input(f"Выберите метод CV (Enter = {default_choice}): ").strip()
     if cv_choice == "":
-        cv_choice = "2"
+        cv_choice = default_choice
+    if cv_choice in ("3", "4") and not group_mode_available:
+        print("  ⚠ Групповые методы недоступны — нет polygon_id или он вырожден. "
+              f"Фолбек на [{default_choice}].")
+        cv_choice = default_choice
 
     n_folds = 10
     cv_method_name = ""
@@ -476,13 +618,22 @@ def main():
 
     y = samples_df["class_name"].values
     coords = np.column_stack([samples_df["x"].values, samples_df["y"].values])
+    groups = (
+        samples_df["polygon_id"].values if group_mode_available else None
+    )
 
     if cv_choice == "1":
         # ---- Стратифицированная KFold ----
         cv_method_name = "stratified_kfold"
-        print("\n  Используется СТРАТИФИЦИРОВАННАЯ кросс-валидация:")
+        print("\n  Используется СТРАТИФИЦИРОВАННАЯ KFold:")
         print("  - Каждый класс представлен в каждом фолде пропорционально")
-        print("  - Более стабильная оценка качества моделей\n")
+        if group_mode_available:
+            print(
+                "  ⚠ ВНИМАНИЕ: пиксели одного полигона могут попасть и в train, и в test.\n"
+                "     Метрики будут ЗАВЫШЕНЫ. Используйте [3] или [4] для честной оценки.\n"
+            )
+        else:
+            print()
 
         skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
         X_dummy = np.zeros((len(y), 1))
@@ -493,13 +644,62 @@ def main():
             folds_train[fold_idx] = train_idx.tolist()
             folds_test[fold_idx] = test_idx.tolist()
 
+    elif cv_choice == "3":
+        # ---- Stratified GroupKFold по polygon_id (вариант B) ----
+        cv_method_name = "stratified_group_kfold"
+        print("\n  Используется Stratified GroupKFold по polygon_id:")
+        print("  - Все пиксели одного polygon_id гарантированно в одном фолде")
+        print("  - Стратификация по class_name (классы балансируются по фолдам)")
+        print("  - Устраняет утечку train/test внутри полигонов (вариант B)\n")
+
+        sgkf = StratifiedGroupKFold(
+            n_splits=n_folds, shuffle=True, random_state=42
+        )
+        X_dummy = np.zeros((len(y), 1))
+
+        folds_train = {}
+        folds_test = {}
+        for fold_idx, (train_idx, test_idx) in enumerate(
+            sgkf.split(X_dummy, y, groups=groups)
+        ):
+            folds_train[fold_idx] = train_idx.tolist()
+            folds_test[fold_idx] = test_idx.tolist()
+
+        # Проверка: ни один polygon_id не должен быть в двух тестовых фолдах
+        leak = 0
+        for fi in range(n_folds):
+            for fj in range(fi + 1, n_folds):
+                gi = set(groups[folds_test[fi]])
+                gj = set(groups[folds_test[fj]])
+                leak += len(gi & gj)
+        if leak == 0:
+            print("  ✓ Утечка по polygon_id отсутствует.")
+        else:
+            print(f"  ⚠ Обнаружена утечка: {leak} полигонов в нескольких test-фолдах!")
+
     else:
         # ---- Spatial Block CV + стратификация ----
-        cv_method_name = "spatial_block_cv"
-        print("\n  Используется SPATIAL BLOCK CV + стратификация:")
-        print("  - KMeans кластеризация по координатам X, Y")
-        print("  - Жадное распределение блоков по фолдам с балансировкой классов")
-        print("  - Борьба с пространственной автокорреляцией\n")
+        # cv_choice в ("2", "4")
+        if cv_choice == "4":
+            cv_method_name = "spatial_block_cv_grouped"
+            print("\n  Используется SPATIAL BLOCK CV по polygon_id (вариант B):")
+            print("  - KMeans по центроидам полигонов (целые полигоны → блоки)")
+            print("  - Жадное распределение блоков по фолдам")
+            print("  - Учитывает и внутриполигонную, и пространственную автокорреляцию\n")
+            use_groups = groups
+        else:
+            cv_method_name = "spatial_block_cv"
+            print("\n  Используется SPATIAL BLOCK CV + стратификация:")
+            print("  - KMeans кластеризация по координатам X, Y (пиксели)")
+            print("  - Жадное распределение блоков по фолдам с балансировкой классов")
+            if group_mode_available:
+                print(
+                    "  ⚠ Пиксели одного polygon_id могут попасть в разные блоки. "
+                    "Используйте [4] для варианта B.\n"
+                )
+            else:
+                print("  - Борьба с пространственной автокорреляцией\n")
+            use_groups = None
 
         # Настройки Spatial Block CV
         block_mult_str = input(
@@ -515,7 +715,23 @@ def main():
             n_folds=n_folds,
             block_multiplier=block_multiplier,
             random_state=42,
+            groups=use_groups,
         )
+
+        # Проверка утечки polygon_id (только в групповом режиме)
+        if use_groups is not None:
+            leak = 0
+            for fi in range(n_folds):
+                for fj in range(fi + 1, n_folds):
+                    gi = set(groups[folds_test[fi]])
+                    gj = set(groups[folds_test[fj]])
+                    leak += len(gi & gj)
+            if leak == 0:
+                print("  ✓ Утечка по polygon_id отсутствует.")
+            else:
+                print(
+                    f"  ⚠ Обнаружена утечка: {leak} полигонов в нескольких test-фолдах!"
+                )
 
         # Визуализация пространственных блоков
         print("\n  Создание карт пространственных блоков...")
@@ -532,7 +748,7 @@ def main():
             fold_assignment_map=fold_assignment_map,
             class_names=y,
             n_folds=n_folds,
-            output_dir=DATA_DIR,
+            output_dir=plots_dir,
         )
 
     # ================================================================
@@ -629,7 +845,7 @@ def main():
     plt.xticks(rotation=45, ha="right")
     plt.tight_layout()
 
-    png1 = os.path.join(DATA_DIR, "cv_folds_barplot.png")
+    png1 = os.path.join(plots_dir, "cv_folds_barplot.png")
     plt.savefig(png1, dpi=150, bbox_inches="tight", facecolor="white")
     plt.close(fig1)
     print(f"  ✓ Сохранён: {os.path.basename(png1)}")
@@ -654,13 +870,13 @@ def main():
     ax2.set_xlabel("Класс")
     plt.tight_layout()
 
-    png2 = os.path.join(DATA_DIR, "cv_folds_heatmap.png")
+    png2 = os.path.join(plots_dir, "cv_folds_heatmap.png")
     plt.savefig(png2, dpi=150, bbox_inches="tight", facecolor="white")
     plt.close(fig2)
     print(f"  ✓ Сохранён: {os.path.basename(png2)}")
 
     # CSV
-    csv_folds = os.path.join(DATA_DIR, "cv_folds_summary.csv")
+    csv_folds = os.path.join(plots_dir, "cv_folds_summary.csv")
     fold_summary.to_csv(csv_folds, index=False)
     print(f"  ✓ Сохранён: {os.path.basename(csv_folds)}\n")
 
@@ -826,9 +1042,12 @@ def main():
     cv_config = {
         "folds_train": folds_train,
         "folds_test": folds_test,
+        "cv_method": cv_method_name,
     }
     if block_labels is not None:
         cv_config["block_labels"] = block_labels.tolist()
+    if groups is not None:
+        cv_config["groups"] = groups.tolist()  # polygon_id для каждой строки
 
     with open(os.path.join(OUTPUT_DIR, "cv_folds.pkl"), "wb") as f:
         pickle.dump(cv_config, f)

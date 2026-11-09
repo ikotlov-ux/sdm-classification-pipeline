@@ -1,5 +1,6 @@
 # ============================================================================
-# 01_prepare_data_v13.py (workspace: 01_prepare_data_v7.py)
+# 01_prepare_data_v14.py (workspace: 01_prepare_data_v8.py)
+# v8/v14: запись samples.gpkg через локальный TEMP с journal_mode=DELETE (без WAL)
 # ИЗМЕНЕНИЯ: в списке растров запуска 00 видны и .vrt — виртуальные
 # композиты (Composite.vrt / Composite_filtered.vrt из 00 v66) читаются
 # как обычные растры.
@@ -531,25 +532,52 @@ def main():
             f"  ⚠ Обнаружены оставшиеся case-insensitive дубли перед записью: "
             f"{_dup_final}"
         )
+    # v8: запись GPKG через локальный TEMP + journal_mode=DELETE (без WAL),
+    # чтобы Яндекс.Диск не блокировал -wal/-shm и 02/03 не падали с
+    # "attempt to write a readonly database".
+    os.environ["OGR_SQLITE_JOURNAL"] = "DELETE"
+    import tempfile as _tempfile, shutil as _shutil, sqlite3 as _sqlite3
+    _tmp_dir = _tempfile.mkdtemp(prefix="gpkg_write_")
+    _tmp_gpkg = os.path.join(_tmp_dir, "samples.gpkg")
     try:
-        samples_gdf.to_file(gpkg_path, layer="samples", driver="GPKG")
-    except Exception as _e:
-        # Fallback: принудительно все имена в lower_case_uniq
-        print(f"  ⚠ Ошибка записи GPKG: {_e}. Пробуем fallback (все имена → lower).")
-        _fallback_map = {}
-        _used = set()
-        for _c in samples_gdf.columns:
-            _base = _c.lower()
-            _n = _base
-            _i = 2
-            while _n in _used:
-                _n = f"{_base}_{_i}"
-                _i += 1
-            _fallback_map[_c] = _n
-            _used.add(_n)
-        samples_gdf = samples_gdf.rename(columns=_fallback_map)
-        samples_gdf.to_file(gpkg_path, layer="samples", driver="GPKG")
-        print("  ✓ GPKG сохранён через fallback")
+        try:
+            samples_gdf.to_file(_tmp_gpkg, layer="samples", driver="GPKG")
+        except Exception as _e:
+            print(f"  ⚠ Ошибка записи GPKG: {_e}. Пробуем fallback (все имена → lower).")
+            _fallback_map = {}
+            _used = set()
+            for _c in samples_gdf.columns:
+                _base = _c.lower()
+                _n = _base
+                _i = 2
+                while _n in _used:
+                    _n = f"{_base}_{_i}"
+                    _i += 1
+                _fallback_map[_c] = _n
+                _used.add(_n)
+            samples_gdf = samples_gdf.rename(columns=_fallback_map)
+            samples_gdf.to_file(_tmp_gpkg, layer="samples", driver="GPKG")
+            print("  ✓ GPKG сохранён через fallback")
+        try:
+            _con = _sqlite3.connect(_tmp_gpkg)
+            _con.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+            _con.execute("PRAGMA journal_mode=DELETE;")
+            _con.close()
+        except Exception:
+            pass
+        try:
+            with open(_tmp_gpkg, "r+b") as _fh:
+                _hdr = bytearray(_fh.read(32))
+                if len(_hdr) >= 20 and (_hdr[18] == 2 or _hdr[19] == 2):
+                    _hdr[18] = 1
+                    _hdr[19] = 1
+                    _fh.seek(0)
+                    _fh.write(_hdr)
+        except Exception:
+            pass
+        _shutil.copyfile(_tmp_gpkg, gpkg_path)
+    finally:
+        _shutil.rmtree(_tmp_dir, ignore_errors=True)
     print(
         f" ✓ {os.path.basename(gpkg_path)} "
         f"({len(samples_gdf)} строк, поля: {len(band_cols)} бандов + "
