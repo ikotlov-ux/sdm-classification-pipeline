@@ -1,5 +1,17 @@
 # ============================================================================
-# 00_Prepare_Layers_v62.py
+# 00_Prepare_Layers_v67.py (workspace: 00_Prepare_Layers_v10.py)
+#
+# v67 (ускорение эталонов, KW и графиков медиана + CI):
+#   - Медианы и ДИ (95/99%) по классам считаются векторно для всех слоёв сразу
+#     через порядковые статистики (Beta-квантили) вместо 2000 бутстреп-итераций
+#     на каждую пару слой×класс; сводка Class_medians_CI.csv.
+#   - Графики ci_<слой>.png: одна переиспользуемая фигура, vlines,
+#     многопоточное сохранение PNG, dpi 200.
+#   - KW: предгруппировка индексов классов.
+#   - Таблица эталонов собирается векторно (без попиксельных dict).
+#   - Heatmap корреляции при сотнях слоёв: ограничение размера и dpi.
+#
+# (история) 00_Prepare_Layers_v62.py
 # Скрипт для объединения TIF растров в один файл (Composite)
 #
 # v62 (оптимизация диска и памяти):
@@ -849,13 +861,12 @@ def create_reference_points_table(
                 # out_img: (bands, h, w)
                 # Пиксель валиден, если хотя бы один слой содержит конечное значение
                 mask_valid = np.any(np.isfinite(out_img), axis=0)
-                coords = np.argwhere(mask_valid)
-                for rc in coords:
-                    vals = out_img[:, rc[0], rc[1]]
-                    row_dict = {bn: float(vals[bi]) for bi, bn in enumerate(band_names)}
-                    row_dict["class_name"] = cls
-                    all_rows.append(row_dict)
-                    cls_count += 1
+                n_pix = int(mask_valid.sum())
+                if n_pix:
+                    # v67: блок (пиксели × слои) целиком, без попиксельных dict
+                    all_rows.append(
+                        (out_img[:, mask_valid].T.astype(np.float64), cls))
+                    cls_count += n_pix
             if cls_count == 0 and len(gdf) > 0:
                 print(f"  ✗ '{cls}': все {len(gdf)} полигонов вне растра")
             else:
@@ -869,7 +880,10 @@ def create_reference_points_table(
         print("\n⚠ Не извлечено ни одного пикселя! Проверьте пересечение маски и эталонных полигонов.\n")
         return None
 
-    ref_table = pd.DataFrame(all_rows)
+    ref_table = pd.DataFrame(
+        np.vstack([blk for blk, _ in all_rows]), columns=list(band_names))
+    ref_table["class_name"] = np.concatenate(
+        [np.full(len(blk), c, dtype=object) for blk, c in all_rows])
     n_classes = ref_table["class_name"].nunique()
     print(f"\n✓ Итого: {len(ref_table)} пикселей, {n_classes} классов")
 
@@ -912,7 +926,7 @@ def plot_spearman_corr(
     print(f"  ✓ {os.path.basename(out_csv)}")
 
     # PNG
-    fig_size = max(8, n_vars * 0.45 + 2)
+    fig_size = min(30, max(8, n_vars * 0.45 + 2))  # v67: не >30 дюймов
     fig, ax = plt.subplots(figsize=(fig_size, fig_size * 0.95))
     mask_upper = np.triu(np.ones_like(corr_mat, dtype=bool), k=1)
 
@@ -929,14 +943,14 @@ def plot_spearman_corr(
         fmt=".2f" if annot else "",
         annot_kws={"size": font_size},
         square=True,
-        linewidths=0.5,
+        linewidths=0.5 if n_vars <= 80 else 0,
         ax=ax,
     )
     ax.set_title(title_text, fontsize=12)
     tick_size = max(5, min(9, 160 / n_vars))
     ax.tick_params(axis="both", labelsize=tick_size)
     plt.tight_layout()
-    plt.savefig(out_png, dpi=300, bbox_inches="tight")
+    plt.savefig(out_png, dpi=300 if n_vars <= 100 else 150, bbox_inches="tight")
     plt.close(fig)
     print(f"  ✓ {os.path.basename(out_png)}\n")
 
@@ -951,11 +965,10 @@ def calculate_ci_median(x: np.ndarray, conf: float = 0.95, R: int = 1000):
     x = x[np.isfinite(x)]
     if len(x) < 3:
         return {"lower": np.nan, "median": np.nanmedian(x), "upper": np.nan}
-    rng = np.random.RandomState(42)
-    bm = np.array([np.median(rng.choice(x, size=len(x), replace=True)) for _ in range(R)])
     alpha = (1 - conf) / 2
-    lo, med, hi = np.quantile(bm, [alpha, 0.5, 1 - alpha])
-    return {"lower": lo, "median": med, "upper": hi}
+    md, ci_ = _median_ci_matrix(x[:, None], np.zeros(len(x)), [0],
+                                probs=(alpha, 1 - alpha))[:2]
+    return {"lower": ci_[0, 0, 0], "median": md[0, 0], "upper": ci_[1, 0, 0]}
 
 
 # ============================================================================
@@ -976,13 +989,15 @@ def perform_kruskal_wallis_tests(ref_table: pd.DataFrame) -> pd.DataFrame | None
         print("Недостаточно данных.\n")
         return None
 
-    classes = ref_table["class_name"].unique()
+    # v67: индексы строк каждого класса считаются один раз
+    cls_arr = ref_table["class_name"].to_numpy()
+    cls_idx = [np.flatnonzero(cls_arr == c) for c in pd.unique(cls_arr)]
+    mat = ref_table[layer_cols].to_numpy(dtype=np.float64)
     results = []
-    for lc in layer_cols:
-        groups = [
-            ref_table.loc[ref_table["class_name"] == cls, lc].dropna().values
-            for cls in classes
-        ]
+    for j, lc in enumerate(layer_cols):
+        col = mat[:, j]
+        groups = [col[ix] for ix in cls_idx]
+        groups = [g[np.isfinite(g)] for g in groups]
         groups = [g for g in groups if len(g) > 0]
         if len(groups) < 2:
             continue
@@ -1028,6 +1043,113 @@ def save_kruskal_wallis_results(kw_results: pd.DataFrame | None, output_dir: str
 # ГРАФИКИ: МЕДИАНА + CI ПО КЛАССАМ
 # ============================================================================
 
+def _median_ci_matrix(mat, cls_arr, classes,
+                      probs=(0.025, 0.975, 0.005, 0.995)):
+    """v67: медианы и бутстреп-ДИ медианы для всех слоёв × классов сразу.
+
+    Медиана бутстреп-выборки объёма n из отсортированного s — это s[K],
+    где K — порядковая статистика индексов. Её распределение точно
+    известно (I_p(m+1, n-m), бета-функция), поэтому квантили бутстрепа
+    берутся аналитически — это предел бутстрепа при R -> бесконечность,
+    без случайного шума и без 2000 повторов.
+    """
+    probs = np.asarray(probs, dtype=float)
+    n_c, n_l = len(classes), mat.shape[1]
+    med = np.full((n_c, n_l), np.nan)
+    ci = np.full((len(probs), n_c, n_l), np.nan)
+    cnt = np.zeros((n_c, n_l), dtype=np.int64)
+
+    def _stats(s_sorted, n):
+        m1, m2 = (n - 1) // 2, n // 2
+        md = 0.5 * (s_sorted[m1] + s_sorted[m2])
+        if n < 3:
+            return md, np.broadcast_to(md, (len(probs),) + np.shape(md))
+        k1 = np.clip(np.ceil(n * sp_stats.beta.ppf(probs, m1 + 1, n - m1))
+                     .astype(np.intp) - 1, 0, n - 1)
+        k2 = np.clip(np.ceil(n * sp_stats.beta.ppf(probs, m2 + 1, n - m2))
+                     .astype(np.intp) - 1, 0, n - 1)
+        return md, 0.5 * (s_sorted[k1] + s_sorted[k2])
+
+    for i, c in enumerate(classes):
+        sub = mat[cls_arr == c]
+        if not len(sub):
+            continue
+        fin = np.isfinite(sub)
+        full = np.flatnonzero(fin.all(axis=0))
+        if len(full):
+            n = len(sub)
+            md, q = _stats(np.sort(sub[:, full], axis=0), n)
+            med[i, full], ci[:, i, full], cnt[i, full] = md, q, n
+        for j in np.flatnonzero(~fin.all(axis=0)):
+            v = sub[fin[:, j], j]
+            cnt[i, j] = len(v)
+            if len(v):
+                md, q = _stats(np.sort(v), len(v))
+                med[i, j], ci[:, i, j] = md, q
+    return med, ci, cnt
+
+
+def _render_ci_chunk(job):
+    """Рисует пакет графиков ci_<слой>.png на одной переиспользуемой фигуре."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt_w
+    (names, med, ci, classes, plots_dir, dpi) = job
+    n_c = len(classes)
+    x = np.arange(n_c)
+    cols = plt_w.cm.tab10(np.linspace(0, 1, max(n_c, 10)))
+    c_arr = [cols[k % len(cols)] for k in range(n_c)]
+    fig_w = min(16.0, max(5.0, n_c * 0.45 + 2.0))
+    fig, ax = plt_w.subplots(figsize=(fig_w, 4.2), dpi=dpi)
+    zeros = np.zeros(n_c)
+    v99 = ax.vlines(x, zeros, zeros, colors=c_arr, linewidth=2.5, alpha=0.3)
+    v95 = ax.vlines(x, zeros, zeros, colors=c_arr, linewidth=5, alpha=0.5)
+    pts, = ax.plot(x, zeros, "ok", markersize=4)
+    ax.set_xticks(x)
+    ax.set_xticklabels([str(c) for c in classes], rotation=45,
+                       ha="right", fontsize=8)
+    ttl = ax.set_title("", fontsize=10)
+    ax.set_xlabel("Class")
+    ax.set_ylabel("Value")
+    fig.suptitle("Median ± CI 0.95 (bold) & CI 0.99 (thin)",
+                 fontsize=7, color="grey")
+    fig.tight_layout()
+    # фиксированное поле слева под подписи оси Y любой длины
+    pos = ax.get_position()
+    left = max(pos.x0, 1.05 / fig_w)
+    ax.set_position([left, pos.y0, pos.x1 - left, pos.height])
+    from PIL import Image as _PILImage
+    fig.canvas.draw()
+    base_rgb = np.array(fig.canvas.buffer_rgba(), copy=True)[:, :, :3]
+    H_px = base_rgb.shape[0]
+    y_bot = int(np.floor(H_px - ax.bbox.ymin)) + 1
+    for lbl in ax.get_xticklabels():
+        lbl.set_visible(False)
+    ax.xaxis.label.set_visible(False)
+    seg = np.zeros((n_c, 2, 2))
+    seg[:, :, 0] = x[:, None]
+    for k, nm in enumerate(names):
+        seg[:, 0, 1], seg[:, 1, 1] = ci[2, :, k], ci[3, :, k]
+        v99.set_segments(seg.copy())
+        seg[:, 0, 1], seg[:, 1, 1] = ci[0, :, k], ci[1, :, k]
+        v95.set_segments(seg.copy())
+        pts.set_ydata(med[:, k])
+        lo, hi = np.nanmin(ci[2, :, k]), np.nanmax(ci[3, :, k])
+        if not (np.isfinite(lo) and np.isfinite(hi)):
+            lo, hi = -1.0, 1.0
+        pad = (hi - lo) * 0.06 if hi > lo else max(abs(hi) * 0.05, 1e-6)
+        ax.set_ylim(lo - pad, hi + pad)
+        ttl.set_text(nm)
+        fig.canvas.draw()
+        out = np.asarray(fig.canvas.buffer_rgba())[:, :, :3].copy()
+        if 0 < y_bot < H_px:
+            out[y_bot:, :] = base_rgb[y_bot:, :]
+        _PILImage.fromarray(out).save(
+            os.path.join(plots_dir, f"ci_{nm}.png"), compress_level=1)
+    plt_w.close(fig)
+    return len(names)
+
+
 def plot_boxplots_by_class(ref_table: pd.DataFrame, plots_dir: str):
     print("\n════════════════════════════════════════════════════════")
     print("ГРАФИКИ: МЕДИАНА + ДОВЕРИТЕЛЬНЫЕ ИНТЕРВАЛЫ ПО КЛАССАМ")
@@ -1042,77 +1164,48 @@ def plot_boxplots_by_class(ref_table: pd.DataFrame, plots_dir: str):
     if not layer_cols:
         return
 
-    classes = sorted(ref_table["class_name"].unique(), key=str)
-    n_classes = len(classes)
-    colors = plt.cm.tab10(np.linspace(0, 1, max(n_classes, 10)))
+    import time as _time
+    t0 = _time.time()
+    cls_arr = ref_table["class_name"].to_numpy()
+    classes = sorted(pd.unique(cls_arr), key=str)
+    mat = ref_table[layer_cols].to_numpy(dtype=np.float64)
+    med, ci, cnt = _median_ci_matrix(mat, cls_arr, classes)
+    print(f"  Медианы и ДИ: {len(layer_cols)} слоёв × {len(classes)} классов "
+          f"({_time.time() - t0:.1f} с)")
 
-    for lc in layer_cols:
-        stats_rows = []
-        for cls in classes:
-            vals = ref_table.loc[ref_table["class_name"] == cls, lc].dropna().values
-            n = len(vals)
-            med = np.median(vals) if n > 0 else np.nan
-            if n >= 3:
-                rng = np.random.RandomState(42)
-                bm = np.array(
-                    [np.median(rng.choice(vals, size=n, replace=True)) for _ in range(2000)]
-                )
-                ci95 = np.quantile(bm, [0.025, 0.975])
-                ci99 = np.quantile(bm, [0.005, 0.995])
-            else:
-                ci95 = [med, med]
-                ci99 = [med, med]
-            stats_rows.append(
-                {
-                    "class": cls,
-                    "median": med,
-                    "ci95_lo": ci95[0],
-                    "ci95_hi": ci95[1],
-                    "ci99_lo": ci99[0],
-                    "ci99_hi": ci99[1],
-                    "n": n,
-                }
-            )
+    # сводная таблица (для отчётов — без открытия сотен PNG)
+    rows = []
+    for j, lc in enumerate(layer_cols):
+        for i, c in enumerate(classes):
+            rows.append({"layer": lc, "class": c, "n": int(cnt[i, j]),
+                         "median": med[i, j],
+                         "ci95_lo": ci[0, i, j], "ci95_hi": ci[1, i, j],
+                         "ci99_lo": ci[2, i, j], "ci99_hi": ci[3, i, j]})
+    out_csv = os.path.join(os.path.dirname(os.path.abspath(plots_dir)),
+                           "Class_medians_CI.csv")
+    pd.DataFrame(rows).to_csv(out_csv, index=False)
+    print(f"  ✓ {os.path.basename(out_csv)}")
 
-        sdf = pd.DataFrame(stats_rows)
-        fig_w = max(5, n_classes * 0.8 + 2)
-        fig, ax = plt.subplots(figsize=(fig_w, 4))
-
-        x = np.arange(len(sdf))
-        for j, row in sdf.iterrows():
-            ax.plot(
-                [j, j],
-                [row["ci99_lo"], row["ci99_hi"]],
-                color=colors[j % len(colors)],
-                linewidth=2.5,
-                alpha=0.3,
-            )
-            ax.plot(
-                [j, j],
-                [row["ci95_lo"], row["ci95_hi"]],
-                color=colors[j % len(colors)],
-                linewidth=5,
-                alpha=0.5,
-            )
-            ax.plot(j, row["median"], "ok", markersize=4)
-
-        ax.set_xticks(x)
-        ax.set_xticklabels(sdf["class"], rotation=45, ha="right", fontsize=8)
-        ax.set_title(lc, fontsize=10)
-        ax.set_xlabel("Class")
-        ax.set_ylabel("Value")
-        fig.suptitle(
-            "Median ± CI 0.95 (bold) & CI 0.99 (thin)",
-            fontsize=7,
-            color="grey",
-        )
-        plt.tight_layout()
-        plt.savefig(
-            os.path.join(plots_dir, f"ci_{lc}.png"), dpi=300, bbox_inches="tight"
-        )
-        plt.close(fig)
-
-    print(f"✓ Графиков (медиана + CI): {len(layer_cols)}\n")
+    # отрисовка: пакеты слоёв параллельно (по числу потоков из начала скрипта)
+    t0 = _time.time()
+    n_jobs = max(1, min(int(os.environ.get("GDAL_NUM_THREADS", "1") or 1),
+                        len(layer_cols) // 20 or 1))
+    chunks = np.array_split(np.arange(len(layer_cols)), n_jobs)
+    jobs = [([layer_cols[j] for j in ch], med[:, ch], ci[:, :, ch],
+             classes, plots_dir, 200) for ch in chunks if len(ch)]
+    done = False
+    if n_jobs > 1:
+        try:
+            Parallel(n_jobs=n_jobs, backend="loky")(
+                delayed(_render_ci_chunk)(jb) for jb in jobs)
+            done = True
+        except Exception as e:
+            print(f"  ⚠ Параллельная отрисовка не удалась ({e}); рисую в один поток")
+    if not done:
+        for jb in jobs:
+            _render_ci_chunk(jb)
+    print(f"✓ Графиков (медиана + CI): {len(layer_cols)} "
+          f"({_time.time() - t0:.0f} с, потоков: {n_jobs})\n")
 
 
 # ============================================================================
@@ -1342,7 +1435,7 @@ def filter_layers_by_correlation(
         png_name = f"Spearman_layers_{suffix}.png"
         png_path = os.path.join(plots_dir, png_name)
         n_v = len(col_names)
-        fig_sz = max(8, n_v * 0.45 + 2)
+        fig_sz = min(30, max(8, n_v * 0.45 + 2))  # v67: не >30 дюймов
         fig, ax = plt.subplots(figsize=(fig_sz, fig_sz * 0.95))
         mask_upper = np.triu(np.ones_like(corr_mat, dtype=bool), k=1)
         annot = n_v <= 40
@@ -1358,14 +1451,14 @@ def filter_layers_by_correlation(
             fmt=".2f" if annot else "",
             annot_kws={"size": fsize},
             square=True,
-            linewidths=0.5,
+            linewidths=0.5 if n_v <= 80 else 0,
             ax=ax,
         )
         ax.set_title(f"Spearman correlation ({title_tag})", fontsize=10)
         tick_sz = max(5, min(9, 160 / n_v))
         ax.tick_params(axis="both", labelsize=tick_sz)
         plt.tight_layout()
-        plt.savefig(png_path, dpi=300, bbox_inches="tight")
+        plt.savefig(png_path, dpi=300 if n_v <= 100 else 150, bbox_inches="tight")
         plt.close(fig)
         print(f"✓ PNG: {png_name}\n")
 
@@ -1805,6 +1898,7 @@ def main():
     print("Объединение TIF растров в один файл")
     print("ВЕРСИЯ v63 (Python) — ZSTD+PREDICTOR=3, потоковое объединение")
     print("v66: виртуальный композит VRT — быстро и без места на диске; полигоны вне растра не теряют класс")
+    print("v67: ускорены извлечение эталонов, тесты KW и графики медиана + CI")
     print("С ВЫБОРОМ ПРОЕКЦИИ, МАСКОЙ, КОРРЕЛЯЦИЯМИ, KRUSKAL-WALLIS И ФИЛЬТРАЦИЕЙ СЛОЁВ")
     print("════════════════════════════════════════════════════════\n")
 
