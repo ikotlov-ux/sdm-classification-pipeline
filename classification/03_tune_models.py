@@ -1,5 +1,5 @@
 # =============================================================================
-# 03_tune_models_v54.py (workspace: 03_tune_models_v5.py)
+# 03_tune_models_v55.py (workspace: 03_tune_models_v5.py)
 # v5/v54: ускорение в 2–20x (предварительная стандартизация по фолдам 1 раз,
 #         отказ от 2x cross_val_predict через сбор OOF в процессе CV,
 #         быстрый спектральный решатель RDA, однократный поиск соседей в KNN,
@@ -1309,12 +1309,14 @@ def main():
         try:
             if tuning_grid and supports_grid:
                 combos = list(ParameterGrid(tuning_grid))
+                import threading as _threading
+                _pbar_lock = _threading.Lock()
                 pbar = tqdm(
                     total=total_fits,
                     desc=f"  {algo_name}",
                     unit="fit",
-                    bar_format="  {l_bar}{bar}| {n_fmt}/{total_fmt} фитов [{elapsed}<{remaining}, {rate_fmt}]",
-                    ncols=100,
+                    bar_format="  {l_bar}{bar}| {n_fmt}/{total_fmt} фитов [{elapsed}<{remaining}, {rate_fmt}{postfix}]",
+                    ncols=115,
                 )
 
                 # Matrix of fold scores (n_combos, n_folds) and OOF predictions per combo
@@ -1325,11 +1327,11 @@ def main():
                     # Быстрый спектральный решатель RDA (1 разложение ковариации на фолд)
                     shrinkages = [float(c["model__shrinkage"]) for c in combos]
                     outer_jobs = min(ncores, n_folds)
-                    fold_results = joblib.Parallel(n_jobs=outer_jobs, prefer="threads")(
-                        joblib.delayed(_eval_rda_fold_fast)(fold_caches[fi], shrinkages)
-                        for fi in range(n_folds)
-                    )
-                    for fi, fdict in enumerate(fold_results):
+                    def _rda_task(fi: int):
+                        return fi, _eval_rda_fold_fast(fold_caches[fi], shrinkages)
+                    for fi, fdict in joblib.Parallel(
+                        n_jobs=outer_jobs, prefer="threads", return_as="generator_unordered"
+                    )(joblib.delayed(_rda_task)(fi) for fi in range(n_folds)):
                         te_idx = fold_caches[fi]["te_idx"]
                         for ci, (sc, preds) in fdict.items():
                             scores_mat[ci, fi] = sc
@@ -1337,23 +1339,19 @@ def main():
                         pbar.update(len(combos))
 
                 elif algo_key == "knn":
-                    # Быстрый KNN: kneighbors 1 раз на (фолд, метрика) до max(k)
-                    outer_jobs = min(ncores, n_folds)
-                    inner_jobs = max(1, ncores // max(outer_jobs, 1))
-                    fold_results = joblib.Parallel(n_jobs=outer_jobs, prefer="threads")(
-                        joblib.delayed(_eval_knn_fold_fast)(fold_caches[fi], combos, inner_jobs)
-                        for fi in range(n_folds)
-                    )
-                    for fi, fdict in enumerate(fold_results):
+                    # Быстрый KNN: kneighbors 1 раз на (фолд, метрика) до max(k) со всеми ядрами ncores
+                    for fi in range(n_folds):
+                        pbar.set_postfix_str(f"фолд {fi+1}/{n_folds}", refresh=True)
+                        fdict = _eval_knn_fold_fast(fold_caches[fi], combos, ncores)
                         te_idx = fold_caches[fi]["te_idx"]
                         for ci, (sc, preds) in fdict.items():
                             scores_mat[ci, fi] = sc
                             oof_by_combo[ci][te_idx] = preds
                         pbar.update(len(combos))
+                    pbar.set_postfix_str("", refresh=True)
 
                 elif algo_key in ("ridge", "lasso", "elasticnet"):
                     # Warm-start вдоль возрастающего C внутри каждого фолда
-                    # Группируем комбинации по (penalty, l1_ratio) и сортируем по C
                     groups_lr: dict[tuple, list[tuple[int, float, dict]]] = {}
                     for ci, params in enumerate(combos):
                         mp = _strip_model_prefix(params)
@@ -1374,6 +1372,8 @@ def main():
                                     est.fit(fc["X_tr64"], fc["y_tr"])
                                 preds = est.predict(fc["X_te64"])
                                 out[ci] = (float(accuracy_score(fc["y_te"], preds)), preds)
+                                with _pbar_lock:
+                                    pbar.update(1)
                         return fi, out
 
                     outer_jobs = min(ncores, n_folds)
@@ -1384,11 +1384,15 @@ def main():
                         for ci, (sc, preds) in fdict.items():
                             scores_mat[ci, fi] = sc
                             oof_by_combo[ci][te_idx] = preds
-                        pbar.update(len(combos))
 
                 elif algo_key in ("rf", "catboost", "lgbm"):
-                    # Группируем по всем параметрам кроме числа деревьев (n_estimators / iterations):
-                    # обучаем 1 раз до max_trees и снимаем предсказания на префиксах деревьев!
+                    # Для ансамблей деревьев (RF, CatBoost, LightGBM) обучаем по одному фиту за раз,
+                    # отдавая ВСЕ ncores потоков внутрь самой модели (n_jobs=ncores / thread_count=ncores).
+                    # Это:
+                    # 1) в ncores раз ускоряет завершение первого и каждого следующего фита (прогресс-бар
+                    #    начинает двигаться через секунды, а не через минуты ожидания ncores параллельных лесов);
+                    # 2) в ncores раз снижает пиковое потребление RAM и полностью исключает борьбу потоков за GIL;
+                    # 3) для RF выводит живой счётчик построенных деревьев прямо внутри каждого фолда.
                     iter_key = "iterations" if algo_key == "catboost" else "n_estimators"
                     tree_groups: dict[tuple, list[tuple[int, int, dict]]] = {}
                     for ci, params in enumerate(combos):
@@ -1399,63 +1403,103 @@ def main():
                     for gkey in tree_groups:
                         tree_groups[gkey].sort(key=lambda t: t[1])
 
-                    group_list = list(tree_groups.values())
-                    tasks = [(gi, fi) for gi in range(len(group_list)) for fi in range(n_folds)]
-                    outer_jobs = min(ncores, len(tasks))
-                    inner_jobs = max(1, ncores // max(outer_jobs, 1))
+                    # Сортируем группы так, чтобы быстрые комбинации (меньший max_features/depth, больший min_samples_leaf)
+                    # шли первыми и сразу давали быстрый отклик прогресс-бара (результаты записываются по исходным индексам ci).
+                    def _group_sort_key(items):
+                        mp0 = items[-1][2]
+                        mf = mp0.get("max_features", mp0.get("depth", mp0.get("num_leaves", 10)))
+                        mf_val = mf if isinstance(mf, (int, float)) else 9999
+                        msl = mp0.get("min_samples_leaf", 1)
+                        msl_val = msl if isinstance(msl, (int, float)) else 1
+                        return (mf_val, -msl_val)
+
+                    group_list = sorted(tree_groups.values(), key=_group_sort_key)
                     use_f32 = algo_key in ("rf", "lgbm")
+                    _orig_batch_cb = joblib.parallel.BatchCompletionCallBack
 
-                    def _run_tree_group_fold(gi: int, fi: int):
-                        fc = fold_caches[fi]
-                        X_tr = fc["X_tr32"] if use_f32 else fc["X_tr64"]
-                        X_te = fc["X_te32"] if use_f32 else fc["X_te64"]
-                        y_tr = fc["y_tr"]
-                        y_te = fc["y_te"]
-                        items = group_list[gi]
+                    for gi, items in enumerate(group_list):
                         max_ci, max_trees, max_mp = items[-1]
-
-                        est, _ = _build_estimator(algo_key, inner_jobs)
-                        est.set_params(**max_mp)
-                        with _sklearn.config_context(assume_finite=True):
-                            est.fit(X_tr, y_tr)
-
-                        out = {}
-                        if len(items) == 1:
-                            preds = np.asarray(est.predict(X_te)).reshape(-1)
-                            out[max_ci] = (float(accuracy_score(y_te, preds)), preds)
+                        if algo_key == "rf":
+                            hint_str = f"mtry={max_mp.get('max_features')}, leaf={max_mp.get('min_samples_leaf', 1)}"
+                        elif algo_key == "catboost":
+                            hint_str = f"depth={max_mp.get('depth')}, lr={max_mp.get('learning_rate')}"
                         else:
-                            orig_ests = getattr(est, "estimators_", None) if algo_key == "rf" else None
-                            for ci, n_tr, mp in items:
-                                try:
-                                    if algo_key == "rf" and orig_ests is not None:
-                                        est.estimators_ = orig_ests[:n_tr]
-                                        est.n_estimators = n_tr
-                                        preds = np.asarray(est.predict(X_te)).reshape(-1)
-                                    elif algo_key == "catboost":
-                                        preds = np.asarray(est.predict(X_te, ntree_end=n_tr)).reshape(-1)
-                                    elif algo_key == "lgbm":
-                                        preds = np.asarray(est.predict(X_te, num_iteration=n_tr)).reshape(-1)
-                                    else:
-                                        preds = np.asarray(est.predict(X_te)).reshape(-1)
-                                except Exception:
-                                    est_sub, _ = _build_estimator(algo_key, inner_jobs)
-                                    est_sub.set_params(**mp)
-                                    est_sub.fit(X_tr, y_tr)
-                                    preds = np.asarray(est_sub.predict(X_te)).reshape(-1)
-                                out[ci] = (float(accuracy_score(y_te, preds)), preds)
-                            if algo_key == "rf" and orig_ests is not None:
-                                est.estimators_ = orig_ests
-                                est.n_estimators = max_trees
-                        return gi, fi, out
+                            hint_str = f"leaves={max_mp.get('num_leaves')}, lr={max_mp.get('learning_rate')}"
 
-                    for gi, fi, fdict in joblib.Parallel(
-                        n_jobs=outer_jobs, prefer="threads", return_as="generator_unordered"
-                    )(joblib.delayed(_run_tree_group_fold)(gi, fi) for gi, fi in tasks):
-                        te_idx = fold_caches[fi]["te_idx"]
-                        for ci, (sc, preds) in fdict.items():
-                            scores_mat[ci, fi] = sc
-                            oof_by_combo[ci][te_idx] = preds
-                        pbar.update(len(fdict))
+                        for fi in range(n_folds):
+                            fc = fold_caches[fi]
+                            X_tr = fc["X_tr32"] if use_f32 else fc["X_tr64"]
+                            X_te = fc["X_te32"] if use_f32 else fc["X_te64"]
+                            y_tr = fc["y_tr"]
+                            y_te = fc["y_te"]
+
+                            est, _ = _build_estimator(algo_key, ncores)
+                            est.set_params(**max_mp)
+
+                            if algo_key == "rf":
+                                trees_done = [0]
+                                last_t = [time.monotonic()]
+                                pbar.set_postfix_str(
+                                    f"фолд {fi+1}/{n_folds}, {hint_str}, дер. 0/{max_trees}",
+                                    refresh=True,
+                                )
+
+                                class _TreeProgressCB(_orig_batch_cb):
+                                    def __call__(self, *args, **kwargs):
+                                        trees_done[0] += self.batch_size
+                                        now = time.monotonic()
+                                        if now - last_t[0] >= 0.25:
+                                            last_t[0] = now
+                                            pbar.set_postfix_str(
+                                                f"фолд {fi+1}/{n_folds}, {hint_str}, дер. {min(trees_done[0], max_trees)}/{max_trees}",
+                                                refresh=True,
+                                            )
+                                        return super().__call__(*args, **kwargs)
+
+                                joblib.parallel.BatchCompletionCallBack = _TreeProgressCB
+                                try:
+                                    with _sklearn.config_context(assume_finite=True):
+                                        est.fit(X_tr, y_tr)
+                                finally:
+                                    joblib.parallel.BatchCompletionCallBack = _orig_batch_cb
+                            else:
+                                pbar.set_postfix_str(f"фолд {fi+1}/{n_folds}, {hint_str}", refresh=True)
+                                with _sklearn.config_context(assume_finite=True):
+                                    est.fit(X_tr, y_tr)
+
+                            te_idx = fc["te_idx"]
+                            if len(items) == 1:
+                                preds = np.asarray(est.predict(X_te)).reshape(-1)
+                                scores_mat[max_ci, fi] = float(accuracy_score(y_te, preds))
+                                oof_by_combo[max_ci][te_idx] = preds
+                            else:
+                                orig_ests = getattr(est, "estimators_", None) if algo_key == "rf" else None
+                                for ci, n_tr, mp in items:
+                                    try:
+                                        if algo_key == "rf" and orig_ests is not None:
+                                            est.estimators_ = orig_ests[:n_tr]
+                                            est.n_estimators = n_tr
+                                            preds = np.asarray(est.predict(X_te)).reshape(-1)
+                                        elif algo_key == "catboost":
+                                            preds = np.asarray(est.predict(X_te, ntree_end=n_tr)).reshape(-1)
+                                        elif algo_key == "lgbm":
+                                            preds = np.asarray(est.predict(X_te, num_iteration=n_tr)).reshape(-1)
+                                        else:
+                                            preds = np.asarray(est.predict(X_te)).reshape(-1)
+                                    except Exception:
+                                        est_sub, _ = _build_estimator(algo_key, ncores)
+                                        est_sub.set_params(**mp)
+                                        with _sklearn.config_context(assume_finite=True):
+                                            est_sub.fit(X_tr, y_tr)
+                                        preds = np.asarray(est_sub.predict(X_te)).reshape(-1)
+                                    scores_mat[ci, fi] = float(accuracy_score(y_te, preds))
+                                    oof_by_combo[ci][te_idx] = preds
+                                if algo_key == "rf" and orig_ests is not None:
+                                    est.estimators_ = orig_ests
+                                    est.n_estimators = max_trees
+                            del est
+                            pbar.update(len(items))
+                    pbar.set_postfix_str("", refresh=True)
 
                 else:
                     # Универсальный параллельный перебор (SVM и др.) по предмасштабированным фолдам
@@ -1480,19 +1524,21 @@ def main():
                         oof_by_combo[ci][fold_caches[fi]["te_idx"]] = preds
                         pbar.update(1)
 
-                pbar.close()
-
                 mean_scores = scores_mat.mean(axis=1)
                 best_ci = int(np.argmax(mean_scores))
                 best_params_ = combos[best_ci]
                 y_pred = oof_by_combo[best_ci]
 
                 # Финальный refit лучшей модели на всех стандартизованных данных (1 раз)
+                pbar.set_postfix_str("финальное обучение на всей выборке...", refresh=True)
                 best_mp = _strip_model_prefix(best_params_)
                 final_est, _ = _build_estimator(algo_key, ncores)
                 final_est.set_params(**best_mp)
                 X_fit_full = full_cache["X_full32"] if algo_key in ("rf", "lgbm") else full_cache["X_full64"]
-                final_est.fit(X_fit_full, y_all)
+                with _sklearn.config_context(assume_finite=True):
+                    final_est.fit(X_fit_full, y_all)
+                pbar.set_postfix_str("", refresh=True)
+                pbar.close()
                 trained_model = _build_fitted_pipeline(full_cache, final_est, predictor_cols)
 
                 print(f"  Лучшие параметры: ", end="")
