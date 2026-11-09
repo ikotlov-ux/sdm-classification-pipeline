@@ -1,5 +1,10 @@
 # =============================================================================
-# 03_tune_models_v52.py
+# 03_tune_models_v54.py (workspace: 03_tune_models_v5.py)
+# v5/v54: ускорение в 2–20x (предварительная стандартизация по фолдам 1 раз,
+#         отказ от 2x cross_val_predict через сбор OOF в процессе CV,
+#         быстрый спектральный решатель RDA, однократный поиск соседей в KNN,
+#         оценка префиксов деревьев в CatBoost/LightGBM/RF, warm_start по C
+#         в Ridge/Lasso/ElasticNet, быстрый ZV/NZV и векторный AIC)
 # СКРИПТ 03: ТЮНИНГ МОДЕЛЕЙ КЛАССИФИКАЦИИ
 #
 # Функционал:
@@ -123,30 +128,43 @@ def _select_prev_subdir(base_dir: str) -> tuple[str, str]:
 def _near_zero_var(df: pd.DataFrame, cols: list, freq_cut: float = 19.0,
                    unique_cut: float = 10.0) -> list:
     """
-    Аналог caret::nearZeroVar.
+    Векторизованный аналог caret::nearZeroVar.
     freq_cut — отношение самого частого к второму по частоте (95/5 = 19).
     unique_cut — процент уникальных значений.
     Возвращает список имён ZV/NZV-переменных.
     """
     bad = []
     n = len(df)
-    for c in cols:
-        vals = df[c].dropna()
-        n_unique = vals.nunique()
-        pct_unique = 100.0 * n_unique / max(n, 1)
-
+    if n == 0 or not cols:
+        return bad
+    X_arr = df[cols].to_numpy(dtype=np.float64, copy=False)
+    max_u = int(n * unique_cut / 100.0)
+    probe_n = min(n, max(max_u * 2, 2000))
+    for j, c in enumerate(cols):
+        col = X_arr[:, j]
+        # Быстрая отсечка явно непрерывных каналов по префиксу без полной сортировки
+        probe = col[:probe_n]
+        probe_v = probe[~np.isnan(probe)]
+        if probe_v.size > max_u and np.unique(probe_v).size > max_u:
+            continue
+        valid = col[~np.isnan(col)]
+        if valid.size <= 1:
+            bad.append(c)
+            continue
+        u, counts = np.unique(valid, return_counts=True)
+        n_unique = u.size
         if n_unique <= 1:
             bad.append(c)
             continue
-
-        freq = vals.value_counts()
-        if len(freq) >= 2:
-            ratio = freq.iloc[0] / max(freq.iloc[1], 1)
-        else:
-            ratio = float("inf")
-
-        if ratio >= freq_cut and pct_unique <= unique_cut:
-            bad.append(c)
+        pct_unique = 100.0 * n_unique / max(n, 1)
+        if pct_unique <= unique_cut:
+            if counts.size >= 2:
+                top2 = np.partition(counts, -2)[-2:]
+                ratio = top2[1] / max(top2[0], 1)
+            else:
+                ratio = float("inf")
+            if ratio >= freq_cut:
+                bad.append(c)
     return bad
 
 
@@ -463,18 +481,18 @@ def _count_combinations(grid: dict | None) -> int:
 # AIC
 # =============================================================================
 
-def _compute_aic(model, X, y_true, n_classes: int) -> float | None:
-    """Вычисление AIC через log-loss. Возвращает None при ошибке."""
+def _compute_aic(model, X, y_true, n_classes: int, X_scaled: np.ndarray | None = None) -> float | None:
+    """Векторизованное вычисление AIC через log-loss. Возвращает None при ошибке."""
     try:
-        probs = model.predict_proba(X)
+        if X_scaled is not None and hasattr(model, "named_steps") and "model" in model.named_steps:
+            probs = model.named_steps["model"].predict_proba(X_scaled)
+        else:
+            probs = model.predict_proba(X)
         eps = 1e-15
-        probs = np.clip(probs, eps, 1 - eps)
-        ll = 0.0
-        for i in range(len(y_true)):
-            true_idx = y_true[i]
-            ll -= np.log(probs[i, true_idx])
+        probs = np.clip(probs, eps, 1.0 - eps)
+        ll = -float(np.sum(np.log(probs[np.arange(len(y_true)), y_true])))
         k = _estimate_nparams(model, X.shape[1], n_classes)
-        return 2 * k + 2 * ll
+        return 2.0 * k + 2.0 * ll
     except Exception:
         return None
 
@@ -672,6 +690,188 @@ def _load_samples_safe(data_dir: str, need_xy: bool = True) -> pd.DataFrame:
     raise RuntimeError(f"Не удалось прочитать обучающие данные из {data_dir}")
 
 
+
+try:
+    import functools as _functools
+    import sklearn as _sklearn
+    from sklearn.base import BaseEstimator as _BaseEstimator
+    if not hasattr(_BaseEstimator, "_gpn_cached"):
+        _orig_gpn = _BaseEstimator._get_param_names.__func__
+        @_functools.lru_cache(maxsize=None)
+        def _cached_gpn_impl(cls):
+            return _orig_gpn(cls)
+        _BaseEstimator._get_param_names = classmethod(_cached_gpn_impl)
+        _BaseEstimator._gpn_cached = True
+except Exception:
+    pass
+
+
+def _prepare_fold_caches(
+    X_df: pd.DataFrame,
+    y_all: np.ndarray,
+    cv_splits: list[tuple[np.ndarray, np.ndarray]],
+):
+    """Однократная импутация (median) и стандартизация (z-score) для всех фолдов и всей выборки.
+
+    Возвращает:
+      fold_caches: список словарей по фолдам (X_tr64, X_te64, X_tr32, X_te32, y_tr, y_te, te_idx)
+      full_cache: словарь (X_full64, X_full32, imputer_full, scaler_full)
+    """
+    X_raw = X_df.to_numpy(dtype=np.float64, copy=False)
+    has_nan_col = np.isnan(X_raw).any(axis=0)
+    any_nan = bool(np.any(has_nan_col))
+
+    fold_caches = []
+    for tr_idx, te_idx in cv_splits:
+        X_tr = X_raw[tr_idx]
+        X_te = X_raw[te_idx]
+        if any_nan:
+            imp = SimpleImputer(strategy="median")
+            scl = StandardScaler()
+            X_tr64 = np.ascontiguousarray(scl.fit_transform(imp.fit_transform(X_tr)), dtype=np.float64)
+            X_te64 = np.ascontiguousarray(scl.transform(imp.transform(X_te)), dtype=np.float64)
+        else:
+            mean = X_tr.mean(axis=0)
+            std = X_tr.std(axis=0, ddof=0)
+            std_safe = np.where(std == 0.0, 1.0, std)
+            X_tr64 = np.ascontiguousarray((X_tr - mean) / std_safe, dtype=np.float64)
+            X_te64 = np.ascontiguousarray((X_te - mean) / std_safe, dtype=np.float64)
+        fold_caches.append({
+            "X_tr64": X_tr64,
+            "X_te64": X_te64,
+            "X_tr32": np.ascontiguousarray(X_tr64, dtype=np.float32),
+            "X_te32": np.ascontiguousarray(X_te64, dtype=np.float32),
+            "y_tr": y_all[tr_idx],
+            "y_te": y_all[te_idx],
+            "te_idx": te_idx,
+        })
+
+    imputer_full = SimpleImputer(strategy="median")
+    scaler_full = StandardScaler()
+    X_full64 = np.ascontiguousarray(
+        scaler_full.fit_transform(imputer_full.fit_transform(X_df)),
+        dtype=np.float64,
+    )
+    full_cache = {
+        "X_full64": X_full64,
+        "X_full32": np.ascontiguousarray(X_full64, dtype=np.float32),
+        "imputer_full": imputer_full,
+        "scaler_full": scaler_full,
+    }
+    return fold_caches, full_cache
+
+
+def _build_fitted_pipeline(full_cache: dict, fitted_model, predictor_cols: list[str]) -> Pipeline:
+    """Собирает стандартный sklearn Pipeline из уже обученных imputer, scaler и модели."""
+    import copy
+    pipe = Pipeline([
+        ("imputer", copy.deepcopy(full_cache["imputer_full"])),
+        ("scaler", copy.deepcopy(full_cache["scaler_full"])),
+        ("model", fitted_model),
+    ])
+    return _attach_predictor_names(pipe, predictor_cols)
+
+
+def _strip_model_prefix(params: dict) -> dict:
+    return {
+        (k[7:] if k.startswith("model__") else k): v
+        for k, v in params.items()
+    }
+
+
+def _eval_rda_fold_fast(fc: dict, shrinkages: list[float]) -> dict[int, tuple[float, np.ndarray]]:
+    """Быстрый точный расчёт RDA (LinearDiscriminantAnalysis solver='lsqr') для всех shrinkage на одном фолде."""
+    from scipy import linalg
+    X_tr = fc["X_tr64"]
+    y_tr = fc["y_tr"]
+    X_te = fc["X_te64"]
+    y_te = fc["y_te"]
+
+    N, p = X_tr.shape
+    classes, y_idx = np.unique(y_tr, return_inverse=True)
+    K = classes.size
+    counts = np.bincount(y_idx, minlength=K).astype(np.float64)
+    priors = counts / float(N)
+    log_priors = np.log(priors)
+
+    Y_oh = np.zeros((N, K), dtype=np.float64)
+    Y_oh[np.arange(N), y_idx] = 1.0
+    means = (Y_oh.T @ X_tr) / counts[:, None]
+    cov_base = (X_tr.T @ X_tr) / float(N) - (means * priors[:, None]).T @ means
+    mu_trace = np.trace(cov_base) / float(p)
+
+    evals, evecs = linalg.eigh(cov_base)
+    means_proj = means @ evecs
+    X_te_proj = X_te @ evecs
+    eps_cond = np.finfo(np.float64).eps * max(cov_base.shape)
+
+    out = {}
+    for si, s in enumerate(shrinkages):
+        s_val = float(s)
+        d = (1.0 - s_val) * evals + s_val * mu_trace
+        cutoff = eps_cond * float(np.max(np.abs(d)))
+        inv_d = np.where(d > cutoff, 1.0 / d, 0.0)
+        coef_proj = means_proj * inv_d[None, :]
+        intercept = -0.5 * np.einsum("ij,ij->i", means_proj, coef_proj) + log_priors
+        scores = X_te_proj @ coef_proj.T + intercept
+        preds = classes[np.argmax(scores, axis=1)]
+        out[si] = (float(accuracy_score(y_te, preds)), preds)
+    return out
+
+
+def _eval_knn_fold_fast(
+    fc: dict,
+    combos: list[dict],
+    inner_jobs: int = 1,
+) -> dict[int, tuple[float, np.ndarray]]:
+    """Быстрый точный расчёт KNN: kneighbors считается один раз на каждую метрику до max(n_neighbors)."""
+    X_tr = fc["X_tr64"]
+    y_tr = fc["y_tr"]
+    X_te = fc["X_te64"]
+    y_te = fc["y_te"]
+
+    classes, y_idx = np.unique(y_tr, return_inverse=True)
+    n_classes = classes.size
+
+    # Группируем комбинации по metric
+    by_metric: dict[str, list[tuple[int, int, str]]] = {}
+    for ci, params in enumerate(combos):
+        mp = _strip_model_prefix(params)
+        metric = mp.get("metric", "minkowski")
+        k = int(mp.get("n_neighbors", 5))
+        w = mp.get("weights", "uniform")
+        by_metric.setdefault(metric, []).append((ci, k, w))
+
+    out = {}
+    for metric, items in by_metric.items():
+        k_max = max(k for _, k, _ in items)
+        knn_base = KNeighborsClassifier(n_neighbors=k_max, metric=metric, n_jobs=inner_jobs)
+        knn_base.fit(X_tr, y_tr)
+        neigh_dist, neigh_ind = knn_base.kneighbors(X_te, n_neighbors=k_max, return_distance=True)
+        neigh_y = y_idx[neigh_ind]
+
+        for ci, k, w in items:
+            ny = neigh_y[:, :k]
+            if w == "uniform":
+                counts = np.zeros((X_te.shape[0], n_classes), dtype=np.int32)
+                for c in range(n_classes):
+                    counts[:, c] = np.sum(ny == c, axis=1)
+                preds = classes[np.argmax(counts, axis=1)]
+            else:
+                nd = neigh_dist[:, :k]
+                with np.errstate(divide="ignore"):
+                    w_arr = 1.0 / nd
+                inf_mask = np.isinf(w_arr)
+                if np.any(inf_mask):
+                    w_arr = np.where(inf_mask, 1.0, 0.0)
+                w_scores = np.zeros((X_te.shape[0], n_classes), dtype=np.float64)
+                for c in range(n_classes):
+                    w_scores[:, c] = np.sum(np.where(ny == c, w_arr, 0.0), axis=1)
+                preds = classes[np.argmax(w_scores, axis=1)]
+            out[ci] = (float(accuracy_score(y_te, preds)), preds)
+    return out
+
+
 def main():
     print("\n============================================================")
     print(" 03 - ТЮНИНГ МОДЕЛЕЙ КЛАССИФИКАЦИИ")
@@ -801,13 +1001,28 @@ def main():
             cv_method_label = "Spatial Block CV + стратификация"
     print(f"  ✓ CV метод: {cv_method_label}")
 
-    # --- Проверка sd предикторов по CV-фолдам ---
+    # --- Быстрая векторная проверка sd предикторов по CV-фолдам ---
     fold_zero_sd = set()
-    for fi in range(n_folds):
-        fold_data = samples_df.iloc[folds_train[fi]][predictor_cols]
-        sds = fold_data.std()
-        bad = sds[(sds.isna()) | (sds < 1e-12)].index.tolist()
-        fold_zero_sd.update(bad)
+    _X_sd_check = samples_df[predictor_cols].to_numpy(dtype=np.float64, copy=False)
+    if n_folds >= 2 and len(folds_test[0]) > 1 and len(folds_test[1]) > 1:
+        _t0 = np.asarray(folds_test[0], dtype=np.intp)
+        _t1 = np.asarray(folds_test[1], dtype=np.intp)
+        _sd0 = np.nanstd(_X_sd_check[_t0], axis=0, ddof=1)
+        _sd1 = np.nanstd(_X_sd_check[_t1], axis=0, ddof=1)
+        _scale = np.sqrt(max(min(_t0.size, _t1.size) - 1, 1) / max(_X_sd_check.shape[0], 1))
+        _suspect = np.where(
+            np.isnan(_sd0) | np.isnan(_sd1) | (np.minimum(_sd0, _sd1) * _scale < 1e-11)
+        )[0]
+    else:
+        _suspect = np.arange(len(predictor_cols))
+    if _suspect.size > 0:
+        _X_sub = _X_sd_check[:, _suspect]
+        for fi in range(n_folds):
+            _tr_idx = np.asarray(folds_train[fi], dtype=np.intp)
+            _sds_f = np.nanstd(_X_sub[_tr_idx], axis=0, ddof=1)
+            for _loc_j in np.where(np.isnan(_sds_f) | (_sds_f < 1e-12))[0]:
+                fold_zero_sd.add(predictor_cols[int(_suspect[_loc_j])])
+    del _X_sd_check
     if fold_zero_sd:
         print(
             f"  ! Удалены предикторы с sd=0 в CV-фолдах ({len(fold_zero_sd)}): "
@@ -1037,21 +1252,23 @@ def main():
     print("  Предобработка: SimpleImputer(median) + StandardScaler (z-score)")
     print("  (импутация NA медианой + z-score стандартизация внутри каждого фолда)\n")
 
-    # Подготовка данных
-    # Важно: оставляем X_all как DataFrame, а не numpy-массив.
-    # Тогда sklearn Pipeline сохраняет feature_names_in_, и 04_predict_map
-    # сможет автоматически понять, какие band-ы Composite/Composite_filtered
-    # нужны конкретной модели.
+    # Подготовка данных и однократная стандартизация по фолдам
+    import joblib
+    from sklearn.base import clone
+
     predictor_cols = [str(c) for c in predictor_cols]
     X_all = samples_df[predictor_cols].astype(np.float64)
     y_all_str = samples_df["class_name"].values
     y_all = le.transform(y_all_str)
 
-    # Формируем cv splits для sklearn
     cv_splits = [
-        (np.array(folds_train[fi]), np.array(folds_test[fi]))
+        (np.asarray(folds_train[fi], dtype=np.intp), np.asarray(folds_test[fi], dtype=np.intp))
         for fi in range(n_folds)
     ]
+
+    t_prep0 = time.time()
+    fold_caches, full_cache = _prepare_fold_caches(X_all, y_all, cv_splits)
+    print(f"  ✓ Кэш стандартизации {n_folds} фолдов подготовлен за {time.time() - t_prep0:.2f} сек.")
 
     all_models = {}
     results_list = []
@@ -1080,29 +1297,18 @@ def main():
             f"Фитов: {total_fits}"
         )
 
-        # --- Строим Pipeline ---
         base_estimator, supports_grid = _build_estimator(algo_key, ncores)
         if base_estimator is None:
             print("  ! Метод недоступен - пропуск.")
             continue
 
-        pipeline = Pipeline([
-            ("imputer", SimpleImputer(strategy="median")),
-            ("scaler", StandardScaler()),
-            ("model", base_estimator),
-        ])
-
-        # --- Обучение ---
         start_time = time.time()
         trained_model = None
+        y_pred = None
 
         try:
             if tuning_grid and supports_grid:
-                # GridSearchCV с прогресс-баром
-                import joblib
-
-                actual_njobs = min(ncores, n_combos)
-
+                combos = list(ParameterGrid(tuning_grid))
                 pbar = tqdm(
                     total=total_fits,
                     desc=f"  {algo_name}",
@@ -1111,97 +1317,223 @@ def main():
                     ncols=100,
                 )
 
-                if actual_njobs == 1:
-                    # Последовательный режим: вручную перебираем комбинации
-                    from sklearn.model_selection import ParameterGrid as PG
-                    from sklearn.base import clone
+                # Matrix of fold scores (n_combos, n_folds) and OOF predictions per combo
+                scores_mat = np.zeros((len(combos), n_folds), dtype=np.float64)
+                oof_by_combo = [np.empty_like(y_all) for _ in range(len(combos))]
 
-                    best_score_ = -np.inf
-                    best_params_ = None
-                    all_cv_results = []
-
-                    for params in PG(tuning_grid):
-                        fold_scores = []
-                        for train_idx, test_idx in cv_splits:
-                            pipe_clone = clone(pipeline).set_params(**params)
-                            pipe_clone.fit(X_all.iloc[train_idx], y_all[train_idx])
-                            score = accuracy_score(
-                                y_all[test_idx],
-                                pipe_clone.predict(X_all.iloc[test_idx]),
-                            )
-                            fold_scores.append(score)
-                            pbar.update(1)
-                        mean_score = np.mean(fold_scores)
-                        all_cv_results.append((params, mean_score))
-                        if mean_score > best_score_:
-                            best_score_ = mean_score
-                            best_params_ = params
-
-                    pbar.close()
-
-                    # Refit на всех данных с лучшими параметрами
-                    trained_model = clone(pipeline).set_params(**best_params_)
-                    trained_model.fit(X_all, y_all)
-
-                    print(f"  Лучшие параметры: ", end="")
-                    bp = best_params_
-                    parts = [
-                        f"{k.replace('model__', '')}={v}"
-                        for k, v in bp.items()
-                        if "penalty" not in k
-                    ]
-                    print(", ".join(parts))
-                else:
-                    # Параллельный режим: патчим joblib для tqdm
-                    gs = GridSearchCV(
-                        estimator=pipeline,
-                        param_grid=tuning_grid,
-                        cv=cv_splits,
-                        scoring="accuracy",
-                        n_jobs=actual_njobs,
-                        refit=True,
-                        return_train_score=False,
-                        error_score="raise",
-                        verbose=0,
+                if algo_key == "rda" and set(tuning_grid.keys()) == {"model__shrinkage"}:
+                    # Быстрый спектральный решатель RDA (1 разложение ковариации на фолд)
+                    shrinkages = [float(c["model__shrinkage"]) for c in combos]
+                    outer_jobs = min(ncores, n_folds)
+                    fold_results = joblib.Parallel(n_jobs=outer_jobs, prefer="threads")(
+                        joblib.delayed(_eval_rda_fold_fast)(fold_caches[fi], shrinkages)
+                        for fi in range(n_folds)
                     )
+                    for fi, fdict in enumerate(fold_results):
+                        te_idx = fold_caches[fi]["te_idx"]
+                        for ci, (sc, preds) in fdict.items():
+                            scores_mat[ci, fi] = sc
+                            oof_by_combo[ci][te_idx] = preds
+                        pbar.update(len(combos))
 
-                    _orig_cb = joblib.parallel.BatchCompletionCallBack
+                elif algo_key == "knn":
+                    # Быстрый KNN: kneighbors 1 раз на (фолд, метрика) до max(k)
+                    outer_jobs = min(ncores, n_folds)
+                    inner_jobs = max(1, ncores // max(outer_jobs, 1))
+                    fold_results = joblib.Parallel(n_jobs=outer_jobs, prefer="threads")(
+                        joblib.delayed(_eval_knn_fold_fast)(fold_caches[fi], combos, inner_jobs)
+                        for fi in range(n_folds)
+                    )
+                    for fi, fdict in enumerate(fold_results):
+                        te_idx = fold_caches[fi]["te_idx"]
+                        for ci, (sc, preds) in fdict.items():
+                            scores_mat[ci, fi] = sc
+                            oof_by_combo[ci][te_idx] = preds
+                        pbar.update(len(combos))
 
-                    class _TqdmBatchCB(joblib.parallel.BatchCompletionCallBack):
-                        def __call__(self, *args, **kwargs):
-                            pbar.update(self.batch_size)
-                            return super().__call__(*args, **kwargs)
+                elif algo_key in ("ridge", "lasso", "elasticnet"):
+                    # Warm-start вдоль возрастающего C внутри каждого фолда
+                    # Группируем комбинации по (penalty, l1_ratio) и сортируем по C
+                    groups_lr: dict[tuple, list[tuple[int, float, dict]]] = {}
+                    for ci, params in enumerate(combos):
+                        mp = _strip_model_prefix(params)
+                        gkey = (mp.get("penalty", "l2"), mp.get("l1_ratio", None))
+                        groups_lr.setdefault(gkey, []).append((ci, float(mp.get("C", 1.0)), mp))
+                    for gkey in groups_lr:
+                        groups_lr[gkey].sort(key=lambda t: t[1])
 
-                    joblib.parallel.BatchCompletionCallBack = _TqdmBatchCB
-                    try:
-                        gs.fit(X_all, y_all)
-                    finally:
-                        joblib.parallel.BatchCompletionCallBack = _orig_cb
-                        pbar.close()
+                    def _run_lr_fold(fi: int):
+                        fc = fold_caches[fi]
+                        out = {}
+                        for _, items in groups_lr.items():
+                            est, _ = _build_estimator(algo_key, 1)
+                            est.set_params(warm_start=True)
+                            for ci, _, mp in items:
+                                est.set_params(**mp)
+                                with _sklearn.config_context(assume_finite=True):
+                                    est.fit(fc["X_tr64"], fc["y_tr"])
+                                preds = est.predict(fc["X_te64"])
+                                out[ci] = (float(accuracy_score(fc["y_te"], preds)), preds)
+                        return fi, out
 
-                    trained_model = gs.best_estimator_
+                    outer_jobs = min(ncores, n_folds)
+                    for fi, fdict in joblib.Parallel(
+                        n_jobs=outer_jobs, prefer="threads", return_as="generator_unordered"
+                    )(joblib.delayed(_run_lr_fold)(fi) for fi in range(n_folds)):
+                        te_idx = fold_caches[fi]["te_idx"]
+                        for ci, (sc, preds) in fdict.items():
+                            scores_mat[ci, fi] = sc
+                            oof_by_combo[ci][te_idx] = preds
+                        pbar.update(len(combos))
 
-                    print(f"  Лучшие параметры: ", end="")
-                    bp = gs.best_params_
-                    parts = [
-                        f"{k.replace('model__', '')}={v}"
-                        for k, v in bp.items()
-                        if "penalty" not in k
-                    ]
-                    print(", ".join(parts))
+                elif algo_key in ("rf", "catboost", "lgbm"):
+                    # Группируем по всем параметрам кроме числа деревьев (n_estimators / iterations):
+                    # обучаем 1 раз до max_trees и снимаем предсказания на префиксах деревьев!
+                    iter_key = "iterations" if algo_key == "catboost" else "n_estimators"
+                    tree_groups: dict[tuple, list[tuple[int, int, dict]]] = {}
+                    for ci, params in enumerate(combos):
+                        mp = _strip_model_prefix(params)
+                        n_trees = int(mp.get(iter_key, 500))
+                        other_items = tuple(sorted((k, v) for k, v in mp.items() if k != iter_key))
+                        tree_groups.setdefault(other_items, []).append((ci, n_trees, mp))
+                    for gkey in tree_groups:
+                        tree_groups[gkey].sort(key=lambda t: t[1])
+
+                    group_list = list(tree_groups.values())
+                    tasks = [(gi, fi) for gi in range(len(group_list)) for fi in range(n_folds)]
+                    outer_jobs = min(ncores, len(tasks))
+                    inner_jobs = max(1, ncores // max(outer_jobs, 1))
+                    use_f32 = algo_key in ("rf", "lgbm")
+
+                    def _run_tree_group_fold(gi: int, fi: int):
+                        fc = fold_caches[fi]
+                        X_tr = fc["X_tr32"] if use_f32 else fc["X_tr64"]
+                        X_te = fc["X_te32"] if use_f32 else fc["X_te64"]
+                        y_tr = fc["y_tr"]
+                        y_te = fc["y_te"]
+                        items = group_list[gi]
+                        max_ci, max_trees, max_mp = items[-1]
+
+                        est, _ = _build_estimator(algo_key, inner_jobs)
+                        est.set_params(**max_mp)
+                        with _sklearn.config_context(assume_finite=True):
+                            est.fit(X_tr, y_tr)
+
+                        out = {}
+                        if len(items) == 1:
+                            preds = np.asarray(est.predict(X_te)).reshape(-1)
+                            out[max_ci] = (float(accuracy_score(y_te, preds)), preds)
+                        else:
+                            orig_ests = getattr(est, "estimators_", None) if algo_key == "rf" else None
+                            for ci, n_tr, mp in items:
+                                try:
+                                    if algo_key == "rf" and orig_ests is not None:
+                                        est.estimators_ = orig_ests[:n_tr]
+                                        est.n_estimators = n_tr
+                                        preds = np.asarray(est.predict(X_te)).reshape(-1)
+                                    elif algo_key == "catboost":
+                                        preds = np.asarray(est.predict(X_te, ntree_end=n_tr)).reshape(-1)
+                                    elif algo_key == "lgbm":
+                                        preds = np.asarray(est.predict(X_te, num_iteration=n_tr)).reshape(-1)
+                                    else:
+                                        preds = np.asarray(est.predict(X_te)).reshape(-1)
+                                except Exception:
+                                    est_sub, _ = _build_estimator(algo_key, inner_jobs)
+                                    est_sub.set_params(**mp)
+                                    est_sub.fit(X_tr, y_tr)
+                                    preds = np.asarray(est_sub.predict(X_te)).reshape(-1)
+                                out[ci] = (float(accuracy_score(y_te, preds)), preds)
+                            if algo_key == "rf" and orig_ests is not None:
+                                est.estimators_ = orig_ests
+                                est.n_estimators = max_trees
+                        return gi, fi, out
+
+                    for gi, fi, fdict in joblib.Parallel(
+                        n_jobs=outer_jobs, prefer="threads", return_as="generator_unordered"
+                    )(joblib.delayed(_run_tree_group_fold)(gi, fi) for gi, fi in tasks):
+                        te_idx = fold_caches[fi]["te_idx"]
+                        for ci, (sc, preds) in fdict.items():
+                            scores_mat[ci, fi] = sc
+                            oof_by_combo[ci][te_idx] = preds
+                        pbar.update(len(fdict))
+
+                else:
+                    # Универсальный параллельный перебор (SVM и др.) по предмасштабированным фолдам
+                    tasks = [(ci, fi) for ci in range(len(combos)) for fi in range(n_folds)]
+                    outer_jobs = min(ncores, len(tasks))
+                    inner_jobs = max(1, ncores // max(outer_jobs, 1))
+
+                    def _run_generic_fit(ci: int, fi: int):
+                        fc = fold_caches[fi]
+                        mp = _strip_model_prefix(combos[ci])
+                        est, _ = _build_estimator(algo_key, inner_jobs)
+                        est.set_params(**mp)
+                        with _sklearn.config_context(assume_finite=True):
+                                    est.fit(fc["X_tr64"], fc["y_tr"])
+                        preds = np.asarray(est.predict(fc["X_te64"])).reshape(-1)
+                        return ci, fi, float(accuracy_score(fc["y_te"], preds)), preds
+
+                    for ci, fi, sc, preds in joblib.Parallel(
+                        n_jobs=outer_jobs, prefer="threads", return_as="generator_unordered"
+                    )(joblib.delayed(_run_generic_fit)(ci, fi) for ci, fi in tasks):
+                        scores_mat[ci, fi] = sc
+                        oof_by_combo[ci][fold_caches[fi]["te_idx"]] = preds
+                        pbar.update(1)
+
+                pbar.close()
+
+                mean_scores = scores_mat.mean(axis=1)
+                best_ci = int(np.argmax(mean_scores))
+                best_params_ = combos[best_ci]
+                y_pred = oof_by_combo[best_ci]
+
+                # Финальный refit лучшей модели на всех стандартизованных данных (1 раз)
+                best_mp = _strip_model_prefix(best_params_)
+                final_est, _ = _build_estimator(algo_key, ncores)
+                final_est.set_params(**best_mp)
+                X_fit_full = full_cache["X_full32"] if algo_key in ("rf", "lgbm") else full_cache["X_full64"]
+                final_est.fit(X_fit_full, y_all)
+                trained_model = _build_fitted_pipeline(full_cache, final_est, predictor_cols)
+
+                print(f"  Лучшие параметры: ", end="")
+                parts = [
+                    f"{k.replace('model__', '')}={v}"
+                    for k, v in best_params_.items()
+                    if "penalty" not in k
+                ]
+                print(", ".join(parts))
+
             else:
-                # Без тюнинга — обучаем на всех данных
+                # Без тюнинга (LDA / QDA): 10 фолдов для OOF y_pred + 1 финальный fit
                 pbar = tqdm(
-                    total=1,
+                    total=n_folds + 1,
                     desc=f"  {algo_name}",
                     unit="fit",
                     bar_format="  {l_bar}{bar}| {n_fmt}/{total_fmt} фитов [{elapsed}<{remaining}]",
                     ncols=100,
                 )
-                pipeline.fit(X_all, y_all)
+                y_pred = np.empty_like(y_all)
+
+                def _run_notune_fold(fi: int):
+                    fc = fold_caches[fi]
+                    est, _ = _build_estimator(algo_key, 1)
+                    with _sklearn.config_context(assume_finite=True):
+                                    est.fit(fc["X_tr64"], fc["y_tr"])
+                    preds = np.asarray(est.predict(fc["X_te64"])).reshape(-1)
+                    return fi, preds
+
+                outer_jobs = min(ncores, n_folds)
+                for fi, preds in joblib.Parallel(
+                    n_jobs=outer_jobs, prefer="threads", return_as="generator_unordered"
+                )(joblib.delayed(_run_notune_fold)(fi) for fi in range(n_folds)):
+                    y_pred[fold_caches[fi]["te_idx"]] = preds
+                    pbar.update(1)
+
+                final_est, _ = _build_estimator(algo_key, ncores)
+                final_est.fit(full_cache["X_full64"], y_all)
+                trained_model = _build_fitted_pipeline(full_cache, final_est, predictor_cols)
                 pbar.update(1)
                 pbar.close()
-                trained_model = pipeline
 
             elapsed = time.time() - start_time
             print(f"  ✓ Время: {elapsed:.1f} сек.")
@@ -1211,25 +1543,16 @@ def main():
             print(f"  ✗ Ошибка: {e}")
             continue
 
-        trained_model = _attach_predictor_names(trained_model, predictor_cols)
         all_models[algo_name] = trained_model
 
-        # --- Метрики через cross_val_predict ---
-        try:
-            y_pred = cross_val_predict(
-                trained_model, X_all, y_all, cv=cv_splits, n_jobs=ncores
-            )
-            y_proba = cross_val_predict(
-                trained_model, X_all, y_all, cv=cv_splits,
-                method="predict_proba", n_jobs=ncores,
-            )
-        except Exception:
-            # Fallback: предсказание на трейне (не идеально, но работает)
-            y_pred = trained_model.predict(X_all)
+        # Если по какой-то причине y_pred не заполнен — резервный расчёт
+        if y_pred is None:
             try:
-                y_proba = trained_model.predict_proba(X_all)
+                y_pred = cross_val_predict(
+                    trained_model, X_all, y_all, cv=cv_splits, n_jobs=ncores
+                )
             except Exception:
-                y_proba = None
+                y_pred = trained_model.predict(X_all)
 
         overall_acc = accuracy_score(y_all, y_pred)
         kappa = cohen_kappa_score(y_all, y_pred)
@@ -1262,7 +1585,7 @@ def main():
         )
 
         # AIC
-        aic_val = _compute_aic(trained_model, X_all, y_all, n_cls)
+        aic_val = _compute_aic(trained_model, X_all, y_all, n_cls, X_scaled=full_cache['X_full64'])
         aic_values[algo_name] = aic_val
 
         # --- Confusion matrix ---
@@ -1371,7 +1694,7 @@ def main():
 
             safe_name = re.sub(r"[^A-Za-z0-9]", "_", algo_name)
             png_path = os.path.join(plots_dir, f"confusion_matrix_{safe_name}.png")
-            plt.savefig(png_path, dpi=250, bbox_inches="tight", facecolor="white")
+            plt.savefig(png_path, dpi=(180 if n_cls > 20 else 250), bbox_inches="tight", facecolor="white", pil_kwargs={"compress_level": 1})
             plt.close(fig)
             print(f"  ✓ {os.path.basename(png_path)}")
     else:
