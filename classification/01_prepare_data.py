@@ -1,5 +1,10 @@
 # ============================================================================
-# 01_prepare_data_v14.py (workspace: 01_prepare_data_v8.py)
+# 01_prepare_data_v15.py (workspace: 01_prepare_data_v9.py)
+# v9/v15: гибридный all_touched (мелкие полигоны и точки — True, остальные —
+#   по центрам пикселей с откатом на True при < 3 пикс.); дедупликация
+#   пикселей, попавших в несколько полигонов (приоритет — меньший полигон,
+#   затем ближайший центроид); пересчёт n_pixels; x, y — центр пикселя.
+# (история) 01_prepare_data_v14.py (workspace: 01_prepare_data_v8.py)
 # v8/v14: запись samples.gpkg через локальный TEMP с journal_mode=DELETE (без WAL)
 # ИЗМЕНЕНИЯ: в списке растров запуска 00 видны и .vrt — виртуальные
 # композиты (Composite.vrt / Composite_filtered.vrt из 00 v66) читаются
@@ -354,8 +359,13 @@ def main():
     n_pixels_by_pid = {}
     n_skipped_empty = 0
     n_skipped_error = 0
+    n_small_at = 0       # v15: мелкие полигоны/точки с all_touched=True
+    n_fallback_at = 0    # v15: откат на all_touched=True (< MIN_PX_FALLBACK пикс.)
+    SMALL_POLY_PX = 10   # v15: порог «мелкого» полигона, в пикселях площади
+    MIN_PX_FALLBACK = 3  # v15: минимум пикселей без all_touched
     with rasterio.open(selected_tif) as src:
         transform = src.transform
+        px_area = abs(transform.a * transform.e)
 
         for idx_row, row in training_poly.iterrows():
             cls = row[class_field]
@@ -369,37 +379,66 @@ def main():
                 flush=True,
             )
 
+            # v15: гибридный all_touched. all_touched=True для всех полигонов
+            # захватывал пиксели, лишь задетые границей: у соседних полигонов
+            # они дублировались (~21% строк) и часто получали разные классы
+            # (~16%). Теперь: мелкие полигоны (< SMALL_POLY_PX пикселей
+            # площади) и точки — all_touched=True; остальные — только пиксели,
+            # центр которых внутри полигона; если таких < MIN_PX_FALLBACK —
+            # откат на all_touched=True.
+            _g = row.geometry
+            _area = float(_g.area) if _g is not None else 0.0
+            _use_at = (_area < SMALL_POLY_PX * px_area) or (_g.geom_type in ("Point", "MultiPoint"))
             try:
                 out_image, out_transform = rio_mask(
-                    src, geom, crop=True, all_touched=True, nodata=np.nan
+                    src, geom, crop=True, all_touched=_use_at, nodata=np.nan
                 )
+                valid_mask = np.all(np.isfinite(out_image), axis=0)
+                if not _use_at and int(valid_mask.sum()) < MIN_PX_FALLBACK:
+                    out_image, out_transform = rio_mask(
+                        src, geom, crop=True, all_touched=True, nodata=np.nan
+                    )
+                    valid_mask = np.all(np.isfinite(out_image), axis=0)
+                    n_fallback_at += 1
+                elif _use_at:
+                    n_small_at += 1
             except Exception:
                 n_skipped_error += 1
                 continue
 
-            # out_image: (n_bands, h, w)
-            # маска валидных пикселей — все бенды конечные
-            valid_mask = np.all(np.isfinite(out_image), axis=0)
+            # out_image: (n_bands, h, w); valid_mask — все бенды конечные
             if not valid_mask.any():
                 n_skipped_empty += 1
                 continue
 
             coords = np.argwhere(valid_mask)  # (row, col) внутри кропа
             n_pixels_by_pid[pid] = int(len(coords))
+            # Глобальные индексы строки/столбца пикселя в растре
+            _col0 = int(round((out_transform.c - transform.c) / transform.a))
+            _row0 = int(round((out_transform.f - transform.f) / transform.e))
+            try:
+                _cen = _g.centroid
+                _cx, _cy = float(_cen.x), float(_cen.y)
+            except Exception:
+                _cx = _cy = np.nan
             for rc in coords:
                 r, c = rc[0], rc[1]
                 vals = out_image[:, r, c]
-                # координаты x, y
-                x_coord = out_transform.c + c * out_transform.a + r * out_transform.b
-                y_coord = out_transform.f + c * out_transform.d + r * out_transform.e
+                # координаты центра пикселя (v15: раньше — левый верхний угол)
+                x_coord = out_transform.c + (c + 0.5) * out_transform.a + (r + 0.5) * out_transform.b
+                y_coord = out_transform.f + (c + 0.5) * out_transform.d + (r + 0.5) * out_transform.e
                 row_dict = {}
                 for bi, bn in enumerate(band_descriptions):
                     row_dict[bn] = float(vals[bi])
                 row_dict["class_name"] = str(cls)
                 row_dict["polygon_id"] = pid  # стабильный ID
-                row_dict["n_pixels"] = int(len(coords))  # ПРАВКА (b)
+                row_dict["n_pixels"] = int(len(coords))  # пересчитывается после дедупликации
                 row_dict["x"] = x_coord
                 row_dict["y"] = y_coord
+                row_dict["_grow"] = _row0 + int(r)
+                row_dict["_gcol"] = _col0 + int(c)
+                row_dict["_area"] = _area
+                row_dict["_dist2"] = (x_coord - _cx) ** 2 + (y_coord - _cy) ** 2
                 samples_list.append(row_dict)
 
     # Диагностика отброшенных геометрий (ПРАВКА b)
@@ -431,6 +470,50 @@ def main():
         raise RuntimeError("Не удалось извлечь образцы!")
 
     samples_df = pd.DataFrame(samples_list)
+
+    # --- v15: дедупликация пикселей, попавших в несколько полигонов ---
+    # Один пиксель растра = один образец. При перекрытии полигонов или
+    # касании границ пиксель отдаётся полигону меньшей площади (более
+    # детальное описание), при равенстве — полигону, к центроиду которого
+    # центр пикселя ближе.
+    print(f"  Геометрий с all_touched=True (мелкие < {SMALL_POLY_PX} пикс. и точки): {n_small_at}")
+    print(f"  Откат на all_touched=True (< {MIN_PX_FALLBACK} пикс. по центрам): {n_fallback_at}")
+    _n_before = len(samples_df)
+    _grp = samples_df.groupby(["_grow", "_gcol"])
+    _n_conf_px = int((_grp["class_name"].nunique() > 1).sum())
+    _n_dup_px = int((_grp.size() > 1).sum())
+    samples_df = (
+        samples_df.sort_values(["_area", "_dist2"], kind="mergesort")
+        .drop_duplicates(subset=["_grow", "_gcol"], keep="first")
+        .sort_index()
+        .reset_index(drop=True)
+    )
+    _n_after = len(samples_df)
+    _np_new = samples_df.groupby("polygon_id")["polygon_id"].transform("size")
+    samples_df["n_pixels"] = _np_new.astype(int)
+    _lost_pids = set(n_pixels_by_pid) - set(samples_df["polygon_id"].unique())
+    n_pixels_by_pid = samples_df.groupby("polygon_id").size().astype(int).to_dict()
+    samples_df = samples_df.drop(columns=["_grow", "_gcol", "_area", "_dist2"])
+    print(
+        f"  Дедупликация пикселей: {_n_before} -> {_n_after} строк "
+        f"(удалено {_n_before - _n_after}, {100.0 * (_n_before - _n_after) / max(_n_before, 1):.1f}%)"
+    )
+    print(
+        f"    • пикселей в нескольких полигонах: {_n_dup_px}, "
+        f"из них с разными классами: {_n_conf_px}"
+    )
+    if _lost_pids:
+        print(
+            f"    ⚠ Полигонов, полностью поглощённых более мелкими: {len(_lost_pids)} "
+            f"(polygon_id: {', '.join(str(x) for x in sorted(_lost_pids)[:20])}"
+            f"{' ...' if len(_lost_pids) > 20 else ''})"
+        )
+    _c2 = np.array(list(n_pixels_by_pid.values()))
+    print(
+        f"  ✓ После дедупликации: полигонов {len(_c2)}, классов "
+        f"{samples_df['class_name'].nunique()}, пикселей на полигон: "
+        f"min={_c2.min()}, median={int(np.median(_c2))}, max={_c2.max()}\n"
+    )
 
     # --- Определяем бенд-колонки ---
     service_cols = {

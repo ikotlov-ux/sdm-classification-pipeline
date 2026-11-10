@@ -1,5 +1,11 @@
 # =============================================================================
-# 03_tune_models_v55.py (workspace: 03_tune_models_v5.py)
+# 03_tune_models_v56.py (workspace: 03_tune_models_v6.py)
+# v6/v56: режим равной априорной вероятности классов (по умолчанию):
+#         sample_weight с одинаковой суммой весов на класс (+ выравнивание
+#         полигонов n_pixels^-0.5) для RF/CatBoost/LightGBM/логистических/SVM,
+#         priors = 1/K для LDA/QDA/RDA; подбор гиперпараметров и ранжирование
+#         моделей по Balanced Accuracy; вывод числа предсказанных классов.
+# (история) 03_tune_models_v55.py (workspace: 03_tune_models_v5.py)
 # v5/v54: ускорение в 2–20x (предварительная стандартизация по фолдам 1 раз,
 #         отказ от 2x cross_val_predict через сбор OOF в процессе CV,
 #         быстрый спектральный решатель RDA, однократный поиск соседей в KNN,
@@ -47,6 +53,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.metrics import (
+    balanced_accuracy_score,
     accuracy_score, cohen_kappa_score, confusion_matrix,
     classification_report, f1_score, precision_score, recall_score,
     log_loss,
@@ -534,6 +541,76 @@ def _estimate_nparams(model, n_predictors: int, n_classes: int) -> int:
 # ПОСТРОЕНИЕ SKLEARN-МОДЕЛИ
 # =============================================================================
 
+# =============================================================================
+# v56: РАВНАЯ АПРИОРНАЯ ВЕРОЯТНОСТЬ КЛАССОВ
+# =============================================================================
+# При обучении «пиксель = образец» модель по умолчанию считает, что класс
+# встречается так же часто, как в выборке пикселей. Крупные таксационные
+# классы (десятки тысяч пикселей) тогда «съедают» редкие классы из кружков
+# R = 10 м (единицы пикселей). В режиме равной вероятности сумма весов
+# каждого класса одинакова (N/K), то есть априорная вероятность каждого класса
+# = 1/K. Дополнительно можно выровнять вклад полигонов внутри класса
+# (вес пикселя ~ n_pixels^-alpha), чтобы один огромный выдел не определял
+# весь класс.
+
+EQUAL_CLASS_PRIOR = False   # устанавливается в main() по выбору пользователя
+POLY_ALPHA = 0.0            # степень выравнивания полигонов (0 = не выравнивать)
+
+
+def _score_fn(y_true, y_pred) -> float:
+    """Критерий выбора гиперпараметров: Balanced Accuracy в режиме равных
+    вероятностей классов, иначе Overall Accuracy."""
+    if EQUAL_CLASS_PRIOR:
+        return float(balanced_accuracy_score(y_true, y_pred))
+    return float(accuracy_score(y_true, y_pred))
+
+
+def _class_balanced_weights(y, n_px=None, alpha: float = 0.0):
+    """Веса образцов: сумма весов каждого класса = N/K (средний вес = 1).
+
+    Если alpha > 0 и известен n_px (число пикселей полигона), внутри класса
+    вес пикселя пропорционален n_px^-alpha (alpha = 1 — каждый полигон
+    весит одинаково, alpha = 0.5 — компромисс), затем нормируется так,
+    чтобы сумма по классу осталась N/K.
+    """
+    y = np.asarray(y)
+    N = y.shape[0]
+    classes, y_idx = np.unique(y, return_inverse=True)
+    K = classes.size
+    base = np.ones(N, dtype=np.float64)
+    if alpha and n_px is not None:
+        npx = np.asarray(n_px, dtype=np.float64)
+        npx = np.where(np.isfinite(npx) & (npx > 0), npx, 1.0)
+        base = npx ** (-float(alpha))
+    sums = np.bincount(y_idx, weights=base, minlength=K)
+    sums = np.where(sums > 0, sums, 1.0)
+    w = base * (N / float(K)) / sums[y_idx]
+    return w
+
+
+def _fit_w(est, X, y, w=None):
+    """fit с учётом режима весов.
+
+    - LDA/QDA/RDA: веса не поддерживаются -> priors = 1/K (по классам,
+      присутствующим в обучающей части фолда);
+    - KNN: веса не поддерживаются -> обычный fit;
+    - остальные (RF, CatBoost, LightGBM, логистические, SVM): sample_weight.
+    """
+    if isinstance(est, (LinearDiscriminantAnalysis, QuadraticDiscriminantAnalysis)):
+        if EQUAL_CLASS_PRIOR:
+            k = int(np.unique(y).size)
+            est.set_params(priors=np.full(k, 1.0 / k))
+        else:
+            est.set_params(priors=None)
+        return est.fit(X, y)
+    if w is None or (SVM_KNN_AVAILABLE and isinstance(est, KNeighborsClassifier)):
+        return est.fit(X, y)
+    try:
+        return est.fit(X, y, sample_weight=w)
+    except TypeError:
+        return est.fit(X, y)
+
+
 def _build_estimator(algo_key: str, ncores: int):
     """Возвращает (estimator, supports_grid)."""
     if algo_key == "rf":
@@ -791,13 +868,20 @@ def _eval_rda_fold_fast(fc: dict, shrinkages: list[float]) -> dict[int, tuple[fl
     classes, y_idx = np.unique(y_tr, return_inverse=True)
     K = classes.size
     counts = np.bincount(y_idx, minlength=K).astype(np.float64)
-    priors = counts / float(N)
+    if EQUAL_CLASS_PRIOR:
+        priors = np.full(K, 1.0 / K)      # v56: равные априорные вероятности
+    else:
+        priors = counts / float(N)
     log_priors = np.log(priors)
 
     Y_oh = np.zeros((N, K), dtype=np.float64)
     Y_oh[np.arange(N), y_idx] = 1.0
     means = (Y_oh.T @ X_tr) / counts[:, None]
-    cov_base = (X_tr.T @ X_tr) / float(N) - (means * priors[:, None]).T @ means
+    # Взвешенная внутриклассовая ковариация: sum_k priors_k * cov_k
+    # (как в sklearn LDA с заданными priors); при priors = counts/N совпадает
+    # с прежней формулой.
+    w_row = (priors / counts)[y_idx]
+    cov_base = (X_tr * w_row[:, None]).T @ X_tr - (means * priors[:, None]).T @ means
     mu_trace = np.trace(cov_base) / float(p)
 
     evals, evecs = linalg.eigh(cov_base)
@@ -815,7 +899,7 @@ def _eval_rda_fold_fast(fc: dict, shrinkages: list[float]) -> dict[int, tuple[fl
         intercept = -0.5 * np.einsum("ij,ij->i", means_proj, coef_proj) + log_priors
         scores = X_te_proj @ coef_proj.T + intercept
         preds = classes[np.argmax(scores, axis=1)]
-        out[si] = (float(accuracy_score(y_te, preds)), preds)
+        out[si] = (_score_fn(y_te, preds), preds)
     return out
 
 
@@ -868,7 +952,7 @@ def _eval_knn_fold_fast(
                 for c in range(n_classes):
                     w_scores[:, c] = np.sum(np.where(ny == c, w_arr, 0.0), axis=1)
                 preds = classes[np.argmax(w_scores, axis=1)]
-            out[ci] = (float(accuracy_score(y_te, preds)), preds)
+            out[ci] = (_score_fn(y_te, preds), preds)
     return out
 
 
@@ -1128,6 +1212,54 @@ def main():
     print(f"\n✓ Будет использовано ядер: {ncores} из {total_cores}\n")
 
     # ================================================================
+    # ШАГ 3b: РЕЖИМ АПРИОРНЫХ ВЕРОЯТНОСТЕЙ КЛАССОВ (v56)
+    # ================================================================
+    print("============================================================")
+    print(" ШАГ 3b: ВЕРОЯТНОСТИ КЛАССОВ ПРИ ОБУЧЕНИИ")
+    print("============================================================\n")
+    _cls_counts = samples_df["class_name"].value_counts()
+    print(
+        f"  Пикселей на класс: min={int(_cls_counts.min())} ({_cls_counts.idxmin()}), "
+        f"max={int(_cls_counts.max())} ({_cls_counts.idxmax()}), "
+        f"отношение max/min = {_cls_counts.max() / max(_cls_counts.min(), 1):.0f}\n"
+    )
+    print("  [1] Равная вероятность классов + выравнивание полигонов (alpha=0.5) - РЕКОМЕНДУЕМО")
+    print("      сумма весов каждого класса одинакова; внутри класса вес пикселя ~ n_pixels^-0.5")
+    print("  [2] Равная вероятность классов")
+    print("      сумма весов каждого класса одинакова; все пиксели класса равноценны")
+    print("  [3] Как в выборке (без весов, прежнее поведение)")
+    print("      крупные классы получают преимущество пропорционально числу пикселей\n")
+    _wm = input("Выбор (Enter = 1): ").strip()
+    global EQUAL_CLASS_PRIOR, POLY_ALPHA
+    if _wm == "3":
+        EQUAL_CLASS_PRIOR, POLY_ALPHA = False, 0.0
+        weight_mode_label = "без весов (вероятности классов как в выборке)"
+    elif _wm == "2":
+        EQUAL_CLASS_PRIOR, POLY_ALPHA = True, 0.0
+        weight_mode_label = "равная вероятность классов"
+    else:
+        EQUAL_CLASS_PRIOR, POLY_ALPHA = True, 0.5
+        weight_mode_label = "равная вероятность классов + выравнивание полигонов (alpha=0.5)"
+    if EQUAL_CLASS_PRIOR and POLY_ALPHA > 0 and "n_pixels" not in samples_df.columns:
+        if "polygon_id" in samples_df.columns:
+            samples_df["n_pixels"] = samples_df.groupby("polygon_id")["polygon_id"].transform("size")
+            print("  ℹ n_pixels пересчитан по polygon_id")
+        else:
+            POLY_ALPHA = 0.0
+            weight_mode_label = "равная вероятность классов (нет polygon_id - без выравнивания полигонов)"
+    if "n_pixels" in samples_df.columns:
+        n_px_all = samples_df["n_pixels"].to_numpy(dtype=np.float64)
+    else:
+        n_px_all = np.ones(len(samples_df), dtype=np.float64)
+    print(f"\n✓ Режим: {weight_mode_label}")
+    if EQUAL_CLASS_PRIOR:
+        print("  RF/CatBoost/LightGBM/логистические/SVM - sample_weight;")
+        print("  LDA/QDA/RDA - priors = 1/K; KNN весов не поддерживает (обучается как раньше).")
+        print("  Гиперпараметры подбираются по Balanced Accuracy, модели ранжируются по Balanced Accuracy.\n")
+    else:
+        print("  Гиперпараметры подбираются по Overall Accuracy.\n")
+
+    # ================================================================
     # ШАГ 4: НАСТРОЙКА ГИПЕРПАРАМЕТРОВ
     # ================================================================
     print("============================================================")
@@ -1146,6 +1278,9 @@ def main():
         "classes": ", ".join(class_levels),
         "cv_method": f"{cv_method_label} — {n_folds}-fold CV",
         "preProcess": "SimpleImputer(median) + StandardScaler (z-score)",
+        "class_weighting": weight_mode_label,
+        "equal_class_prior": bool(EQUAL_CLASS_PRIOR),
+        "poly_alpha": float(POLY_ALPHA),
         "algorithms": {},
     }
 
@@ -1270,6 +1405,24 @@ def main():
     fold_caches, full_cache = _prepare_fold_caches(X_all, y_all, cv_splits)
     print(f"  ✓ Кэш стандартизации {n_folds} фолдов подготовлен за {time.time() - t_prep0:.2f} сек.")
 
+    # v56: веса образцов по фолдам (считаются только по обучающей части)
+    if EQUAL_CLASS_PRIOR:
+        for fi, (tr_idx, _te) in enumerate(cv_splits):
+            fold_caches[fi]["w_tr"] = _class_balanced_weights(
+                y_all[tr_idx], n_px_all[tr_idx], POLY_ALPHA
+            )
+        full_cache["w_full"] = _class_balanced_weights(y_all, n_px_all, POLY_ALPHA)
+        _wf = full_cache["w_full"]
+        _cls_sum = np.bincount(y_all, weights=_wf)
+        print(
+            f"  ✓ Веса образцов: min={_wf.min():.3f}, median={np.median(_wf):.3f}, "
+            f"max={_wf.max():.3f}; сумма весов на класс = {_cls_sum.min():.1f}..{_cls_sum.max():.1f}"
+        )
+    else:
+        for fc in fold_caches:
+            fc["w_tr"] = None
+        full_cache["w_full"] = None
+
     all_models = {}
     results_list = []
     confusion_matrices = {}
@@ -1369,9 +1522,9 @@ def main():
                             for ci, _, mp in items:
                                 est.set_params(**mp)
                                 with _sklearn.config_context(assume_finite=True):
-                                    est.fit(fc["X_tr64"], fc["y_tr"])
+                                    _fit_w(est, fc["X_tr64"], fc["y_tr"], fc.get("w_tr"))
                                 preds = est.predict(fc["X_te64"])
-                                out[ci] = (float(accuracy_score(fc["y_te"], preds)), preds)
+                                out[ci] = (_score_fn(fc["y_te"], preds), preds)
                                 with _pbar_lock:
                                     pbar.update(1)
                         return fi, out
@@ -1459,18 +1612,18 @@ def main():
                                 joblib.parallel.BatchCompletionCallBack = _TreeProgressCB
                                 try:
                                     with _sklearn.config_context(assume_finite=True):
-                                        est.fit(X_tr, y_tr)
+                                        _fit_w(est, X_tr, y_tr, fc.get("w_tr"))
                                 finally:
                                     joblib.parallel.BatchCompletionCallBack = _orig_batch_cb
                             else:
                                 pbar.set_postfix_str(f"фолд {fi+1}/{n_folds}, {hint_str}", refresh=True)
                                 with _sklearn.config_context(assume_finite=True):
-                                    est.fit(X_tr, y_tr)
+                                    _fit_w(est, X_tr, y_tr, fc.get("w_tr"))
 
                             te_idx = fc["te_idx"]
                             if len(items) == 1:
                                 preds = np.asarray(est.predict(X_te)).reshape(-1)
-                                scores_mat[max_ci, fi] = float(accuracy_score(y_te, preds))
+                                scores_mat[max_ci, fi] = _score_fn(y_te, preds)
                                 oof_by_combo[max_ci][te_idx] = preds
                             else:
                                 orig_ests = getattr(est, "estimators_", None) if algo_key == "rf" else None
@@ -1490,9 +1643,9 @@ def main():
                                         est_sub, _ = _build_estimator(algo_key, ncores)
                                         est_sub.set_params(**mp)
                                         with _sklearn.config_context(assume_finite=True):
-                                            est_sub.fit(X_tr, y_tr)
+                                            _fit_w(est_sub, X_tr, y_tr, fc.get("w_tr"))
                                         preds = np.asarray(est_sub.predict(X_te)).reshape(-1)
-                                    scores_mat[ci, fi] = float(accuracy_score(y_te, preds))
+                                    scores_mat[ci, fi] = _score_fn(y_te, preds)
                                     oof_by_combo[ci][te_idx] = preds
                                 if algo_key == "rf" and orig_ests is not None:
                                     est.estimators_ = orig_ests
@@ -1513,9 +1666,9 @@ def main():
                         est, _ = _build_estimator(algo_key, inner_jobs)
                         est.set_params(**mp)
                         with _sklearn.config_context(assume_finite=True):
-                                    est.fit(fc["X_tr64"], fc["y_tr"])
+                                    _fit_w(est, fc["X_tr64"], fc["y_tr"], fc.get("w_tr"))
                         preds = np.asarray(est.predict(fc["X_te64"])).reshape(-1)
-                        return ci, fi, float(accuracy_score(fc["y_te"], preds)), preds
+                        return ci, fi, _score_fn(fc["y_te"], preds), preds
 
                     for ci, fi, sc, preds in joblib.Parallel(
                         n_jobs=outer_jobs, prefer="threads", return_as="generator_unordered"
@@ -1536,7 +1689,7 @@ def main():
                 final_est.set_params(**best_mp)
                 X_fit_full = full_cache["X_full32"] if algo_key in ("rf", "lgbm") else full_cache["X_full64"]
                 with _sklearn.config_context(assume_finite=True):
-                    final_est.fit(X_fit_full, y_all)
+                    _fit_w(final_est, X_fit_full, y_all, full_cache.get("w_full"))
                 pbar.set_postfix_str("", refresh=True)
                 pbar.close()
                 trained_model = _build_fitted_pipeline(full_cache, final_est, predictor_cols)
@@ -1564,7 +1717,7 @@ def main():
                     fc = fold_caches[fi]
                     est, _ = _build_estimator(algo_key, 1)
                     with _sklearn.config_context(assume_finite=True):
-                                    est.fit(fc["X_tr64"], fc["y_tr"])
+                                    _fit_w(est, fc["X_tr64"], fc["y_tr"], fc.get("w_tr"))
                     preds = np.asarray(est.predict(fc["X_te64"])).reshape(-1)
                     return fi, preds
 
@@ -1576,7 +1729,7 @@ def main():
                     pbar.update(1)
 
                 final_est, _ = _build_estimator(algo_key, ncores)
-                final_est.fit(full_cache["X_full64"], y_all)
+                _fit_w(final_est, full_cache["X_full64"], y_all, full_cache.get("w_full"))
                 trained_model = _build_fitted_pipeline(full_cache, final_est, predictor_cols)
                 pbar.update(1)
                 pbar.close()
@@ -1674,10 +1827,13 @@ def main():
 
         run_log["algorithms"][algo_name]["accuracy"] = round(overall_acc, 4)
         run_log["algorithms"][algo_name]["kappa"] = round(kappa, 4)
+        run_log["algorithms"][algo_name]["balanced_accuracy"] = round(float(balanced_acc), 4)
+        run_log["algorithms"][algo_name]["f1_macro"] = round(float(f1_macro), 4)
         run_log["algorithms"][algo_name]["time_sec"] = round(elapsed, 1)
 
         print(
-            f"  Acc: {overall_acc:.4f} | Kappa: {kappa:.4f} | "
+            f"  OA: {overall_acc:.4f} | BalAcc: {balanced_acc:.4f} | "
+            f"Предсказано классов: {len(np.unique(y_pred))}/{n_cls} | Kappa: {kappa:.4f} | "
             f"TSS: {tss:.4f} | F1: {f1_macro:.4f} | "
             f"AIC: {'NA' if aic_val is None else f'{aic_val:.1f}'}"
         )
@@ -1758,10 +1914,11 @@ def main():
         return
 
     results_df = pd.DataFrame(results_list)
-    results_df = results_df.sort_values("OverallAccuracy", ascending=False).reset_index(drop=True)
+    rank_metric = "BalancedAccuracy" if EQUAL_CLASS_PRIOR else "OverallAccuracy"
+    results_df = results_df.sort_values(rank_metric, ascending=False).reset_index(drop=True)
 
     print_cols = [
-        "Algorithm", "GridMode", "OverallAccuracy", "Kappa",
+        "Algorithm", "GridMode", "OverallAccuracy", "BalancedAccuracy", "Kappa",
         "TSS", "F1_Macro", "AIC", "TrainingTime_Sec",
     ]
     print_cols = [c for c in print_cols if c in results_df.columns]
@@ -1875,17 +2032,17 @@ def main():
         min_aic = aic_series.min()
         results_df["DeltaAIC"] = aic_series - min_aic
         results_df = results_df.sort_values(
-            ["OverallAccuracy", "F1_Macro", "TSS", "DeltaAIC"],
+            [rank_metric, "F1_Macro", "TSS", "DeltaAIC"],
             ascending=[False, False, False, True],
         ).reset_index(drop=True)
     else:
         results_df["DeltaAIC"] = None
         results_df = results_df.sort_values(
-            ["OverallAccuracy", "F1_Macro", "TSS"],
+            [rank_metric, "F1_Macro", "TSS"],
             ascending=[False, False, False],
         ).reset_index(drop=True)
 
-    print("Ранжирование по OA, F1_Macro, TSS, ΔAIC:\n")
+    print(f"Ранжирование по {'BalancedAccuracy' if EQUAL_CLASS_PRIOR else 'OA'}, F1_Macro, TSS, ΔAIC:\n")
     for i, row in results_df.iterrows():
         marker = " <- лучшая" if i == 0 else ""
         daic = (
@@ -1895,6 +2052,7 @@ def main():
         print(
             f" [{i + 1}] {row['Algorithm']:<30s} "
             f"Acc={row['OverallAccuracy']:.4f} "
+            f"BalAcc={row['BalancedAccuracy']:.4f} "
             f"F1={row['F1_Macro']:.4f} "
             f"TSS={row['TSS']:.4f} "
             f"ΔAIC={daic}{marker}"
@@ -1914,7 +2072,8 @@ def main():
 
     best_model_name = results_df.iloc[model_idx]["Algorithm"]
     best_acc = results_df.iloc[model_idx]["OverallAccuracy"]
-    print(f"\n* Выбрана: {best_model_name} (Accuracy = {best_acc:.4f})")
+    best_bacc = results_df.iloc[model_idx]["BalancedAccuracy"]
+    print(f"\n* Выбрана: {best_model_name} (Accuracy = {best_acc:.4f}, Balanced Accuracy = {best_bacc:.4f})")
 
     # Сохраняем финальную модель
     final_model_path = os.path.join(output_dir, "final_model.pkl")
@@ -1945,6 +2104,8 @@ def main():
         f"Классов: {run_log['n_classes']} ({run_log['classes']})",
         f"Кросс-валидация: {run_log['cv_method']}",
         f"Предобработка: {run_log['preProcess']}",
+        f"Вероятности классов: {run_log['class_weighting']}",
+        f"Критерий подбора гиперпараметров: {'Balanced Accuracy' if run_log['equal_class_prior'] else 'Overall Accuracy'}",
         "",
         "------------------------------------------------------------",
         "  АЛГОРИТМЫ И ГИПЕРПАРАМЕТРЫ",
@@ -1964,6 +2125,8 @@ def main():
             info_lines.extend([
                 "  --- Результат ---",
                 f"  Accuracy: {a['accuracy']:.4f}",
+                f"  Balanced Accuracy: {a.get('balanced_accuracy', float('nan')):.4f}",
+                f"  F1 macro: {a.get('f1_macro', float('nan')):.4f}",
                 f"  Kappa: {a['kappa']:.4f}",
                 f"  Время: {a['time_sec']:.1f} сек.",
             ])

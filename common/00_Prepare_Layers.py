@@ -1,5 +1,15 @@
 # ============================================================================
-# 00_Prepare_Layers_v67.py (workspace: 00_Prepare_Layers_v10.py)
+# 00_Prepare_Layers_v68.py (workspace: 00_Prepare_Layers_v11.py)
+#
+# v68 (устранение блочности грубых слоёв):
+#   - Передискретизация при перепроецировании и выравнивании выбирается
+#     по каналу: bilinear для непрерывных слоёв, average при агрегировании
+#     (исходный пиксель мельче целевого более чем в 1.5 раза), nearest для
+#     категориальных (flowdir, geomorphons, SCL, маски, классы, QA).
+#     Раньше везде был nearest -> «лестница» MODIS/Landsat/DEM на 10-м
+#     сетке и крупные угловатые выделы на карте классификации.
+#
+# (история) 00_Prepare_Layers_v67.py (workspace: 00_Prepare_Layers_v10.py)
 #
 # v67 (ускорение эталонов, KW и графиков медиана + CI):
 #   - Медианы и ДИ (95/99%) по классам считаются векторно для всех слоёв сразу
@@ -58,6 +68,43 @@ from rasterio.warp import (
     transform_bounds,
 )
 from rasterio.merge import merge
+
+# ----------------------------------------------------------------------------
+# v68: выбор метода передискретизации для каждого канала.
+# Непрерывные слои (отражение, индексы, DEM-производные) — bilinear, если
+# исходный пиксель не мельче целевого более чем в 1.5 раза, иначе average.
+# Категориальные слои (flowdir, geomorphons, SCL, маски, классы, QA) — nearest.
+# Раньше для всех слоёв использовался nearest, из-за чего грубые слои
+# (MODIS 250-500 м, Landsat 30 м, DEM) давали на 10-м сетке блочную
+# «лестницу», и классификатор рисовал крупные угловатые выделы.
+# ----------------------------------------------------------------------------
+import re as _re_rs
+_CATEGORICAL_PATTERNS = _re_rs.compile(
+    r"(flowdir|flow_dir|d8|geomorph|landform|scl|class|mask|lulc|landcover|"
+    r"land_cover|qa|pixel_qa|cloud|categ|_cat\b|label|zone)",
+    _re_rs.IGNORECASE,
+)
+
+
+def _choose_resampling(src, band: int, dst_res=None):
+    """Возвращает (Resampling, метка) для канала band растра src."""
+    try:
+        desc = (src.descriptions[band - 1] or "") if src.descriptions else ""
+    except Exception:
+        desc = ""
+    name = f"{os.path.basename(src.name)} {desc}"
+    if _CATEGORICAL_PATTERNS.search(name):
+        return Resampling.nearest, "nearest (категориальный)"
+    if dst_res is not None:
+        try:
+            src_px = max(abs(src.res[0]), abs(src.res[1]))
+            dst_px = max(abs(dst_res[0]), abs(dst_res[1]))
+            if src_px * 1.5 < dst_px:
+                return Resampling.average, "average (агрегирование)"
+        except Exception:
+            pass
+    return Resampling.bilinear, "bilinear"
+
 from rasterio.mask import mask as rio_mask
 import geopandas as gpd
 from shapely.geometry import mapping
@@ -425,19 +472,23 @@ def align_rasters_to_common_grid(
                 if _needs_bigtiff(src.count, height, width, "float32"):
                     prof["BIGTIFF"] = "YES"
                 with rasterio.open(out_reproj, "w", **prof) as dst:
+                    _rs_used = set()
                     for band in range(1, src.count + 1):
+                        _rs, _rs_lbl = _choose_resampling(src, band, (transform.a, transform.e))
+                        _rs_used.add(_rs_lbl)
                         reproject(
                             source=rasterio.band(src, band),
                             destination=rasterio.band(dst, band),
                             src_crs=src_crs,
                             dst_crs=target_crs,
-                            resampling=Resampling.nearest,
+                            resampling=_rs,
                             dst_nodata=np.nan,
                             num_threads=0,
                         )
                 reproj_paths.append(out_reproj)
                 n_reprojected += 1
-                print(f" ✓ Конвертирована в {target_crs}\n")
+                print(f" ✓ Конвертирована в {target_crs} "
+                      f"(передискретизация: {', '.join(sorted(_rs_used))})\n")
 
     print(
         f"Итого: {n_already_ok} уже в целевой СКО, {n_reprojected} перепроецировано\n"
@@ -603,7 +654,12 @@ def align_rasters_to_common_grid(
             if _needs_bigtiff(src.count, out_height, out_width, "float32"):
                 prof["BIGTIFF"] = "YES"
             with rasterio.open(out_aligned, "w", **prof) as dst:
+                _rs_used = set()
                 for band in range(1, src.count + 1):
+                    _rs, _rs_lbl = _choose_resampling(
+                        src, band, (template_transform.a, template_transform.e)
+                    )
+                    _rs_used.add(_rs_lbl)
                     reproject(
                         source=rasterio.band(src, band),
                         destination=rasterio.band(dst, band),
@@ -611,10 +667,11 @@ def align_rasters_to_common_grid(
                         src_transform=src.transform,
                         dst_crs=target_crs,
                         dst_transform=template_transform,
-                        resampling=Resampling.nearest,
+                        resampling=_rs,
                         dst_nodata=np.nan,
                         num_threads=0,  # все доступные ядра
                     )
+            print(f"      передискретизация: {', '.join(sorted(_rs_used))}")
         aligned_files.append(out_aligned)
         n_aligned += 1
 
@@ -1899,6 +1956,7 @@ def main():
     print("ВЕРСИЯ v63 (Python) — ZSTD+PREDICTOR=3, потоковое объединение")
     print("v66: виртуальный композит VRT — быстро и без места на диске; полигоны вне растра не теряют класс")
     print("v67: ускорены извлечение эталонов, тесты KW и графики медиана + CI")
+    print("v68: bilinear/average для непрерывных слоёв, nearest только для категориальных")
     print("С ВЫБОРОМ ПРОЕКЦИИ, МАСКОЙ, КОРРЕЛЯЦИЯМИ, KRUSKAL-WALLIS И ФИЛЬТРАЦИЕЙ СЛОЁВ")
     print("════════════════════════════════════════════════════════\n")
 
