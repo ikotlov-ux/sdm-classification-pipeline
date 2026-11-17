@@ -85,6 +85,8 @@
 
 from __future__ import annotations
 
+SCRIPT_VERSION = "v8 (структурные классы, запуск в ячейке ноутбука)"
+
 import argparse
 import re
 import glob
@@ -2156,7 +2158,7 @@ def _console_dialog(root_dir: str):
 def _run_interactive():
     root_dir = os.getcwd()
     line = "=" * 60
-    print(f"\n{line}\n  07 - ГЕНЕРАЛИЗАЦИЯ (sieve + marching squares)\n{line}", flush=True)
+    print(f"\n{line}\n  07 - ГЕНЕРАЛИЗАЦИЯ (sieve + marching squares), версия {SCRIPT_VERSION}\n{line}", flush=True)
     print(f"Рабочая папка: {root_dir}", flush=True)
     try:
         choice = _gui_dialog(root_dir)
@@ -2188,7 +2190,7 @@ def _strip_kernel_args(argv):
         if skip:
             skip = False
             continue
-        if x == "-f" and i + 1 < len(argv) and argv[i + 1].lower().endswith(".json"):
+        if x == "-f" and i + 1 < len(argv):
             skip = True
             continue
         if x.startswith("--f=") or (x.lower().endswith(".json") and "kernel" in x.lower()):
@@ -2202,7 +2204,12 @@ def _strip_kernel_args(argv):
 def main(argv=None):
     if argv is None:
         argv = sys.argv[1:]
-        if _in_notebook() or "ipykernel" in os.path.basename(sys.argv[0] if sys.argv else ""):
+        prog = os.path.basename(sys.argv[0]) if sys.argv else ""
+        if "ipykernel" in prog.lower() or "kernel" in prog.lower():
+            # код выполняется в ячейке ноутбука (Jupyter, ArcGIS Pro):
+            # всё в sys.argv принадлежит ядру, а не скрипту — открыть окно
+            argv = []
+        elif _in_notebook():
             argv = _strip_kernel_args(argv)
     # запуск без аргументов (кнопка Run, %run в Jupyter) — окно
     if not argv:
