@@ -2179,9 +2179,31 @@ def _run_interactive():
 # MAIN
 # ===========================================================================
 
+def _strip_kernel_args(argv):
+    """Убирает служебные аргументы ядра Jupyter/IPython (-f kernel-*.json,
+    --f=..., --HistoryManager... и т.п.), которые попадают в sys.argv при
+    запуске скрипта в ячейке ноутбука (в том числе в ArcGIS Pro)."""
+    out, skip = [], False
+    for i, x in enumerate(argv):
+        if skip:
+            skip = False
+            continue
+        if x == "-f" and i + 1 < len(argv) and argv[i + 1].lower().endswith(".json"):
+            skip = True
+            continue
+        if x.startswith("--f=") or (x.lower().endswith(".json") and "kernel" in x.lower()):
+            continue
+        if x.startswith("--") and "=" in x and x[2:3].isupper():   # --IPKernelApp.x=...
+            continue
+        out.append(x)
+    return out
+
+
 def main(argv=None):
     if argv is None:
         argv = sys.argv[1:]
+        if _in_notebook() or "ipykernel" in os.path.basename(sys.argv[0] if sys.argv else ""):
+            argv = _strip_kernel_args(argv)
     # запуск без аргументов (кнопка Run, %run в Jupyter) — окно
     if not argv:
         _run_interactive()
