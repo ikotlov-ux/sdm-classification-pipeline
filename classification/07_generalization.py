@@ -39,6 +39,15 @@
    Если у класса есть такой слой, классифицированные пиксели этого класса
    остаются только там, где их не накрывает слой.
 
+5) СТРУКТУРНЫЕ КЛАССЫ (v6, --struct-table / --struct-prefix): иерархический
+   sieve. Этап 1 — sieve растра структурных классов (все типы класса вместе):
+   исчезают только участки структурного класса меньше min_size. Этап 2 —
+   sieve типов: мелкое пятно типа присоединяется только к соседнему типу
+   ТОГО ЖЕ структурного класса. Таблица «тип -> структурный класс» берётся
+   из XLSX/CSV (лист с колонкой «Структурный класс», код типа — «Индекс»
+   после «Тип») или по правилу код // 10. В GPKG добавляются поля
+   struct_class и struct_code.
+
 4) КЛАССЫ БЕЗ РАСШИРЕНИЯ ГРАНИЦ (--no-expand): полигоны перечисленных
    классов обрезаются по пиксельным границам класса (с допуском
    --expand-tol пикселей) — для классов, у которых нет векторного слоя.
@@ -121,7 +130,7 @@ def _pair_slices(dr, dc, shape):
 
 
 def _sieve_pass_window(out, valid, r0, r1, inner_lo, inner_hi, min_size,
-                       struct, shifts, stage=0, force_classes=None):
+                       struct, shifts, stage=0, force_classes=None, group=None):
     """
     Один проход по окну строк [r0, r1) массива out.
 
@@ -146,6 +155,9 @@ def _sieve_pass_window(out, valid, r0, r1, inner_lo, inner_hi, min_size,
 
     win = out[r0:r1]
     vw = valid[r0:r1]
+    # group (v6): массив групп (структурных классов); если задан, голосуют
+    # только соседи из той же группы, что и мелкая группа пикселей
+    gw = None if group is None else group[r0:r1]
     hh, ww = win.shape
 
     classes = np.unique(win[vw])
@@ -216,6 +228,8 @@ def _sieve_pass_window(out, valid, r0, r1, inner_lo, inner_hi, min_size,
         a_cls = win[ra, ca][sel]
         b_cls = win[rb, cb][sel]
         keep = vw[rb, cb][sel] & (b_cls != a_cls)
+        if gw is not None:
+            keep &= gw[rb, cb][sel] == gw[ra, ca][sel]
         if stage == 0:
             # голосуют только соседи, не входящие в мелкие группы
             keep &= sidx[rb, cb][sel] < 0
@@ -274,7 +288,8 @@ def sieve_majority_fast(arr: np.ndarray,
                         max_iter: int = 30,
                         chunk_rows: int = 1024,
                         force_classes=None,
-                        verbose: bool = True) -> np.ndarray:
+                        verbose: bool = True,
+                        group: np.ndarray | None = None) -> np.ndarray:
     """
     Группы связных пикселей одного класса площадью < min_size получают
     ПРЕОБЛАДАЮЩИЙ соседний класс (голосование по числу примыкающих пикселей).
@@ -316,7 +331,8 @@ def sieve_majority_fast(arr: np.ndarray,
             r1 = min(H, hi + ov)
             ch, un = _sieve_pass_window(out, valid, r0, r1, lo - r0, hi - r0,
                                         min_size, struct, shifts, stage,
-                                        force_classes=force_classes)
+                                        force_classes=force_classes,
+                                        group=group)
             changed += ch
             unresolved += un
         if verbose:
@@ -338,6 +354,231 @@ def sieve_majority_fast(arr: np.ndarray,
         stage = 1 if stage == 0 else 0
 
     return out
+
+
+# ===========================================================================
+# 1b. СОХРАНЕНИЕ СТРУКТУРНЫХ КЛАССОВ (v6)
+# ===========================================================================
+# Обычный sieve отдаёт мелкую группу соседу с самой длинной общей границей,
+# не глядя на смысл классов. Если структурный класс (например «Широколиственные
+# леса» = 110, 111, 112, 113, 121) представлен мозаикой мелких пятен разных
+# типов, каждое пятно по отдельности меньше min_size и поглощается соседями
+# из ДРУГИХ структурных классов — структурный класс исчезает, хотя суммарно
+# его участок крупнее порога.
+#
+# Иерархический sieve:
+#   этап 1 — sieve растра СТРУКТУРНЫХ КЛАССОВ: исчезают только участки
+#            структурного класса (все его типы вместе) меньше min_size;
+#   этап 2 — sieve ТИПОВ: мелкая группа типа присоединяется только к соседнему
+#            типу ТОГО ЖЕ структурного класса; пиксели, сменившие структурный
+#            класс на этапе 1, получают преобладающий соседний тип нового
+#            структурного класса.
+# Итог: границы и площади структурных классов определяются этапом 1,
+# типы перераспределяются только внутри своего структурного класса.
+
+
+def _norm_hdr(x) -> str:
+    return re.sub(r"\s+", " ", str(x)).strip().lower()
+
+
+def _to_int(v):
+    try:
+        f = float(str(v).replace(",", ".").strip())
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(f) or abs(f - round(f)) > 1e-9:
+        return None
+    return int(round(f))
+
+
+def _parse_struct_sheet(df):
+    """Ищет в листе (header=None) колонку «Структурный класс» и колонку кода
+    типа. Возвращает {код_типа: (имя_структурного_класса, код_или_None)}."""
+    nrow = min(len(df), 15)
+    for hr in range(nrow):
+        hdr = [_norm_hdr(x) for x in df.iloc[hr].tolist()]
+        sc = next((j for j, h in enumerate(hdr) if "структурн" in h), None)
+        if sc is None:
+            continue
+        body = df.iloc[hr + 1:]
+        idx_cols = [j for j, h in enumerate(hdr) if h.startswith("индекс")
+                    or h in ("код", "code", "class_value", "value")]
+        # колонка кода типа: «Индекс» сразу после «Тип», иначе колонка
+        # «Индекс» с наибольшим числом значений >= 100 (коды типов)
+        tc = None
+        for j, h in enumerate(hdr):
+            if h in ("тип", "type") and j + 1 in idx_cols:
+                tc = j + 1
+                break
+        if tc is None:
+            best = -1
+            for j in idx_cols:
+                vals = [_to_int(v) for v in body.iloc[:, j].tolist()]
+                n = sum(1 for v in vals if v is not None and v >= 100)
+                if n > best:
+                    best, tc = n, j
+        if tc is None:
+            continue
+        scode_col = sc + 1 if (sc + 1) in idx_cols and sc + 1 != tc else None
+        out = {}
+        name_code = {}
+        cur = None
+        for _, row in body.iterrows():
+            nm = row.iloc[sc]
+            if isinstance(nm, str) and nm.strip():
+                cur = re.sub(r"\s+", " ", nm).strip()
+            elif nm is not None and not (isinstance(nm, float) and np.isnan(nm)):
+                cur = str(nm).strip()
+            code = _to_int(row.iloc[tc])
+            if cur is None or code is None:
+                continue
+            if scode_col is not None:
+                scv = _to_int(row.iloc[scode_col])
+                if scv is not None and cur not in name_code:
+                    name_code[cur] = scv
+            out[code] = cur
+        if out:
+            return {c: (n, name_code.get(n)) for c, n in out.items()}
+    return None
+
+
+def read_struct_table(spec: str, verbose: bool = True) -> dict:
+    """Таблица «тип -> структурный класс».
+
+    spec: путь к XLSX/XLS/CSV, для Excel можно указать лист: «путь|лист».
+    Excel: ищется лист с колонкой «Структурный класс» (первый найденный);
+    код типа — колонка «Индекс» после «Тип». CSV: колонки кода
+    (class_value/code/value/Индекс) и структурного класса
+    (struct_class/Структурный класс).
+    Возвращает {код_типа: (имя_структурного_класса, код_структурного_класса)}.
+    """
+    import pandas as pd
+    path, sheet = spec, None
+    if "|" in spec:
+        path, sheet = [x.strip() for x in spec.split("|", 1)]
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"таблица структурных классов не найдена: {path}")
+    ext = os.path.splitext(path)[1].lower()
+    res, used = None, None
+    if ext in (".xlsx", ".xlsm", ".xls"):
+        xl = pd.ExcelFile(path)
+        sheets = [sheet] if sheet else xl.sheet_names
+        for sh in sheets:
+            df = pd.read_excel(path, sheet_name=sh, header=None)
+            res = _parse_struct_sheet(df)
+            if res:
+                used = sh
+                break
+    else:
+        df = None
+        for kw in ({"sep": None, "engine": "python"}, {"sep": ";"}, {"sep": ","}):
+            try:
+                df = pd.read_csv(path, header=None, encoding="utf-8-sig", **kw)
+                break
+            except Exception:
+                continue
+        if df is not None:
+            res = _parse_struct_sheet(df)
+            used = os.path.basename(path)
+    if not res:
+        raise ValueError(
+            f"в {os.path.basename(path)} не найдена колонка «Структурный класс» "
+            f"с кодами типов")
+    if verbose:
+        groups = {}
+        for c, (n, _) in sorted(res.items()):
+            groups.setdefault(n, []).append(c)
+        print(f"[struct] таблица: {os.path.basename(path)}, лист «{used}»: "
+              f"{len(res)} типов, {len(groups)} структурных классов", flush=True)
+        for n, cs in groups.items():
+            print(f"    {n}: {', '.join(str(c) for c in cs)}", flush=True)
+    return res
+
+
+def struct_by_prefix(codes) -> dict:
+    """Запасное правило без таблицы: структурный класс = код // 10
+    (110..113 -> 11, 400 -> 40, 501 -> 50)."""
+    return {int(c): (f"{int(c) // 10}", int(c) // 10) for c in codes}
+
+
+def sieve_structural(arr: np.ndarray, min_size: int, connectivity: int = 4,
+                     nodata_mask: np.ndarray | None = None,
+                     struct_of: dict | None = None,
+                     force_classes=None, verbose: bool = True) -> np.ndarray:
+    """Иерархический sieve, сохраняющий структурные классы (см. выше).
+
+    struct_of: {код_типа: имя_структурного_класса}; коды, которых нет
+    в таблице, считаются отдельными структурными классами.
+    force_classes: стираемые классы (негенерализуемые слои) — стираются
+    ДО иерархического sieve, без ограничения по структурному классу.
+    """
+    from scipy import ndimage as ndi
+    valid = np.ones(arr.shape, bool) if nodata_mask is None else ~nodata_mask
+    work = np.ascontiguousarray(arr.astype(np.int32))
+    if force_classes:
+        if verbose:
+            print("[struct] этап 0: стирание классов негенерализуемых слоёв", flush=True)
+        work = sieve_majority_fast(work, 1, connectivity, nodata_mask,
+                                   force_classes=force_classes, verbose=verbose)
+    codes = np.unique(work[valid])
+    if codes.size == 0:
+        return arr.copy()
+    struct_of = struct_of or {}
+    nm = [struct_of.get(int(c), f"код {int(c)} (нет в таблице)") for c in codes]
+    missing = [int(c) for c in codes if int(c) not in struct_of]
+    if missing and verbose:
+        print(f"[struct] ⚠ коды без структурного класса (считаются отдельными "
+              f"классами): {missing}", flush=True)
+    names = sorted(set(nm))
+    nid = {n: i + 1 for i, n in enumerate(names)}
+    sid_of_code = np.array([nid[n] for n in nm], np.int32)
+    g = np.zeros(arr.shape, np.int32)
+    g[valid] = sid_of_code[np.searchsorted(codes, work[valid])]
+    before = np.bincount(g[valid], minlength=len(names) + 1)
+
+    if verbose:
+        print(f"[struct] этап 1: sieve структурных классов ({len(names)}), "
+              f"min_size={min_size}", flush=True)
+    g2 = sieve_majority_fast(g, min_size, connectivity, nodata_mask, verbose=verbose)
+    moved = valid & (g2 != g)
+    n_moved = int(moved.sum())
+    base = int(codes.max()) + 1
+    pseudo = []
+    if n_moved:
+        work[moved] = base + g2[moved]
+        pseudo = sorted(int(x) for x in (base + np.unique(g2[moved])))
+    if verbose:
+        print(f"[struct] пикселей, сменивших структурный класс: {n_moved}", flush=True)
+        print("[struct] этап 2: sieve типов внутри структурных классов", flush=True)
+    work = sieve_majority_fast(work, min_size, connectivity, nodata_mask,
+                               force_classes=pseudo or None, verbose=verbose,
+                               group=g2)
+    left = valid & np.isin(work, pseudo) if pseudo else np.zeros(arr.shape, bool)
+    if left.any():
+        # страховка: пиксели без соседнего типа своего структурного класса
+        # получают ближайший тип того же структурного класса, иначе ближайший
+        if verbose:
+            print(f"[struct] досрочное заполнение {int(left.sum())} пикс. "
+                  f"ближайшим типом", flush=True)
+        src = valid & ~left
+        _, (ri, ci) = ndi.distance_transform_edt(~src, return_indices=True)
+        work[left] = work[ri[left], ci[left]]
+
+    g3 = np.zeros(arr.shape, np.int32)
+    codes2 = np.unique(work[valid])
+    nm2 = [struct_of.get(int(c), f"код {int(c)} (нет в таблице)") for c in codes2]
+    g3[valid] = np.array([nid.get(n, 0) for n in nm2], np.int32)[
+        np.searchsorted(codes2, work[valid])]
+    after = np.bincount(g3[valid], minlength=len(names) + 1)
+    if verbose:
+        mism = int((valid & (g3 != g2)).sum())
+        print(f"[struct] итог по структурным классам (пикс. до -> после sieve); "
+              f"расхождение с этапом 1: {mism} пикс.", flush=True)
+        for n in names:
+            i = nid[n]
+            flag = "  <- исчез: все участки < min_size" if before[i] and not after[i] else ""
+            print(f"    {n}: {int(before[i])} -> {int(after[i])}{flag}", flush=True)
+    return work.astype(arr.dtype)
 
 
 # ===========================================================================
@@ -1067,7 +1308,10 @@ def run(in_raster, min_size=3, connectivity=8, out_raster=None,
         out_vector=None, smooth=0, simplify=0.0, edge_mode="full",
         repair=True, tile=256, margin=16, no_expand=None, expand_tol=0.0,
         refs=None, workers=1, output_mode="patch",
-        layer="classes", skip_vector=False, resume=False, verbose=True):
+        layer="classes", skip_vector=False, resume=False, verbose=True,
+        struct_of=None):
+    """struct_of (v6): {код_типа: имя_структурного_класса} — иерархический
+    sieve, сохраняющий структурные классы; None — обычный sieve."""
     import rasterio
 
     src_for_vector = in_raster
@@ -1095,9 +1339,15 @@ def run(in_raster, min_size=3, connectivity=8, out_raster=None,
             before = int(np.isin(arr, erase_classes).sum())
             print(f"[erase] классы растра {erase_classes}: {before} пикс. "
                   f"передаётся преобладающим соседям")
-        cleaned = sieve_majority_fast(arr, min_size, connectivity, nd,
-                                      force_classes=erase_classes or None,
-                                      verbose=verbose)
+        if struct_of and min_size and min_size > 1:
+            cleaned = sieve_structural(arr, min_size, connectivity, nd,
+                                       struct_of=struct_of,
+                                       force_classes=erase_classes or None,
+                                       verbose=verbose)
+        else:
+            cleaned = sieve_majority_fast(arr, min_size, connectivity, nd,
+                                          force_classes=erase_classes or None,
+                                          verbose=verbose)
         if erase_classes and verbose:
             print(f"[erase] остаток стираемых классов в растре: "
                   f"{int(np.isin(cleaned, erase_classes).sum())} пикс.")
@@ -1278,6 +1528,8 @@ def _default_params() -> dict:
         "no_expand": [],        # классы, границы которых нельзя расширять
         "expand_tol": 0.0,      # допуск расширения, пикселей (0 = строго)
         "refs": [],             # негенерализуемые слои [{path, layer, class_value}]
+        "struct_mode": "off",   # v6: off / table / prefix — сохранять структурные классы
+        "struct_table": "",     # v6: XLSX/CSV «тип -> структурный класс» («путь|лист»)
     }
 
 
@@ -1298,6 +1550,8 @@ def _make_tag(p: dict) -> str:
             tag += f"t{p['expand_tol']:g}"
     if p.get("refs"):
         tag += "_ref" + "-".join(str(int(r_["class_value"])) for r_ in p["refs"])
+    if p.get("struct_mode", "off") != "off":
+        tag += "_st"
     return tag
 
 
@@ -1309,6 +1563,40 @@ def _add_class_names(out_vector: str, id_to_name: dict) -> None:
     cols = [c for c in ("class_value", "class_name", "area") if c in gdf.columns]
     cols += [c for c in gdf.columns if c not in cols and c != "geometry"]
     gdf[cols + ["geometry"]].to_file(out_vector, layer="classes", driver="GPKG")
+
+
+def _add_struct_fields(out_vector: str, struct_info: dict) -> None:
+    """v6: поля struct_class (имя) и struct_code (код, если есть в таблице)."""
+    import geopandas as gpd
+    gdf = gpd.read_file(out_vector, layer="classes")
+    cv = gdf["class_value"].astype(int)
+    gdf["struct_class"] = cv.map(lambda v: struct_info.get(int(v), (f"код {int(v)}", None))[0])
+    gdf["struct_code"] = cv.map(lambda v: struct_info.get(int(v), (None, None))[1])
+    first = [c for c in ("class_value", "class_name", "struct_code", "struct_class", "area")
+             if c in gdf.columns]
+    rest = [c for c in gdf.columns if c not in first and c != "geometry"]
+    gdf[first + rest + ["geometry"]].to_file(out_vector, layer="classes", driver="GPKG")
+
+
+def _load_struct_info(params: dict, in_raster: str):
+    """Возвращает {код: (имя, код_структ)} или None по params['struct_mode']."""
+    mode = params.get("struct_mode", "off")
+    if mode == "off":
+        return None
+    if mode == "table":
+        spec = (params.get("struct_table") or "").strip()
+        if not spec:
+            raise ValueError("режим «по таблице», но таблица структурных классов не задана")
+        return read_struct_table(spec)
+    import rasterio
+    with rasterio.open(in_raster) as src:
+        a = src.read(1)
+        nd = src.nodata
+    vals = np.unique(a if nd is None else a[a != nd])
+    info = struct_by_prefix(vals)
+    print("[struct] правило «первые две цифры кода»: "
+          + ", ".join(f"{c}->{n}" for c, (n, _) in sorted(info.items())), flush=True)
+    return info
 
 
 def generalize_files(files: list[str], params: dict, out_base: str) -> list[str]:
@@ -1343,6 +1631,13 @@ def generalize_files(files: list[str], params: dict, out_base: str) -> list[str]
 
         t0 = time.time()
         try:
+            struct_info = _load_struct_info(params, in_raster)
+        except Exception as e:
+            print(f"  ! Таблица структурных классов: {e}", flush=True)
+            continue
+        struct_of = ({c: n for c, (n, _) in struct_info.items()}
+                     if struct_info else None)
+        try:
             run(in_raster=in_raster,
                 min_size=params["min_size"],
                 connectivity=params["connectivity"],
@@ -1362,7 +1657,8 @@ def generalize_files(files: list[str], params: dict, out_base: str) -> list[str]
                 layer="classes",
                 skip_vector=False,
                 resume=False,
-                verbose=True)
+                verbose=True,
+                struct_of=struct_of)
         except Exception as e:
             print(f"  ! Ошибка обработки {os.path.basename(in_raster)}: {e}", flush=True)
             continue
@@ -1395,6 +1691,12 @@ def generalize_files(files: list[str], params: dict, out_base: str) -> list[str]
         else:
             print("  • таблица классов не найдена — в векторе только class_value",
                   flush=True)
+        if struct_info:
+            try:
+                _add_struct_fields(out_vector, struct_info)
+                print("  ✓ Добавлены поля struct_class, struct_code", flush=True)
+            except Exception as e:
+                print(f"  ! Не удалось добавить поля структурного класса: {e}", flush=True)
 
         with open(os.path.join(out_dir, "run_info.txt"), "a", encoding="utf-8") as f:
             f.write("07 - Generalization (sieve + marching squares)\n")
@@ -1428,6 +1730,29 @@ def _initial_dir(root_dir: str) -> str:
                 if os.path.isdir(os.path.join(fb, d))]
         return max(subs, key=os.path.getmtime) if subs else fb
     return root_dir
+
+
+def _last_struct_path(root_dir: str) -> str:
+    return os.path.join(root_dir, OUT_BASE_NAME, "last_struct_table.txt")
+
+
+def _read_last_struct(root_dir: str):
+    """v6: последний режим и таблица структурных классов (подставляются в окно)."""
+    try:
+        with open(_last_struct_path(root_dir), encoding="utf-8") as f:
+            lines = [x.rstrip("\n") for x in f.readlines()]
+        return {"mode": lines[0].strip(), "table": lines[1].strip() if len(lines) > 1 else ""}
+    except Exception:
+        return None
+
+
+def _write_last_struct(root_dir: str, mode: str, table: str) -> None:
+    try:
+        os.makedirs(os.path.join(root_dir, OUT_BASE_NAME), exist_ok=True)
+        with open(_last_struct_path(root_dir), "w", encoding="utf-8") as f:
+            f.write(f"{mode}\n{table}\n")
+    except Exception:
+        pass
 
 
 def _gui_dialog(root_dir: str):
@@ -1516,6 +1841,34 @@ def _gui_dialog(root_dir: str):
     ttk.Spinbox(fr_s, from_=0, to=100000, textvariable=v["min_size"], width=10).grid(row=0, column=1, sticky="w", padx=6)
     ttk.Label(fr_s, text="Соседство").grid(row=1, column=0, sticky="w", padx=6, pady=3)
     radio(fr_s, v["connectivity"], [("4", 4), ("8", 8)]).grid(row=1, column=1, sticky="w", padx=6)
+
+    # --- структурные классы (v6) ---
+    v_st_mode = tk.StringVar(value=d["struct_mode"])
+    v_st_table = tk.StringVar(value=d["struct_table"])
+    _last_st = _read_last_struct(root_dir)
+    if _last_st:
+        v_st_mode.set(_last_st.get("mode", "off"))
+        v_st_table.set(_last_st.get("table", ""))
+    fr_st = ttk.LabelFrame(
+        win, text="Структурные классы: мелкие пятна типа присоединяются к типам своего структурного класса")
+    fr_st.pack(fill="x", **pad)
+    radio(fr_st, v_st_mode, [("Не учитывать", "off"), ("По таблице", "table"),
+                             ("По первым двум цифрам кода", "prefix")]).grid(
+        row=0, column=0, columnspan=3, sticky="w", padx=6, pady=3)
+    ttk.Label(fr_st, text="Таблица (XLSX/CSV)").grid(row=1, column=0, sticky="w", padx=6, pady=3)
+    ttk.Entry(fr_st, textvariable=v_st_table, width=62).grid(row=1, column=1, sticky="we", padx=4)
+    def browse_st():
+        pth = filedialog.askopenfilename(
+            parent=win, title="Таблица «тип -> структурный класс»",
+            filetypes=[("Excel / CSV", "*.xlsx *.xls *.csv"), ("Все файлы", "*.*")])
+        if pth:
+            v_st_table.set(os.path.normpath(pth))
+            v_st_mode.set("table")
+    ttk.Button(fr_st, text="Обзор…", command=browse_st).grid(row=1, column=2, padx=4)
+    ttk.Label(fr_st, text="лист ищется по колонке «Структурный класс»; "
+              "конкретный лист: путь|имя листа").grid(
+        row=2, column=0, columnspan=3, sticky="w", padx=6, pady=(0, 4))
+    fr_st.columnconfigure(1, weight=1)
 
     fr_v = ttk.LabelFrame(win, text="Векторизация")
     fr_v.pack(fill="x", **pad)
@@ -1712,6 +2065,8 @@ def _gui_dialog(root_dir: str):
                               if x.strip()],
                 "expand_tol": max(float(v["expand_tol"].get().replace(",", ".")), 0.0),
                 "refs": list(ref_entries),
+                "struct_mode": v_st_mode.get(),
+                "struct_table": v_st_table.get().strip(),
             }
         except (ValueError, tk.TclError):
             messagebox.showerror("Ошибка",
@@ -1719,6 +2074,14 @@ def _gui_dialog(root_dir: str):
                                  "Классы — целые числа через запятую, "
                                  "допуск — число пикселей.", parent=win)
             return
+        if params["struct_mode"] == "table":
+            spec = params["struct_table"]
+            if not spec or not os.path.isfile(spec.split("|", 1)[0].strip()):
+                messagebox.showwarning("Структурные классы",
+                                       "Выберите таблицу структурных классов "
+                                       "или режим «Не учитывать».", parent=win)
+                return
+        _write_last_struct(root_dir, params["struct_mode"], params["struct_table"])
         result.update(files=list(files), params=params,
                       out_base=v_out.get().strip() or os.path.join(root_dir, OUT_BASE_NAME))
         win.destroy()
@@ -1780,6 +2143,12 @@ def _console_dialog(root_dir: str):
         refs.append({"path": raw, "layer": layer or None,
                      "class_value": cv, "erase": erase})
     p["refs"] = refs
+    raw = input("  таблица структурных классов XLSX/CSV (Enter = не учитывать, "
+                "p = по первым двум цифрам кода): ").strip().strip('"')
+    if raw.lower() == "p":
+        p["struct_mode"], p["struct_table"] = "prefix", ""
+    elif raw:
+        p["struct_mode"], p["struct_table"] = "table", raw
     p["save_raster"] = _prompt_yes("сохранить очищенный растр", False)
     return files, p, os.path.join(root_dir, OUT_BASE_NAME)
 
@@ -1850,6 +2219,11 @@ def main(argv=None):
                         "передаются соседям до генерализации, через запятую: "
                         "ФАЙЛ|СЛОЙ|400|1400,2400,3400,4400)")
     p.add_argument("--layer", default="classes")
+    p.add_argument("--struct-table", default=None, metavar="ФАЙЛ[|ЛИСТ]",
+                   help="таблица «тип -> структурный класс» (XLSX/CSV): мелкие пятна "
+                        "типа присоединяются к типам своего структурного класса")
+    p.add_argument("--struct-prefix", action="store_true",
+                   help="структурный класс = код // 10 (без таблицы)")
     p.add_argument("--skip-vector", action="store_true")
     p.add_argument("--resume", action="store_true",
                    help="не удалять уже посчитанные тайлы")
@@ -1861,11 +2235,19 @@ def main(argv=None):
 
     no_expand = [int(x) for x in re.split(r"[,;\s]+", a.no_expand) if x.strip()]
     refs = [_parse_ref_spec(spec) for spec in a.ref]
+    struct_of = None
+    if a.struct_table:
+        struct_of = {c: n for c, (n, _) in read_struct_table(a.struct_table).items()}
+    elif a.struct_prefix:
+        import rasterio
+        with rasterio.open(a.input) as _src:
+            _a = _src.read(1)
+        struct_of = {c: n for c, (n, _) in struct_by_prefix(np.unique(_a)).items()}
     run(a.input, a.min_size, a.connectivity, a.out_raster, a.out_vector,
         a.smooth, a.simplify, a.edge_mode, not a.no_repair, a.tile, a.margin,
         no_expand, a.expand_tol, refs,
         a.workers, a.output_mode, a.layer, a.skip_vector, a.resume,
-        verbose=not a.quiet)
+        verbose=not a.quiet, struct_of=struct_of)
 
 
 if __name__ == "__main__":
