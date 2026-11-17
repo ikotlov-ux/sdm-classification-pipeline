@@ -47,6 +47,12 @@
    из XLSX/CSV (лист с колонкой «Структурный класс», код типа — «Индекс»
    после «Тип») или по правилу код // 10. В GPKG добавляются поля
    struct_class и struct_code.
+   v9: четырёхзначный код = геоморфон (первая цифра) + тип (три последние):
+   1110 -> геоморфон 1, тип 110; в таблице код ищется целиком, затем по
+   трём последним цифрам. В GPKG текстовые поля «Структурный_класс»,
+   «Геоморфон», «Тип», «Геоморфон_тип» и коды struct_code, geomorph_code,
+   type_code. Названия геоморфонов — «1=...; 2=...» (окно, --geomorph-names).
+   Поля добавляются и при режиме «Не учитывать», если таблица указана.
 
 4) КЛАССЫ БЕЗ РАСШИРЕНИЯ ГРАНИЦ (--no-expand): полигоны перечисленных
    классов обрезаются по пиксельным границам класса (с допуском
@@ -85,7 +91,7 @@
 
 from __future__ import annotations
 
-SCRIPT_VERSION = "v8 (структурные классы, запуск в ячейке ноутбука)"
+SCRIPT_VERSION = "v9 (коды «геоморфон + тип», текстовые поля)"
 
 import argparse
 import re
@@ -393,7 +399,7 @@ def _to_int(v):
     return int(round(f))
 
 
-def _parse_struct_sheet(df):
+def _parse_struct_sheet(df, types_out=None):
     """Ищет в листе (header=None) колонку «Структурный класс» и колонку кода
     типа. Возвращает {код_типа: (имя_структурного_класса, код_или_None)}."""
     nrow = min(len(df), 15)
@@ -422,6 +428,8 @@ def _parse_struct_sheet(df):
         if tc is None:
             continue
         scode_col = sc + 1 if (sc + 1) in idx_cols and sc + 1 != tc else None
+        # v9: колонка названия типа — «Тип»
+        tname_col = next((j for j, h in enumerate(hdr) if h in ("тип", "type")), None)
         out = {}
         name_code = {}
         cur = None
@@ -439,12 +447,16 @@ def _parse_struct_sheet(df):
                 if scv is not None and cur not in name_code:
                     name_code[cur] = scv
             out[code] = cur
+            if types_out is not None and tname_col is not None:
+                tn = row.iloc[tname_col]
+                if isinstance(tn, str) and tn.strip():
+                    types_out[code] = re.sub(r"\s+", " ", tn).strip()
         if out:
             return {c: (n, name_code.get(n)) for c, n in out.items()}
     return None
 
 
-def read_struct_table(spec: str, verbose: bool = True) -> dict:
+def read_struct_table(spec: str, verbose: bool = True, types_out=None) -> dict:
     """Таблица «тип -> структурный класс».
 
     spec: путь к XLSX/XLS/CSV, для Excel можно указать лист: «путь|лист».
@@ -467,7 +479,7 @@ def read_struct_table(spec: str, verbose: bool = True) -> dict:
         sheets = [sheet] if sheet else xl.sheet_names
         for sh in sheets:
             df = pd.read_excel(path, sheet_name=sh, header=None)
-            res = _parse_struct_sheet(df)
+            res = _parse_struct_sheet(df, types_out)
             if res:
                 used = sh
                 break
@@ -480,7 +492,7 @@ def read_struct_table(spec: str, verbose: bool = True) -> dict:
             except Exception:
                 continue
         if df is not None:
-            res = _parse_struct_sheet(df)
+            res = _parse_struct_sheet(df, types_out)
             used = os.path.basename(path)
     if not res:
         raise ValueError(
@@ -497,10 +509,68 @@ def read_struct_table(spec: str, verbose: bool = True) -> dict:
     return res
 
 
+def split_code(code: int):
+    """v9: составной код «геоморфон + тип»: 1110 -> (1, 110), 5400 -> (5, 400).
+    Коды < 1000 — без геоморфона: 110 -> (None, 110)."""
+    c = int(code)
+    if c >= 1000:
+        return c // 1000, c % 1000
+    return None, c
+
+
+def _type_key(code: int, table: dict):
+    """Ключ типа в таблице: сам код, иначе последние три цифры."""
+    c = int(code)
+    if c in table:
+        return c
+    t = split_code(c)[1]
+    return t if t in table else None
+
+
 def struct_by_prefix(codes) -> dict:
-    """Запасное правило без таблицы: структурный класс = код // 10
-    (110..113 -> 11, 400 -> 40, 501 -> 50)."""
-    return {int(c): (f"{int(c) // 10}", int(c) // 10) for c in codes}
+    """Запасное правило без таблицы: структурный класс = тип // 10
+    (тип — последние три цифры кода: 110..113 -> 11, 1400 -> 40)."""
+    out = {}
+    for c in codes:
+        t = split_code(int(c))[1]
+        out[int(c)] = (f"{t // 10}", t // 10)
+    return out
+
+
+def expand_struct_info(info: dict, codes, verbose: bool = True) -> dict:
+    """v9: сопоставляет коды растра с таблицей. Код ищется целиком, затем по
+    последним трём цифрам (1110 -> 110, 5400 -> 400): первая цифра
+    четырёхзначного кода — группа рельефа (геоморфон), структурный класс
+    определяется по типу. Коды без соответствия в результат не попадают
+    (в sieve считаются отдельными структурными классами)."""
+    out, miss = {}, []
+    for c in sorted(int(x) for x in codes):
+        k = _type_key(c, info)
+        if k is None:
+            miss.append(c)
+        else:
+            out[c] = info[k]
+    if verbose:
+        n4 = sum(1 for c in out if c >= 1000 and c not in info)
+        print(f"[struct] коды растра: {len(out) + len(miss)}, сопоставлено с таблицей "
+              f"{len(out)}" + (f" (по последним трём цифрам: {n4})" if n4 else ""),
+              flush=True)
+        if miss:
+            print(f"[struct] ! нет в таблице (отдельные структурные классы): {miss}",
+                  flush=True)
+    return out
+
+
+def parse_geomorph_names(text: str) -> dict:
+    """«1=Водоразделы; 2=Склоны» -> {1: 'Водоразделы', 2: 'Склоны'}."""
+    out = {}
+    for part in re.split(r"[;\n]+", text or ""):
+        if "=" in part:
+            k, v = part.split("=", 1)
+            k = _to_int(k)
+            if k is not None and v.strip():
+                out[k] = v.strip()
+    return out
 
 
 def sieve_structural(arr: np.ndarray, min_size: int, connectivity: int = 4,
@@ -1532,6 +1602,7 @@ def _default_params() -> dict:
         "refs": [],             # негенерализуемые слои [{path, layer, class_value}]
         "struct_mode": "off",   # v6: off / table / prefix — сохранять структурные классы
         "struct_table": "",     # v6: XLSX/CSV «тип -> структурный класс» («путь|лист»)
+        "geomorph_names": "",   # v9: «1=Водоразделы; 2=Склоны; ...» — первая цифра кода
     }
 
 
@@ -1567,14 +1638,49 @@ def _add_class_names(out_vector: str, id_to_name: dict) -> None:
     gdf[cols + ["geometry"]].to_file(out_vector, layer="classes", driver="GPKG")
 
 
-def _add_struct_fields(out_vector: str, struct_info: dict) -> None:
-    """v6: поля struct_class (имя) и struct_code (код, если есть в таблице)."""
+FLD_STRUCT, FLD_GEO, FLD_TYPE, FLD_GEOTYPE = ("Структурный_класс", "Геоморфон",
+                                              "Тип", "Геоморфон_тип")
+
+
+def _add_struct_fields(out_vector: str, struct_info: dict, type_names=None,
+                       geomorph_names=None) -> None:
+    """v9: текстовые поля «Структурный_класс», «Геоморфон», «Тип»,
+    «Геоморфон_тип» и коды struct_code, geomorph_code, type_code.
+    Составной код: первая цифра — геоморфон, последние три — тип."""
     import geopandas as gpd
+    type_names = type_names or {}
+    geomorph_names = geomorph_names or {}
     gdf = gpd.read_file(out_vector, layer="classes")
+    gdf = gdf.drop(columns=[c for c in ("struct_class",) if c in gdf.columns])
     cv = gdf["class_value"].astype(int)
-    gdf["struct_class"] = cv.map(lambda v: struct_info.get(int(v), (f"код {int(v)}", None))[0])
-    gdf["struct_code"] = cv.map(lambda v: struct_info.get(int(v), (None, None))[1])
-    first = [c for c in ("class_value", "class_name", "struct_code", "struct_class", "area")
+    gcode = cv.map(lambda v: split_code(v)[0])
+    tcode = cv.map(lambda v: split_code(v)[1])
+
+    def _st(v):
+        r = struct_info.get(int(v))
+        if not r:
+            return (f"код {int(v)}", None)
+        # в таблице код структурного класса указан не у всех групп — тип // 10
+        return (r[0], r[1] if r[1] is not None else split_code(v)[1] // 10)
+
+    def _tn(v):
+        k = _type_key(v, type_names)
+        return type_names[k] if k is not None else f"тип {split_code(v)[1]}"
+
+    def _gn(g):
+        if g is None or (isinstance(g, float) and np.isnan(g)):
+            return None
+        return geomorph_names.get(int(g), f"геоморфон {int(g)}")
+
+    gdf[FLD_STRUCT] = cv.map(lambda v: _st(v)[0])
+    gdf[FLD_TYPE] = cv.map(_tn)
+    gdf[FLD_GEO] = gcode.map(_gn)
+    gdf[FLD_GEOTYPE] = [f"{g} — {t}" if g else t for g, t in zip(gdf[FLD_GEO], gdf[FLD_TYPE])]
+    gdf["struct_code"] = cv.map(lambda v: _st(v)[1])
+    gdf["geomorph_code"] = gcode
+    gdf["type_code"] = tcode
+    first = [c for c in ("class_value", "class_name", FLD_STRUCT, FLD_GEO, FLD_TYPE,
+                         FLD_GEOTYPE, "struct_code", "geomorph_code", "type_code", "area")
              if c in gdf.columns]
     rest = [c for c in gdf.columns if c not in first and c != "geometry"]
     gdf[first + rest + ["geometry"]].to_file(out_vector, layer="classes", driver="GPKG")
@@ -1583,22 +1689,40 @@ def _add_struct_fields(out_vector: str, struct_info: dict) -> None:
 def _load_struct_info(params: dict, in_raster: str):
     """Возвращает {код: (имя, код_структ)} или None по params['struct_mode']."""
     mode = params.get("struct_mode", "off")
+    spec = (params.get("struct_table") or "").strip()
+    types = params.setdefault("_type_names", {})
+    types.clear()
     if mode == "off":
-        return None
+        # v9: таблица задана, но иерархический sieve выключен — только для полей
+        if spec and os.path.isfile(spec.split("|", 1)[0].strip()):
+            return None, _raster_codes_info(spec, in_raster, types)
+        return None, None
     if mode == "table":
-        spec = (params.get("struct_table") or "").strip()
         if not spec:
             raise ValueError("режим «по таблице», но таблица структурных классов не задана")
-        return read_struct_table(spec)
+        info = _raster_codes_info(spec, in_raster, types)
+        return info, info
+    vals = _raster_codes(in_raster)
+    info = struct_by_prefix(vals)
+    print("[struct] правило «первые две цифры типа»: "
+          + ", ".join(f"{c}->{n}" for c, (n, _) in sorted(info.items())), flush=True)
+    if spec and os.path.isfile(spec.split("|", 1)[0].strip()):
+        read_struct_table(spec, verbose=False, types_out=types)
+    return info, info
+
+
+def _raster_codes(in_raster: str):
     import rasterio
     with rasterio.open(in_raster) as src:
         a = src.read(1)
         nd = src.nodata
-    vals = np.unique(a if nd is None else a[a != nd])
-    info = struct_by_prefix(vals)
-    print("[struct] правило «первые две цифры кода»: "
-          + ", ".join(f"{c}->{n}" for c, (n, _) in sorted(info.items())), flush=True)
-    return info
+    return np.unique(a if nd is None else a[a != nd])
+
+
+def _raster_codes_info(spec: str, in_raster: str, types_out: dict) -> dict:
+    """Таблица + сопоставление с кодами растра (1110 -> 110 и т.п.)."""
+    tab = read_struct_table(spec, types_out=types_out)
+    return expand_struct_info(tab, _raster_codes(in_raster))
 
 
 def generalize_files(files: list[str], params: dict, out_base: str) -> list[str]:
@@ -1633,7 +1757,7 @@ def generalize_files(files: list[str], params: dict, out_base: str) -> list[str]
 
         t0 = time.time()
         try:
-            struct_info = _load_struct_info(params, in_raster)
+            struct_info, attr_info = _load_struct_info(params, in_raster)
         except Exception as e:
             print(f"  ! Таблица структурных классов: {e}", flush=True)
             continue
@@ -1693,10 +1817,12 @@ def generalize_files(files: list[str], params: dict, out_base: str) -> list[str]
         else:
             print("  • таблица классов не найдена — в векторе только class_value",
                   flush=True)
-        if struct_info:
+        if attr_info is not None:
             try:
-                _add_struct_fields(out_vector, struct_info)
-                print("  ✓ Добавлены поля struct_class, struct_code", flush=True)
+                _add_struct_fields(out_vector, attr_info, params.get("_type_names"),
+                                   parse_geomorph_names(params.get("geomorph_names", "")))
+                print(f"  ✓ Добавлены поля {FLD_STRUCT}, {FLD_GEO}, {FLD_TYPE}, "
+                      f"{FLD_GEOTYPE}", flush=True)
             except Exception as e:
                 print(f"  ! Не удалось добавить поля структурного класса: {e}", flush=True)
 
@@ -1705,7 +1831,8 @@ def generalize_files(files: list[str], params: dict, out_base: str) -> list[str]
             f.write(f"Запуск       : {stamp}\n")
             f.write(f"Входной растр: {in_raster}\n")
             for key, val in params.items():
-                f.write(f"  {key:12s}= {val}\n")
+                if not key.startswith("_"):
+                    f.write(f"  {key:12s}= {val}\n")
             f.write(f"Вектор       : {os.path.basename(out_vector)}\n")
             if out_raster and not tmp_raster:
                 f.write(f"Растр        : {os.path.basename(out_raster)}\n")
@@ -1743,16 +1870,17 @@ def _read_last_struct(root_dir: str):
     try:
         with open(_last_struct_path(root_dir), encoding="utf-8") as f:
             lines = [x.rstrip("\n") for x in f.readlines()]
-        return {"mode": lines[0].strip(), "table": lines[1].strip() if len(lines) > 1 else ""}
+        return {"mode": lines[0].strip(), "table": lines[1].strip() if len(lines) > 1 else "",
+                "geo": lines[2].strip() if len(lines) > 2 else ""}
     except Exception:
         return None
 
 
-def _write_last_struct(root_dir: str, mode: str, table: str) -> None:
+def _write_last_struct(root_dir: str, mode: str, table: str, geo: str = "") -> None:
     try:
         os.makedirs(os.path.join(root_dir, OUT_BASE_NAME), exist_ok=True)
         with open(_last_struct_path(root_dir), "w", encoding="utf-8") as f:
-            f.write(f"{mode}\n{table}\n")
+            f.write(f"{mode}\n{table}\n{geo}\n")
     except Exception:
         pass
 
@@ -1847,10 +1975,12 @@ def _gui_dialog(root_dir: str):
     # --- структурные классы (v6) ---
     v_st_mode = tk.StringVar(value=d["struct_mode"])
     v_st_table = tk.StringVar(value=d["struct_table"])
+    v_geo_names = tk.StringVar(value=d["geomorph_names"])
     _last_st = _read_last_struct(root_dir)
     if _last_st:
         v_st_mode.set(_last_st.get("mode", "off"))
         v_st_table.set(_last_st.get("table", ""))
+        v_geo_names.set(_last_st.get("geo", ""))
     fr_st = ttk.LabelFrame(
         win, text="Структурные классы: мелкие пятна типа присоединяются к типам своего структурного класса")
     fr_st.pack(fill="x", **pad)
@@ -1868,8 +1998,13 @@ def _gui_dialog(root_dir: str):
             v_st_mode.set("table")
     ttk.Button(fr_st, text="Обзор…", command=browse_st).grid(row=1, column=2, padx=4)
     ttk.Label(fr_st, text="лист ищется по колонке «Структурный класс»; "
-              "конкретный лист: путь|имя листа").grid(
+              "конкретный лист: путь|имя листа; код 1110 = геоморфон 1 + тип 110").grid(
         row=2, column=0, columnspan=3, sticky="w", padx=6, pady=(0, 4))
+    ttk.Label(fr_st, text="Названия геоморфонов").grid(row=3, column=0, sticky="w", padx=6, pady=3)
+    ttk.Entry(fr_st, textvariable=v_geo_names, width=62).grid(row=3, column=1, sticky="we", padx=4)
+    ttk.Label(fr_st, text="первая цифра кода, например: 1=Водоразделы; 2=Склоны; "
+              "3=Долины; 4=Ложбины; 5=...  (пусто — «геоморфон N»)").grid(
+        row=4, column=0, columnspan=3, sticky="w", padx=6, pady=(0, 4))
     fr_st.columnconfigure(1, weight=1)
 
     fr_v = ttk.LabelFrame(win, text="Векторизация")
@@ -2069,6 +2204,7 @@ def _gui_dialog(root_dir: str):
                 "refs": list(ref_entries),
                 "struct_mode": v_st_mode.get(),
                 "struct_table": v_st_table.get().strip(),
+                "geomorph_names": v_geo_names.get().strip(),
             }
         except (ValueError, tk.TclError):
             messagebox.showerror("Ошибка",
@@ -2083,7 +2219,8 @@ def _gui_dialog(root_dir: str):
                                        "Выберите таблицу структурных классов "
                                        "или режим «Не учитывать».", parent=win)
                 return
-        _write_last_struct(root_dir, params["struct_mode"], params["struct_table"])
+        _write_last_struct(root_dir, params["struct_mode"], params["struct_table"],
+                           params["geomorph_names"])
         result.update(files=list(files), params=params,
                       out_base=v_out.get().strip() or os.path.join(root_dir, OUT_BASE_NAME))
         win.destroy()
@@ -2151,6 +2288,8 @@ def _console_dialog(root_dir: str):
         p["struct_mode"], p["struct_table"] = "prefix", ""
     elif raw:
         p["struct_mode"], p["struct_table"] = "table", raw
+    p["geomorph_names"] = input("  названия геоморфонов (первая цифра кода), например "
+                                "«1=Водоразделы; 2=Склоны» (Enter = «геоморфон N»): ").strip()
     p["save_raster"] = _prompt_yes("сохранить очищенный растр", False)
     return files, p, os.path.join(root_dir, OUT_BASE_NAME)
 
@@ -2266,7 +2405,8 @@ def main(argv=None):
     refs = [_parse_ref_spec(spec) for spec in a.ref]
     struct_of = None
     if a.struct_table:
-        struct_of = {c: n for c, (n, _) in read_struct_table(a.struct_table).items()}
+        _tab = expand_struct_info(read_struct_table(a.struct_table), _raster_codes(a.input))
+        struct_of = {c: n for c, (n, _) in _tab.items()}
     elif a.struct_prefix:
         import rasterio
         with rasterio.open(a.input) as _src:
