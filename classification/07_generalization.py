@@ -91,7 +91,7 @@
 
 from __future__ import annotations
 
-SCRIPT_VERSION = "v9 (коды «геоморфон + тип», текстовые поля)"
+SCRIPT_VERSION = "v10 (коды «геоморфон + тип», текстовые поля; кнопка «Запустить» закреплена внизу окна)"
 
 import argparse
 import re
@@ -1902,8 +1902,61 @@ def _gui_dialog(root_dir: str):
     win.after(500, lambda: win.attributes("-topmost", False))
     pad = {"padx": 8, "pady": 4}
 
+    # --- нижняя панель: упаковывается ПЕРВОЙ, поэтому всегда видна ---
+    fr_r = ttk.Frame(win)
+    fr_r.pack(side="bottom", fill="x", padx=8, pady=(4, 8))
+    ttk.Separator(win, orient="horizontal").pack(side="bottom", fill="x")
+    ttk.Label(fr_r, text="Ход обработки выводится в консоль.").pack(side="left")
+    ttk.Button(fr_r, text="Закрыть", command=win.destroy).pack(side="right")
+    ttk.Button(fr_r, text="Запустить", command=lambda: on_run()).pack(side="right", padx=6)
+
+    # --- прокручиваемая область параметров ---
+    fr_scroll = ttk.Frame(win)
+    fr_scroll.pack(side="top", fill="both", expand=True)
+    canvas = tk.Canvas(fr_scroll, highlightthickness=0, borderwidth=0)
+    vsb = ttk.Scrollbar(fr_scroll, orient="vertical", command=canvas.yview)
+    canvas.configure(yscrollcommand=vsb.set)
+    vsb.pack(side="right", fill="y")
+    canvas.pack(side="left", fill="both", expand=True)
+    body = ttk.Frame(canvas)
+    body_id = canvas.create_window((0, 0), window=body, anchor="nw")
+
+    def _body_resized(_e=None):
+        canvas.configure(scrollregion=canvas.bbox("all"))
+
+    def _canvas_resized(e):
+        canvas.itemconfigure(body_id, width=e.width)
+        # растягиваем содержимое по высоте, если окно выше содержимого
+        canvas.itemconfigure(body_id, height=max(e.height, body.winfo_reqheight()))
+        _body_resized()
+
+    body.bind("<Configure>", _body_resized)
+    canvas.bind("<Configure>", _canvas_resized)
+
+    def _on_wheel(e):
+        if isinstance(e.widget, (tk.Listbox,)) or str(e.widget).endswith("popdown"):
+            return
+        try:
+            if not str(e.widget).startswith(str(win)):
+                return
+        except Exception:
+            return
+        if canvas.winfo_height() >= body.winfo_reqheight():
+            return
+        if getattr(e, "num", None) == 4:
+            step = -1
+        elif getattr(e, "num", None) == 5:
+            step = 1
+        else:
+            step = -1 if e.delta > 0 else 1
+        canvas.yview_scroll(step * 3, "units")
+
+    win.bind_all("<MouseWheel>", _on_wheel)
+    win.bind_all("<Button-4>", _on_wheel)
+    win.bind_all("<Button-5>", _on_wheel)
+
     # --- файлы ---
-    fr_f = ttk.LabelFrame(win, text="Входные растры (*_cat.tif из 04_FINAL)")
+    fr_f = ttk.LabelFrame(body, text="Входные растры (*_cat.tif из 04_FINAL)")
     fr_f.pack(fill="both", expand=True, **pad)
     fr_lb = ttk.Frame(fr_f)
     fr_lb.pack(fill="both", expand=True, padx=6, pady=6)
@@ -1965,7 +2018,7 @@ def _gui_dialog(root_dir: str):
             ttk.Radiobutton(f, text=txt, variable=var, value=val).pack(side="left", padx=(0, 10))
         return f
 
-    fr_s = ttk.LabelFrame(win, text="Sieve")
+    fr_s = ttk.LabelFrame(body, text="Sieve")
     fr_s.pack(fill="x", **pad)
     ttk.Label(fr_s, text="Мин. размер группы, пикс. (0/1 — без sieve)").grid(row=0, column=0, sticky="w", padx=6, pady=3)
     ttk.Spinbox(fr_s, from_=0, to=100000, textvariable=v["min_size"], width=10).grid(row=0, column=1, sticky="w", padx=6)
@@ -1982,7 +2035,7 @@ def _gui_dialog(root_dir: str):
         v_st_table.set(_last_st.get("table", ""))
         v_geo_names.set(_last_st.get("geo", ""))
     fr_st = ttk.LabelFrame(
-        win, text="Структурные классы: мелкие пятна типа присоединяются к типам своего структурного класса")
+        body, text="Структурные классы: мелкие пятна типа присоединяются к типам своего структурного класса")
     fr_st.pack(fill="x", **pad)
     radio(fr_st, v_st_mode, [("Не учитывать", "off"), ("По таблице", "table"),
                              ("По первым двум цифрам кода", "prefix")]).grid(
@@ -2007,7 +2060,7 @@ def _gui_dialog(root_dir: str):
         row=4, column=0, columnspan=3, sticky="w", padx=6, pady=(0, 4))
     fr_st.columnconfigure(1, weight=1)
 
-    fr_v = ttk.LabelFrame(win, text="Векторизация")
+    fr_v = ttk.LabelFrame(body, text="Векторизация")
     fr_v.pack(fill="x", **pad)
     rows = [
         ("Сглаживание Чайкина, итераций (0 — выкл, обычно 1-2)",
@@ -2040,7 +2093,7 @@ def _gui_dialog(root_dir: str):
 
     # --- негенерализуемые слои ---
     fr_ref = ttk.LabelFrame(
-        win, text="Негенерализуемые слои (вода, болота): замещают классификацию, границы не меняются")
+        body, text="Негенерализуемые слои (вода, болота): замещают классификацию, границы не меняются")
     fr_ref.pack(fill="x", **pad)
     ref_entries: list[dict] = []          # [{path, layer, class_value}]
 
@@ -2164,7 +2217,7 @@ def _gui_dialog(root_dir: str):
               ).pack(side="right")
 
     # --- вывод ---
-    fr_o = ttk.LabelFrame(win, text="Результаты")
+    fr_o = ttk.LabelFrame(body, text="Результаты")
     fr_o.pack(fill="x", **pad)
     v_out = tk.StringVar(value=os.path.join(root_dir, OUT_BASE_NAME))
     ttk.Entry(fr_o, textvariable=v_out).grid(row=0, column=0, sticky="we", padx=6, pady=6)
@@ -2225,13 +2278,22 @@ def _gui_dialog(root_dir: str):
                       out_base=v_out.get().strip() or os.path.join(root_dir, OUT_BASE_NAME))
         win.destroy()
 
-    fr_r = ttk.Frame(win)
-    fr_r.pack(fill="x", **pad)
-    ttk.Label(fr_r, text="Ход обработки выводится в консоль.").pack(side="left")
-    ttk.Button(fr_r, text="Закрыть", command=win.destroy).pack(side="right")
-    ttk.Button(fr_r, text="Запустить", command=on_run).pack(side="right", padx=6)
+    # --- размер окна: не выше экрана, чтобы нижняя панель не уходила за край ---
+    win.update_idletasks()
+    scr_w, scr_h = win.winfo_screenwidth(), win.winfo_screenheight()
+    want_w = max(body.winfo_reqwidth() + vsb.winfo_reqwidth() + 4, 700)
+    want_h = body.winfo_reqheight() + fr_r.winfo_reqheight() + 20
+    w = min(want_w, scr_w - 40)
+    h = min(want_h, scr_h - 110)            # запас под панель задач и заголовок окна
+    canvas.configure(width=w - vsb.winfo_reqwidth(), height=h - fr_r.winfo_reqheight() - 20)
+    win.geometry(f"{w}x{h}+{max((scr_w - w) // 2, 0)}+{max((scr_h - h) // 2 - 30, 0)}")
+    win.minsize(700, min(320, h))
 
     win.mainloop()
+    try:
+        win.unbind_all("<MouseWheel>")
+    except Exception:
+        pass
     if not result:
         return None
     return result["files"], result["params"], result["out_base"]
