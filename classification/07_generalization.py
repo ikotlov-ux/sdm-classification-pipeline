@@ -67,13 +67,18 @@
    геоморфонов -> nodata; на каждый файл свой GPKG
    <base>_<имя геоморфонов>_..._gmN.gpkg. Геоморфоны: 1..999, 0 — нет данных.
 
-7) ТАБЛИЦА КОДОВ И ЗАМЕНЫ (v12): после генерализации каждого файла в
-   консоль выводится таблица всех кодов результата (контуров, площадь га
+7) ТАБЛИЦА КОДОВ И ЗАМЕНЫ (v12, v13 — окно): после генерализации каждого
+   файла в консоль выводится таблица всех кодов результата (контуров, площадь га
    и %, все атрибуты) и запрос пар «старый=новый» через «;»
    (1232=2232; 4110=1110). Пары применяются одновременно, соседние контуры,
    получившие одинаковый код, сливаются; поля пересчитываются, растр
    (если сохранён) перекодируется; таблица выводится снова — до Enter.
    Флажок в окне «Результаты»; CLI --replace «A=B; C=D» (без вопросов).
+   v13: при запуске через окно пары вводятся в отдельном окне «Замена
+   кодов» (таблица, поле, «Применить» — можно несколько раз, «Готово»;
+   двойной щелчок по строке подставляет код) — без поля ввода Jupyter.
+   В консоли итог замены печатается после таблицы, перед новым запросом.
+   «1232-2232» = 1232 -> 2232 (отрицательных кодов нет).
 
 4) КЛАССЫ БЕЗ РАСШИРЕНИЯ ГРАНИЦ (--no-expand): полигоны перечисленных
    классов обрезаются по пиксельным границам класса (с допуском
@@ -112,7 +117,7 @@
 
 from __future__ import annotations
 
-SCRIPT_VERSION = "v12 (таблица кодов и попарная замена после генерализации)"
+SCRIPT_VERSION = "v13 (окно замены кодов; итог замены перед запросом)"
 
 import argparse
 import re
@@ -1814,7 +1819,7 @@ def print_class_table(df) -> None:
         fmt = {}
         for c in df.columns:
             if df[c].dtype == object or str(df[c].dtype).startswith("str"):
-                w = max(len(str(c)), int(df[c].astype(str).str.len().max() or 0))
+                w = max([len(str(c))] + [len(str(x)) for x in df[c]])
                 fmt[c] = (lambda w: (lambda x: f"{str(x):<{w}}"))(w)
         print(df.to_string(index=False, formatters=fmt, justify="left"), flush=True)
     print(f"  кодов {len(df)}, контуров {int(df['Контуров'].sum())}, "
@@ -1823,20 +1828,23 @@ def print_class_table(df) -> None:
 
 def parse_replacements(text: str) -> dict:
     """«1232=2232; 4110=1110» -> {1232: 2232, 4110: 1110}. Разделители пар:
-    «;», «,», перевод строки; внутри пары: «=», «->», «:» или пробел."""
+    «;», «,», перевод строки; внутри пары — что угодно, кроме цифр:
+    «=», «->», «→», «:», «-», «–», пробел. Отрицательных кодов нет:
+    «1232-2232» — это 1232 -> 2232. Строка из чётного числа кодов через
+    пробел («1232 2232 4110 1110») читается как пары подряд."""
     mp = {}
     for part in re.split(r"[;,\n]+", text or ""):
         part = part.strip()
         if not part:
             continue
-        nums = re.findall(r"-?\d+", part)
-        if len(nums) != 2:
+        nums = [int(x) for x in re.findall(r"\d+", part)]
+        if len(nums) < 2 or len(nums) % 2:
             raise ValueError(f"не пара «старый=новый»: «{part}»")
-        a, b = int(nums[0]), int(nums[1])
-        if a in mp and mp[a] != b:
-            raise ValueError(f"код {a} указан дважды: ->{mp[a]} и ->{b}")
-        if a != b:
-            mp[a] = b
+        for a, b in zip(nums[0::2], nums[1::2]):
+            if a in mp and mp[a] != b:
+                raise ValueError(f"код {a} указан дважды: ->{mp[a]} и ->{b}")
+            if a != b:
+                mp[a] = b
     return mp
 
 
@@ -1855,6 +1863,8 @@ def apply_code_replacements(out_vector: str, mapping: dict, out_raster=None,
         print(f"    ! кода {a} нет в результате — пара {a}={mapping[a]} пропущена", flush=True)
     if not used:
         return {}
+    if verbose:
+        print("    применяю: " + "; ".join(f"{a}={b}" for a, b in used.items()), flush=True)
     cv = gdf["class_value"].astype(int)
     new_cv = cv.map(lambda v: used.get(v, v))
     targets = set(used.values())
@@ -1891,45 +1901,197 @@ def apply_code_replacements(out_vector: str, mapping: dict, out_raster=None,
     return used
 
 
+def _fmt_pairs(d: dict) -> str:
+    return "; ".join(f"{a}={b}" for a, b in d.items())
+
+
 def interactive_replace(out_vector: str, out_raster=None, refresh=None,
-                        preset: dict | None = None) -> list:
-    """Печатает таблицу кодов и спрашивает пары замен, пока не будет Enter.
+                        preset: dict | None = None, gui: bool = False) -> list:
+    """Таблица кодов и пары замен «старый=новый».
+    gui=True — отдельное окно (таблица + поле ввода + «Применить»/«Готово»);
+    при ошибке окна — консоль. В консоли итог каждой замены печатается
+    ПОСЛЕ таблицы, прямо перед следующим запросом.
     preset — замены без вопросов (CLI --replace). Возвращает список пар."""
     done = []
     if preset:
-        done.append(apply_code_replacements(out_vector, preset, out_raster, refresh))
-    while True:
+        used = apply_code_replacements(out_vector, preset, out_raster, refresh)
+        if used:
+            done.append(used)
+    try:
+        df = class_summary(out_vector)
+    except Exception as e:
+        print(f"  ! Не удалось построить таблицу кодов: {e}", flush=True)
+        return done
+    print("\n  Коды после генерализации" + (" и замен:" if done else ":"), flush=True)
+    print_class_table(df)
+    if preset is not None:
+        return done
+    if gui:
         try:
-            print("\n  Коды после генерализации" + (" и замен:" if done else ":"), flush=True)
-            print_class_table(class_summary(out_vector))
+            done += replace_dialog(out_vector, out_raster, refresh)
+            if done:
+                print("\n  Коды после замен:", flush=True)
+                print_class_table(class_summary(out_vector))
+            print("  Замены: " + (" | ".join(_fmt_pairs(d) for d in done) if done else "нет"),
+                  flush=True)
+            return done
         except Exception as e:
-            print(f"  ! Не удалось построить таблицу кодов: {e}", flush=True)
-            break
-        if preset is not None:
-            break
+            print(f"  ! Окно замен недоступно ({e}) — ввод в консоли", flush=True)
+    status = ""
+    while True:
+        if status:
+            print(status, flush=True)
         try:
             raw = input("  Замены кодов попарно «старый=новый», через «;» "
-                        "(например 1232=2232; 4110=1110), Enter — без замен: ").strip()
-        except (EOFError, OSError):
+                        "(например 1232=2232; 4110=1110), Enter — закончить: ").strip()
+        except (EOFError, OSError, KeyboardInterrupt):
             print("  • ввод недоступен — замены пропущены", flush=True)
             break
         if not raw:
+            print("  • замены закончены" + (": " + " | ".join(_fmt_pairs(d) for d in done)
+                                            if done else " (замен нет)"), flush=True)
             break
+        print(f"  получено: «{raw}»", flush=True)
         try:
             mp = parse_replacements(raw)
         except ValueError as e:
-            print(f"  ! {e}; повторите ввод", flush=True)
+            status = f"  ! {e} — введите ещё раз"
             continue
         if not mp:
+            status = "  ! пар нет (старый код равен новому) — введите ещё раз"
             continue
+        n0 = len(df)
         try:
             used = apply_code_replacements(out_vector, mp, out_raster, refresh)
         except Exception as e:
-            print(f"  ! Замена не выполнена: {e}", flush=True)
+            status = f"  ! Замена не выполнена: {type(e).__name__}: {e}"
             continue
+        skipped = {a: b for a, b in mp.items() if a not in used}
         if used:
             done.append(used)
-            print("  ✓ заменено: " + "; ".join(f"{a}={b}" for a, b in used.items()), flush=True)
+            df = class_summary(out_vector)
+            print("\n  Коды после замен:", flush=True)
+            print_class_table(df)
+        status = ("  ✓ заменено: " + _fmt_pairs(used) + f"; кодов {n0} -> {len(df)}"
+                  if used else "  ! ничего не заменено")
+        if skipped:
+            status += "\n  ! нет в результате, пропущено: " + _fmt_pairs(skipped)
+    return done
+
+
+def replace_dialog(out_vector: str, out_raster=None, refresh=None) -> list:
+    """Окно замен: таблица кодов (все атрибуты), поле «старый=новый»,
+    «Применить» (можно много раз), «Готово». Двойной щелчок по строке
+    подставляет код в поле. Возвращает список применённых пар."""
+    import tkinter as tk
+    from tkinter import ttk
+    done = []
+    win = tk.Tk()
+    win.title(f"Замена кодов — {os.path.basename(out_vector)}")
+    win.attributes("-topmost", True)
+    win.after(500, lambda: win.attributes("-topmost", False))
+    sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+    win.geometry(f"{min(1400, sw - 60)}x{min(800, sh - 120)}+20+20")
+
+    top = ttk.Frame(win)
+    top.pack(side="bottom", fill="x", padx=8, pady=6)
+    ttk.Label(top, text="Пары «старый=новый» через «;»:").grid(row=0, column=0, sticky="w")
+    v_in = tk.StringVar()
+    ent = ttk.Entry(top, textvariable=v_in, width=70)
+    ent.grid(row=0, column=1, sticky="we", padx=6)
+    v_st = tk.StringVar(value="Двойной щелчок по строке — подставить код. "
+                              "Можно применять несколько раз; «Готово» — продолжить.")
+    lab = ttk.Label(top, textvariable=v_st, foreground="#1a4d8f", wraplength=1100)
+    lab.grid(row=1, column=0, columnspan=4, sticky="w", pady=(4, 0))
+    top.columnconfigure(1, weight=1)
+
+    fr = ttk.Frame(win)
+    fr.pack(side="top", fill="both", expand=True, padx=8, pady=(8, 0))
+    tv = ttk.Treeview(fr, show="headings")
+    vs = ttk.Scrollbar(fr, orient="vertical", command=tv.yview)
+    hs = ttk.Scrollbar(fr, orient="horizontal", command=tv.xview)
+    tv.configure(yscrollcommand=vs.set, xscrollcommand=hs.set)
+    tv.grid(row=0, column=0, sticky="nsew")
+    vs.grid(row=0, column=1, sticky="ns")
+    hs.grid(row=1, column=0, sticky="we")
+    fr.rowconfigure(0, weight=1)
+    fr.columnconfigure(0, weight=1)
+
+    def fill():
+        df = class_summary(out_vector)
+        cols = [str(c) for c in df.columns]
+        tv.delete(*tv.get_children())
+        tv["columns"] = cols
+        from tkinter import font as tkfont
+        fh = tkfont.nametofont("TkHeadingFont")
+        fb = tkfont.nametofont("TkDefaultFont")
+        for c in cols:
+            longest = max([str(x) for x in df[c]] + [""], key=len)
+            w = max(fh.measure(c) + 18, fb.measure(longest) + 14)
+            tv.heading(c, text=c)
+            tv.column(c, width=min(max(w, 50), 460),
+                      anchor="w" if df[c].dtype == object or str(df[c].dtype).startswith("str")
+                      else "e", stretch=False)
+        for row in df.itertuples(index=False):
+            tv.insert("", "end", values=["" if (isinstance(x, float) and np.isnan(x))
+                                         or x is None or str(x) == "<NA>" else x for x in row])
+        return df
+
+    state = {"df": fill()}
+
+    def on_dbl(_e):
+        it = tv.focus()
+        if not it:
+            return
+        code = tv.item(it, "values")[0]
+        cur = v_in.get().rstrip()
+        if cur and not cur.endswith((";", "=")):
+            cur += "; "
+        v_in.set(f"{cur}{code}" + ("" if cur.endswith("=") else "="))
+        ent.focus_set()
+        ent.icursor("end")
+
+    tv.bind("<Double-1>", on_dbl)
+
+    def apply(_e=None):
+        raw = v_in.get().strip()
+        if not raw:
+            v_st.set("Поле пустое: введите пары, например 1232=2232; 4110=1110")
+            return
+        try:
+            mp = parse_replacements(raw)
+        except ValueError as e:
+            v_st.set(f"Ошибка: {e}")
+            return
+        if not mp:
+            v_st.set("Пар нет (старый код равен новому)")
+            return
+        n0 = len(state["df"])
+        win.config(cursor="watch")
+        win.update()
+        try:
+            used = apply_code_replacements(out_vector, mp, out_raster, refresh)
+        except Exception as e:
+            v_st.set(f"Замена не выполнена: {type(e).__name__}: {e}")
+            win.config(cursor="")
+            return
+        win.config(cursor="")
+        skipped = {a: b for a, b in mp.items() if a not in used}
+        msg = []
+        if used:
+            done.append(used)
+            state["df"] = fill()
+            msg.append(f"Заменено: {_fmt_pairs(used)}; кодов {n0} -> {len(state['df'])}")
+            v_in.set("")
+        if skipped:
+            msg.append(f"Нет в результате, пропущено: {_fmt_pairs(skipped)}")
+        v_st.set(".  ".join(msg) or "Ничего не заменено")
+
+    ttk.Button(top, text="Применить", command=apply).grid(row=0, column=2, padx=4)
+    ttk.Button(top, text="Готово", command=win.destroy).grid(row=0, column=3, padx=4)
+    ent.bind("<Return>", apply)
+    ent.focus_set()
+    win.mainloop()
     return done
 
 
@@ -2178,7 +2340,8 @@ def generalize_files(files: list[str], params: dict, out_base: str) -> list[str]
             if params.get("ask_replace", True) or preset:
                 kept_raster = out_raster if (out_raster and not tmp_raster) else None
                 replaced = interactive_replace(out_vector, kept_raster, _refresh,
-                                               preset=preset if preset else None)
+                                               preset=preset if preset else None,
+                                               gui=bool(params.get("_gui")))
 
             with open(os.path.join(out_dir, "run_info.txt"), "a", encoding="utf-8") as f:
                 f.write("07 - Generalization (sieve + marching squares)\n")
@@ -2668,8 +2831,8 @@ def _gui_dialog(root_dir: str):
                     variable=v["save_raster"]).grid(row=1, column=0, columnspan=2,
                                                     sticky="w", padx=6, pady=(0, 2))
     v_ask_rep = tk.BooleanVar(value=d["ask_replace"])
-    ttk.Checkbutton(fr_o, text="После генерализации показать таблицу кодов в консоли и "
-                    "спросить замены «старый=новый»",
+    ttk.Checkbutton(fr_o, text="После генерализации показать таблицу кодов и "
+                    "спросить замены «старый=новый» (в отдельном окне)",
                     variable=v_ask_rep).grid(row=2, column=0, columnspan=2,
                                              sticky="w", padx=6, pady=(0, 6))
     fr_o.columnconfigure(0, weight=1)
@@ -2831,8 +2994,10 @@ def _run_interactive():
     line = "=" * 60
     print(f"\n{line}\n  07 - ГЕНЕРАЛИЗАЦИЯ (sieve + marching squares), версия {SCRIPT_VERSION}\n{line}", flush=True)
     print(f"Рабочая папка: {root_dir}", flush=True)
+    gui_ok = False
     try:
         choice = _gui_dialog(root_dir)
+        gui_ok = True
         if choice is None:
             print("Окно закрыто без запуска.", flush=True)
             return
@@ -2841,6 +3006,8 @@ def _run_interactive():
         choice = _console_dialog(root_dir)
 
     files, params, out_base = choice
+    if gui_ok:
+        params["_gui"] = True          # замены кодов — в окне, не через input()
     print(f"\nФайлов: {len(files)}", flush=True)
     for key, val in params.items():
         print(f"  {key:12s}= {val}", flush=True)
