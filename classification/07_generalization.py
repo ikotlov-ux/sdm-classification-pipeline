@@ -67,6 +67,14 @@
    геоморфонов -> nodata; на каждый файл свой GPKG
    <base>_<имя геоморфонов>_..._gmN.gpkg. Геоморфоны: 1..999, 0 — нет данных.
 
+7) ТАБЛИЦА КОДОВ И ЗАМЕНЫ (v12): после генерализации каждого файла в
+   консоль выводится таблица всех кодов результата (контуров, площадь га
+   и %, все атрибуты) и запрос пар «старый=новый» через «;»
+   (1232=2232; 4110=1110). Пары применяются одновременно, соседние контуры,
+   получившие одинаковый код, сливаются; поля пересчитываются, растр
+   (если сохранён) перекодируется; таблица выводится снова — до Enter.
+   Флажок в окне «Результаты»; CLI --replace «A=B; C=D» (без вопросов).
+
 4) КЛАССЫ БЕЗ РАСШИРЕНИЯ ГРАНИЦ (--no-expand): полигоны перечисленных
    классов обрезаются по пиксельным границам класса (с допуском
    --expand-tol пикселей) — для классов, у которых нет векторного слоя.
@@ -104,7 +112,7 @@
 
 from __future__ import annotations
 
-SCRIPT_VERSION = "v11 (присоединение геоморфонов после генерализации)"
+SCRIPT_VERSION = "v12 (таблица кодов и попарная замена после генерализации)"
 
 import argparse
 import re
@@ -1732,6 +1740,8 @@ def _default_params() -> dict:
         "workers": 1 if _in_notebook() else min(cap, 8),
         "output_mode": "patch",
         "save_raster": False,   # по умолчанию только вектор
+        "ask_replace": True,    # v12: таблица кодов и вопрос о заменах после генерализации
+        "replace": "",          # v12: замены без вопросов, «1232=2232; 4110=1110»
         "no_expand": [],        # классы, границы которых нельзя расширять
         "expand_tol": 0.0,      # допуск расширения, пикселей (0 = строго)
         "refs": [],             # негенерализуемые слои [{path, layer, class_value}]
@@ -1766,6 +1776,161 @@ def _make_tag(p: dict) -> str:
     if p.get("geomorph_paths"):
         tag += f"_gm{p.get('geomorph_min', 0)}"
     return tag
+
+
+# ---------------------------------------------------------------------------
+# v12: ТАБЛИЦА КОДОВ И ПОПАРНАЯ ЗАМЕНА ПОСЛЕ ГЕНЕРАЛИЗАЦИИ
+# ---------------------------------------------------------------------------
+
+def class_summary(out_vector: str):
+    """Сводка по кодам GPKG: число контуров, площадь (га, %), все атрибуты."""
+    import pandas as pd
+    import pyogrio
+    df = pyogrio.read_dataframe(out_vector, layer="classes", read_geometry=True)
+    df["_a"] = df.geometry.area
+    df = pd.DataFrame(df.drop(columns="geometry"))
+    attrs = [c for c in df.columns if c not in ("class_value", "area", "_a")]
+    g = df.groupby("class_value", sort=True)
+    out = pd.DataFrame({"Контуров": g.size(),
+                        "Площадь_га": (g["_a"].sum() / 1e4).round(2)})
+    tot = out["Площадь_га"].sum()
+    out["Доля_%"] = (out["Площадь_га"] / tot * 100).round(2) if tot else 0.0
+    order = ["class_name", "struct_code", FLD_STRUCT, "geomorph_code", FLD_GEO,
+             "type_code", FLD_TYPE, FLD_GEOTYPE]
+    attrs = [c for c in order if c in attrs] + [c for c in attrs if c not in order]
+    for c in attrs:
+        out[c] = g[c].first()
+    for c in ("struct_code", "geomorph_code", "type_code"):
+        if c in out.columns:
+            out[c] = out[c].astype("Int64")
+    out.index.name = "Код"
+    return out.reset_index()
+
+
+def print_class_table(df) -> None:
+    import pandas as pd
+    with pd.option_context("display.max_rows", None, "display.max_columns", None,
+                           "display.width", 10000, "display.max_colwidth", None):
+        fmt = {}
+        for c in df.columns:
+            if df[c].dtype == object or str(df[c].dtype).startswith("str"):
+                w = max(len(str(c)), int(df[c].astype(str).str.len().max() or 0))
+                fmt[c] = (lambda w: (lambda x: f"{str(x):<{w}}"))(w)
+        print(df.to_string(index=False, formatters=fmt, justify="left"), flush=True)
+    print(f"  кодов {len(df)}, контуров {int(df['Контуров'].sum())}, "
+          f"площадь {df['Площадь_га'].sum():.2f} га", flush=True)
+
+
+def parse_replacements(text: str) -> dict:
+    """«1232=2232; 4110=1110» -> {1232: 2232, 4110: 1110}. Разделители пар:
+    «;», «,», перевод строки; внутри пары: «=», «->», «:» или пробел."""
+    mp = {}
+    for part in re.split(r"[;,\n]+", text or ""):
+        part = part.strip()
+        if not part:
+            continue
+        nums = re.findall(r"-?\d+", part)
+        if len(nums) != 2:
+            raise ValueError(f"не пара «старый=новый»: «{part}»")
+        a, b = int(nums[0]), int(nums[1])
+        if a in mp and mp[a] != b:
+            raise ValueError(f"код {a} указан дважды: ->{mp[a]} и ->{b}")
+        if a != b:
+            mp[a] = b
+    return mp
+
+
+def apply_code_replacements(out_vector: str, mapping: dict, out_raster=None,
+                            refresh=None, verbose=True) -> dict:
+    """Заменяет коды в GPKG (и в сохранённом растре). Все пары применяются
+    одновременно (не по цепочке). Соседние контуры, получившие одинаковый
+    код, сливаются (общие границы совпадают, т.к. сеть линий общая).
+    refresh() — пересчёт текстовых полей. Возвращает реально применённые пары."""
+    import geopandas as gpd
+    import shapely
+    gdf = gpd.read_file(out_vector, layer="classes")
+    present = set(gdf["class_value"].astype(int).unique().tolist())
+    used = {a: b for a, b in mapping.items() if a in present}
+    for a in sorted(set(mapping) - set(used)):
+        print(f"    ! кода {a} нет в результате — пара {a}={mapping[a]} пропущена", flush=True)
+    if not used:
+        return {}
+    cv = gdf["class_value"].astype(int)
+    new_cv = cv.map(lambda v: used.get(v, v))
+    targets = set(used.values())
+    keep = gdf.loc[~new_cv.isin(targets), ["geometry"]].copy()
+    keep["class_value"] = new_cv[~new_cv.isin(targets)].values
+    parts = [keep]
+    for t in sorted(targets):
+        geoms = gdf.geometry[new_cv == t].values
+        u = shapely.union_all(shapely.make_valid(geoms), grid_size=None)
+        u = shapely.make_valid(u)
+        polys = [g for g in shapely.get_parts(u) if g.geom_type == "Polygon" and not g.is_empty]
+        if verbose:
+            print(f"    код {t}: контуров {len(geoms)} -> {len(polys)} после слияния", flush=True)
+        parts.append(gpd.GeoDataFrame({"class_value": [t] * len(polys)},
+                                      geometry=polys, crs=gdf.crs))
+    import pandas as pd
+    res = gpd.GeoDataFrame(pd.concat(parts, ignore_index=True), geometry="geometry", crs=gdf.crs)
+    res = res.sort_values("class_value", kind="stable").reset_index(drop=True)
+    res["class_value"] = res["class_value"].astype("int32")
+    res["area"] = res.geometry.area
+    res[["class_value", "area", "geometry"]].to_file(out_vector, layer="classes", driver="GPKG")
+    if refresh:
+        refresh()
+    if out_raster and os.path.isfile(out_raster):
+        import rasterio
+        with rasterio.open(out_raster, "r+") as r:
+            arr = r.read(1)
+            new = arr.copy()
+            for a, b in used.items():
+                new[arr == a] = b
+            r.write(new.astype(arr.dtype), 1)
+        if verbose:
+            print(f"    растр {os.path.basename(out_raster)}: замены применены", flush=True)
+    return used
+
+
+def interactive_replace(out_vector: str, out_raster=None, refresh=None,
+                        preset: dict | None = None) -> list:
+    """Печатает таблицу кодов и спрашивает пары замен, пока не будет Enter.
+    preset — замены без вопросов (CLI --replace). Возвращает список пар."""
+    done = []
+    if preset:
+        done.append(apply_code_replacements(out_vector, preset, out_raster, refresh))
+    while True:
+        try:
+            print("\n  Коды после генерализации" + (" и замен:" if done else ":"), flush=True)
+            print_class_table(class_summary(out_vector))
+        except Exception as e:
+            print(f"  ! Не удалось построить таблицу кодов: {e}", flush=True)
+            break
+        if preset is not None:
+            break
+        try:
+            raw = input("  Замены кодов попарно «старый=новый», через «;» "
+                        "(например 1232=2232; 4110=1110), Enter — без замен: ").strip()
+        except (EOFError, OSError):
+            print("  • ввод недоступен — замены пропущены", flush=True)
+            break
+        if not raw:
+            break
+        try:
+            mp = parse_replacements(raw)
+        except ValueError as e:
+            print(f"  ! {e}; повторите ввод", flush=True)
+            continue
+        if not mp:
+            continue
+        try:
+            used = apply_code_replacements(out_vector, mp, out_raster, refresh)
+        except Exception as e:
+            print(f"  ! Замена не выполнена: {e}", flush=True)
+            continue
+        if used:
+            done.append(used)
+            print("  ✓ заменено: " + "; ".join(f"{a}={b}" for a, b in used.items()), flush=True)
+    return done
 
 
 def _add_class_names(out_vector: str, id_to_name: dict) -> None:
@@ -1983,8 +2148,17 @@ def generalize_files(files: list[str], params: dict, out_base: str) -> list[str]
                 print("  • таблица классов не найдена — в векторе только class_value",
                       flush=True)
             fields_info = attr_info if attr_info is not None else ({} if gps else None)
+            gnames = params.get("geomorph_names", "") or (DEFAULT_GEOMORPH_NAMES if gps else "")
+
+            def _refresh(fields_info=fields_info, gnames=gnames, id_to_name=id_to_name,
+                         gps=gps, out_vector=out_vector):
+                if id_to_name and not gps:
+                    _add_class_names(out_vector, id_to_name)
+                if fields_info is not None:
+                    _add_struct_fields(out_vector, fields_info, params.get("_type_names"),
+                                       parse_geomorph_names(gnames))
+
             if fields_info is not None:
-                gnames = params.get("geomorph_names", "") or (DEFAULT_GEOMORPH_NAMES if gps else "")
                 try:
                     _add_struct_fields(out_vector, fields_info, params.get("_type_names"),
                                        parse_geomorph_names(gnames))
@@ -1992,6 +2166,19 @@ def generalize_files(files: list[str], params: dict, out_base: str) -> list[str]
                           f"{FLD_GEOTYPE}", flush=True)
                 except Exception as e:
                     print(f"  ! Не удалось добавить поля структурного класса: {e}", flush=True)
+
+            # v12: таблица кодов и попарная замена
+            replaced = []
+            preset = None
+            if params.get("replace"):
+                try:
+                    preset = parse_replacements(params["replace"])
+                except ValueError as e:
+                    print(f"  ! Замены «{params['replace']}»: {e}", flush=True)
+            if params.get("ask_replace", True) or preset:
+                kept_raster = out_raster if (out_raster and not tmp_raster) else None
+                replaced = interactive_replace(out_vector, kept_raster, _refresh,
+                                               preset=preset if preset else None)
 
             with open(os.path.join(out_dir, "run_info.txt"), "a", encoding="utf-8") as f:
                 f.write("07 - Generalization (sieve + marching squares)\n")
@@ -2005,6 +2192,9 @@ def generalize_files(files: list[str], params: dict, out_base: str) -> list[str]
                     if not key.startswith("_"):
                         f.write(f"  {key:12s}= {val}\n")
                 f.write(f"Вектор       : {os.path.basename(out_vector)}\n")
+                if replaced:
+                    f.write("Замены кодов : " + " | ".join(
+                        "; ".join(f"{a}={b}" for a, b in r.items()) for r in replaced) + "\n")
                 if out_raster and not tmp_raster:
                     f.write(f"Растр        : {os.path.basename(out_raster)}\n")
                 f.write(f"Время работы : {dt / 60:.1f} мин\n\n")
@@ -2476,7 +2666,12 @@ def _gui_dialog(root_dir: str):
     ttk.Button(fr_o, text="Обзор…", command=choose_out).grid(row=0, column=1, padx=6)
     ttk.Checkbutton(fr_o, text="Сохранить также очищенный растр (*_cat.tif)",
                     variable=v["save_raster"]).grid(row=1, column=0, columnspan=2,
-                                                    sticky="w", padx=6, pady=(0, 6))
+                                                    sticky="w", padx=6, pady=(0, 2))
+    v_ask_rep = tk.BooleanVar(value=d["ask_replace"])
+    ttk.Checkbutton(fr_o, text="После генерализации показать таблицу кодов в консоли и "
+                    "спросить замены «старый=новый»",
+                    variable=v_ask_rep).grid(row=2, column=0, columnspan=2,
+                                             sticky="w", padx=6, pady=(0, 6))
     fr_o.columnconfigure(0, weight=1)
 
     def on_run():
@@ -2506,6 +2701,7 @@ def _gui_dialog(root_dir: str):
                 "geomorph_paths": list(gm_files) if v_gm_on.get() else [],
                 "geomorph_min": int(v_gm_min.get()),
                 "geomorph_clip": bool(v_gm_clip.get()),
+                "ask_replace": bool(v_ask_rep.get()),
             }
         except (ValueError, tk.TclError):
             messagebox.showerror("Ошибка",
@@ -2625,6 +2821,8 @@ def _console_dialog(root_dir: str):
                                 "«1=Водоразделы; 2=Склоны» (Enter = "
                                 + ("по умолчанию" if gm else "«геоморфон N»") + "): ").strip()
     p["save_raster"] = _prompt_yes("сохранить очищенный растр", False)
+    p["ask_replace"] = _prompt_yes("после генерализации показать таблицу кодов "
+                                   "и спросить замены", True)
     return files, p, os.path.join(root_dir, OUT_BASE_NAME)
 
 
@@ -2733,6 +2931,9 @@ def main(argv=None):
                    help="мин. участок геоморфона внутри типа, пикс.")
     p.add_argument("--geomorph-clip", action="store_true",
                    help="вне охвата геоморфонов — nodata")
+    p.add_argument("--replace", default="", metavar="«A=B; C=D»",
+                   help="v12: заменить коды в результате попарно (одновременно), "
+                        "соседние контуры с одинаковым кодом сливаются")
     p.add_argument("--skip-vector", action="store_true")
     p.add_argument("--resume", action="store_true",
                    help="не удалять уже посчитанные тайлы")
@@ -2760,6 +2961,9 @@ def main(argv=None):
         verbose=not a.quiet, struct_of=struct_of,
         geomorph=({"paths": a.geomorph, "min_size": a.geomorph_min,
                    "clip": a.geomorph_clip} if a.geomorph else None))
+    if a.replace and a.out_vector and not a.skip_vector:
+        interactive_replace(a.out_vector, a.out_raster, None,
+                            preset=parse_replacements(a.replace))
 
 
 if __name__ == "__main__":
