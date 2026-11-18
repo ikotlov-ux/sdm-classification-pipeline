@@ -54,6 +54,19 @@
    type_code. Названия геоморфонов — «1=...; 2=...» (окно, --geomorph-names).
    Поля добавляются и при режиме «Не учитывать», если таблица указана.
 
+6) ГЕОМОРФОНЫ (v11, блок «Геоморфоны» в окне, --geomorph): присоединяются
+   ПОСЛЕ генерализации типов, код = геоморфон * 1000 + тип (как в
+   калькуляторе растров). Порядок «после» выбран потому, что геоморфоны не
+   дробят типы: границы типов и структурных классов остаются такими же, как
+   при генерализации без геоморфонов. Растр геоморфонов переводится на
+   сетку классификации методом mode (преобладающее значение), затем мелкие
+   участки геоморфона (< «мин. участок») внутри ОДНОГО типа получают
+   преобладающий соседний геоморфон того же типа — тип не меняется.
+   «Только в охвате геоморфонов»: для каждого файла геоморфонов вырезается
+   окно классификации (с запасом 64 пикс.), после генерализации всё вне
+   геоморфонов -> nodata; на каждый файл свой GPKG
+   <base>_<имя геоморфонов>_..._gmN.gpkg. Геоморфоны: 1..999, 0 — нет данных.
+
 4) КЛАССЫ БЕЗ РАСШИРЕНИЯ ГРАНИЦ (--no-expand): полигоны перечисленных
    классов обрезаются по пиксельным границам класса (с допуском
    --expand-tol пикселей) — для классов, у которых нет векторного слоя.
@@ -91,7 +104,7 @@
 
 from __future__ import annotations
 
-SCRIPT_VERSION = "v10 (коды «геоморфон + тип», текстовые поля; кнопка «Запустить» закреплена внизу окна)"
+SCRIPT_VERSION = "v11 (присоединение геоморфонов после генерализации)"
 
 import argparse
 import re
@@ -571,6 +584,104 @@ def parse_geomorph_names(text: str) -> dict:
             if k is not None and v.strip():
                 out[k] = v.strip()
     return out
+
+
+# ---------------------------------------------------------------------------
+# v11: ПРИСОЕДИНЕНИЕ ГЕОМОРФОНОВ (код = геоморфон * 1000 + тип)
+# ---------------------------------------------------------------------------
+# Названия по умолчанию для укрупнённых геоморфонов *_reclass_v2.tif
+# (1 — водоразделы, 2 — склоны, 3 — долины, 4 — ложбины); правятся в окне.
+DEFAULT_GEOMORPH_NAMES = ("1=Водораздельные и слабодренированные поверхности; "
+                          "2=Склоны; 3=Долины постоянных водотоков; "
+                          "4=Ложбины временных водотоков и водосборные понижения")
+
+
+def read_geomorph_on_grid(paths, dst_shape, dst_transform, dst_crs, verbose=True):
+    """Растры геоморфонов (один или несколько) на сетке классификации.
+    Передискретизация — mode (преобладающий геоморфон в пикселе); 0 — нет
+    данных. При перекрытии файлов приоритет у первого в списке."""
+    import rasterio
+    from rasterio.warp import reproject, Resampling
+    G = np.zeros(dst_shape, np.int32)
+    for pth in paths:
+        with rasterio.open(pth) as src:
+            tmp = np.zeros(dst_shape, np.int32)
+            nd = src.nodata if src.nodata is not None else 0
+            reproject(rasterio.band(src, 1), tmp, src_nodata=nd, dst_nodata=0,
+                      dst_transform=dst_transform, dst_crs=dst_crs,
+                      resampling=Resampling.mode)
+        tmp[(tmp < 0) | (tmp > 999)] = 0
+        put = (G == 0) & (tmp > 0)
+        G[put] = tmp[put]
+        if verbose:
+            v, c = np.unique(tmp[tmp > 0], return_counts=True)
+            print(f"[geomorph] {os.path.basename(pth)}: пикселей на сетке {int(c.sum())}, "
+                  f"значения {dict(zip(v.tolist(), c.tolist()))}", flush=True)
+    return G
+
+
+def join_geomorph(cleaned, G, nodata_mask, min_geo, connectivity, verbose=True):
+    """Код = геоморфон * 1000 + тип. Затем мелкие участки геоморфона
+    (< min_geo пикс.) внутри одного типа получают преобладающий соседний
+    геоморфон ТОГО ЖЕ типа: тип и границы типов не меняются."""
+    valid = np.ones(cleaned.shape, bool) if nodata_mask is None else ~nodata_mask
+    t = cleaned.astype(np.int32)
+    if valid.any() and int(t[valid].max()) >= 1000:
+        raise ValueError("коды классификации уже четырёхзначные (>= 1000) — "
+                         "геоморфоны присоединяются к трёхзначным типам")
+    has = valid & (G > 0)
+    comb = t.copy()
+    comb[has] = G[has] * 1000 + t[has]
+    if verbose:
+        print(f"[geomorph] присоединено к {int(has.sum())} из {int(valid.sum())} пикс.; "
+              f"без геоморфона {int((valid & ~has).sum())}", flush=True)
+    if min_geo and min_geo > 1:
+        grp = np.where(valid, t, -1).astype(np.int32)
+        before = comb.copy()
+        # пиксели без геоморфона в sieve не участвуют: мелкий участок
+        # геоморфона не может «раствориться» в пикселях без геоморфона
+        comb = sieve_majority_fast(comb, min_geo, connectivity, ~has,
+                                   verbose=False, group=grp)
+        if verbose:
+            ch = int((comb != before).sum())
+            tt = int(((comb % 1000) != (before % 1000))[valid].sum())
+            print(f"[geomorph] sieve геоморфонов внутри типов, min_size={min_geo}: "
+                  f"изменён геоморфон у {ch} пикс.; изменён тип у {tt} пикс.", flush=True)
+    return comb
+
+
+def crop_to_geomorph(in_raster, geo_path, out_tif, pad=64, verbose=True):
+    """Вырезает из классификации окно по охвату растра геоморфонов с запасом
+    pad пикс. (чтобы генерализация у края охвата шла так же, как на полном
+    растре). Маска «вне геоморфонов -> nodata» ставится уже ПОСЛЕ
+    генерализации (run, geomorph['clip']). Возвращает путь out_tif."""
+    import rasterio
+    from rasterio.warp import transform_bounds
+    from rasterio.windows import from_bounds, Window
+    with rasterio.open(geo_path) as g:
+        gb, gcrs = g.bounds, g.crs
+    with rasterio.open(in_raster) as src:
+        b = transform_bounds(gcrs, src.crs, *gb) if gcrs != src.crs else tuple(gb)
+        win = from_bounds(*b, transform=src.transform)
+        win = win.round_offsets(op="floor").round_lengths(op="ceil")
+        win = Window(win.col_off - pad, win.row_off - pad,
+                     win.width + 2 * pad, win.height + 2 * pad)
+        win = win.intersection(Window(0, 0, src.width, src.height))
+        arr = src.read(1, window=win)
+        tr = src.window_transform(win)
+        prof = src.profile.copy()
+        nodata = src.nodata
+    if nodata is None:
+        nodata = -9999 if np.issubdtype(arr.dtype, np.signedinteger) else 0
+    G = read_geomorph_on_grid([geo_path], arr.shape, tr, prof["crs"], verbose=False)
+    prof.update(width=arr.shape[1], height=arr.shape[0], transform=tr, nodata=nodata,
+                compress="lzw", tiled=True, blockxsize=256, blockysize=256)
+    with rasterio.open(out_tif, "w", **prof) as dst:
+        dst.write(arr, 1)
+    if verbose:
+        print(f"[geomorph] охват {os.path.basename(geo_path)}: окно {arr.shape}, "
+              f"пикселей с геоморфоном {int((G > 0).sum())}", flush=True)
+    return out_tif
 
 
 def sieve_structural(arr: np.ndarray, min_size: int, connectivity: int = 4,
@@ -1381,7 +1492,7 @@ def run(in_raster, min_size=3, connectivity=8, out_raster=None,
         repair=True, tile=256, margin=16, no_expand=None, expand_tol=0.0,
         refs=None, workers=1, output_mode="patch",
         layer="classes", skip_vector=False, resume=False, verbose=True,
-        struct_of=None):
+        struct_of=None, geomorph=None):
     """struct_of (v6): {код_типа: имя_структурного_класса} — иерархический
     sieve, сохраняющий структурные классы; None — обычный sieve."""
     import rasterio
@@ -1391,7 +1502,9 @@ def run(in_raster, min_size=3, connectivity=8, out_raster=None,
     erase_classes = sorted({int(c) for ref in (refs or []) for c in
                             (ref.get("erase") or [ref["class_value"]])})
 
-    if (min_size and min_size > 1) or erase_classes:
+    # geomorph (v11): {"paths": [...], "min_size": N} — присоединить геоморфоны
+    # ПОСЛЕ генерализации типов (код = геоморфон * 1000 + тип)
+    if (min_size and min_size > 1) or erase_classes or geomorph:
         with rasterio.open(in_raster) as src:
             arr = src.read(1)
             profile = src.profile
@@ -1423,6 +1536,28 @@ def run(in_raster, min_size=3, connectivity=8, out_raster=None,
         if erase_classes and verbose:
             print(f"[erase] остаток стираемых классов в растре: "
                   f"{int(np.isin(cleaned, erase_classes).sum())} пикс.")
+        if geomorph and geomorph.get("paths"):
+            G = read_geomorph_on_grid(geomorph["paths"], cleaned.shape,
+                                      profile["transform"], profile["crs"], verbose)
+            cleaned = join_geomorph(cleaned, G, nd, geomorph.get("min_size", min_size),
+                                    connectivity, verbose)
+            if geomorph.get("clip"):
+                # только охват геоморфонов: остальное — nodata
+                if nodata is None:
+                    nodata = -9999
+                    profile["nodata"] = nodata
+                outside = (G == 0)
+                nd = outside if nd is None else (nd | outside)
+                if verbose:
+                    print(f"[geomorph] вне охвата геоморфонов -> nodata: "
+                          f"{int(outside.sum())} пикс.", flush=True)
+            del G
+            if int(cleaned.max()) > 32767 or int(cleaned.min()) < -32768:
+                cleaned = cleaned.astype(np.int32)
+            else:
+                cleaned = cleaned.astype(np.int16)
+            if nodata is not None and nd is not None:
+                cleaned[nd] = nodata
         if out_raster:
             profile.update(count=1, dtype=cleaned.dtype, compress="lzw",
                            tiled=True, blockxsize=512, blockysize=512)
@@ -1603,6 +1738,9 @@ def _default_params() -> dict:
         "struct_mode": "off",   # v6: off / table / prefix — сохранять структурные классы
         "struct_table": "",     # v6: XLSX/CSV «тип -> структурный класс» («путь|лист»)
         "geomorph_names": "",   # v9: «1=Водоразделы; 2=Склоны; ...» — первая цифра кода
+        "geomorph_paths": [],   # v11: растры геоморфонов (присоединяются после генерализации)
+        "geomorph_min": 10,     # v11: мин. участок геоморфона внутри типа, пикс.
+        "geomorph_clip": True,  # v11: только охват геоморфонов, отдельный GPKG на файл
     }
 
 
@@ -1625,6 +1763,8 @@ def _make_tag(p: dict) -> str:
         tag += "_ref" + "-".join(str(int(r_["class_value"])) for r_ in p["refs"])
     if p.get("struct_mode", "off") != "off":
         tag += "_st"
+    if p.get("geomorph_paths"):
+        tag += f"_gm{p.get('geomorph_min', 0)}"
     return tag
 
 
@@ -1657,7 +1797,7 @@ def _add_struct_fields(out_vector: str, struct_info: dict, type_names=None,
     tcode = cv.map(lambda v: split_code(v)[1])
 
     def _st(v):
-        r = struct_info.get(int(v))
+        r = struct_info.get(int(v)) or struct_info.get(split_code(v)[1])
         if not r:
             return (f"код {int(v)}", None)
         # в таблице код структурного класса указан не у всех групп — тип // 10
@@ -1675,7 +1815,7 @@ def _add_struct_fields(out_vector: str, struct_info: dict, type_names=None,
     gdf[FLD_STRUCT] = cv.map(lambda v: _st(v)[0])
     gdf[FLD_TYPE] = cv.map(_tn)
     gdf[FLD_GEO] = gcode.map(_gn)
-    gdf[FLD_GEOTYPE] = [f"{g} — {t}" if g else t for g, t in zip(gdf[FLD_GEO], gdf[FLD_TYPE])]
+    gdf[FLD_GEOTYPE] = [f"{g} — {t}" if isinstance(g, str) and g else t for g, t in zip(gdf[FLD_GEO], gdf[FLD_TYPE])]
     gdf["struct_code"] = cv.map(lambda v: _st(v)[1])
     gdf["geomorph_code"] = gcode
     gdf["type_code"] = tcode
@@ -1725,37 +1865,32 @@ def _raster_codes_info(spec: str, in_raster: str, types_out: dict) -> dict:
     return expand_struct_info(tab, _raster_codes(in_raster))
 
 
+def _geo_stem(path: str) -> str:
+    st = os.path.splitext(os.path.basename(path))[0]
+    return re.sub(r"_reclass.*$", "", st) or st
+
+
 def generalize_files(files: list[str], params: dict, out_base: str) -> list[str]:
-    """Обрабатывает растры по очереди. Возвращает список созданных GPKG."""
+    """Обрабатывает растры по очереди. Возвращает список созданных GPKG.
+    v11: если заданы геоморфоны (params['geomorph_paths']), они
+    присоединяются ПОСЛЕ генерализации типов; при geomorph_clip каждый
+    файл геоморфонов даёт отдельный GPKG в своём охвате."""
     line = "=" * 60
     os.makedirs(out_base, exist_ok=True)
     stamp = datetime.now().strftime("%d%m%y_%H%M")
     tag = _make_tag(params)
     created = []
+    geo_paths = [g for g in (params.get("geomorph_paths") or []) if g]
+    geo_clip = bool(params.get("geomorph_clip", True))
 
     for k, in_raster in enumerate(files, 1):
         print(f"\n{line}\n  [{k}/{len(files)}] {in_raster}\n{line}", flush=True)
         out_dir = os.path.join(out_base, stamp + _version_suffix(in_raster))
         os.makedirs(out_dir, exist_ok=True)
 
-        base = re.sub(r"_cat$", "", os.path.splitext(os.path.basename(in_raster))[0])
-        base = re.sub(r"_sieve\d+_c\d+_sm\d+(_dp[\d.]+)?(_norep)?$", "", base)
-        out_vector = os.path.join(out_dir, f"{base}_{tag}.gpkg")
+        base0 = re.sub(r"_cat$", "", os.path.splitext(os.path.basename(in_raster))[0])
+        base0 = re.sub(r"_sieve\d+_c\d+_sm\d+(_dp[\d.]+)?(_norep)?$", "", base0)
 
-        # refs по умолчанию стирают свой класс (см. run) — нужен растр на диске
-        do_sieve = (params["min_size"] > 1
-                    or bool(params.get("refs")))
-        out_raster = None
-        tmp_raster = False
-        if do_sieve:
-            if params["save_raster"]:
-                out_raster = os.path.join(out_dir, f"{base}_{tag}_cat.tif")
-            else:
-                # тайловая векторизация читает растр с диска — временный файл
-                out_raster = os.path.join(out_dir, f"_tmp_{base}_{tag}_sieved.tif")
-                tmp_raster = True
-
-        t0 = time.time()
         try:
             struct_info, attr_info = _load_struct_info(params, in_raster)
         except Exception as e:
@@ -1763,85 +1898,119 @@ def generalize_files(files: list[str], params: dict, out_base: str) -> list[str]
             continue
         struct_of = ({c: n for c, (n, _) in struct_info.items()}
                      if struct_info else None)
-        try:
-            run(in_raster=in_raster,
-                min_size=params["min_size"],
-                connectivity=params["connectivity"],
-                out_raster=out_raster,
-                out_vector=out_vector,
-                smooth=params["smooth"],
-                simplify=params["simplify"],
-                edge_mode=params["edge_mode"],
-                repair=params["repair"],
-                tile=params["tile"],
-                margin=params["margin"],
-                no_expand=params.get("no_expand") or None,
-                expand_tol=params.get("expand_tol", 0.0),
-                refs=params.get("refs") or None,
-                workers=params["workers"],
-                output_mode=params["output_mode"],
-                layer="classes",
-                skip_vector=False,
-                resume=False,
-                verbose=True,
-                struct_of=struct_of)
-        except Exception as e:
-            print(f"  ! Ошибка обработки {os.path.basename(in_raster)}: {e}", flush=True)
-            continue
-        finally:
-            if tmp_raster and out_raster and os.path.isfile(out_raster):
+
+        # задания: (вход, имя, геоморфоны, временный_вход)
+        jobs = []
+        if geo_paths and geo_clip:
+            for gp in geo_paths:
+                tmp_in = os.path.join(out_dir, f"_tmp_{base0}_{_geo_stem(gp)}_crop.tif")
                 try:
-                    os.remove(out_raster)
-                except OSError:
-                    pass
-        dt = time.time() - t0
-
-        if not os.path.isfile(out_vector):
-            print("  ! Вектор не создан.", flush=True)
-            continue
-
-        # промежуточные тайлы больше не нужны
-        parts = os.path.splitext(out_vector)[0] + "_parts"
-        if os.path.isdir(parts):
-            shutil.rmtree(parts, ignore_errors=True)
-
-        id_to_name = _read_class_table(os.path.dirname(in_raster))
-        if id_to_name is None:
-            id_to_name = _read_class_table(os.path.join(os.getcwd(), FINAL_BASE_NAME))
-        if id_to_name:
-            try:
-                _add_class_names(out_vector, id_to_name)
-                print("  ✓ Добавлено поле class_name", flush=True)
-            except Exception as e:
-                print(f"  ! Не удалось добавить class_name: {e}", flush=True)
+                    crop_to_geomorph(in_raster, gp, tmp_in)
+                except Exception as e:
+                    print(f"  ! Охват {os.path.basename(gp)}: {e}", flush=True)
+                    continue
+                jobs.append((tmp_in, f"{base0}_{_geo_stem(gp)}", [gp], True))
         else:
-            print("  • таблица классов не найдена — в векторе только class_value",
-                  flush=True)
-        if attr_info is not None:
+            jobs.append((in_raster, base0, geo_paths, False))
+
+        for src_in, base, gps, tmp_in in jobs:
+            if len(jobs) > 1 or tmp_in:
+                print(f"\n  --- {base} ---", flush=True)
+            out_vector = os.path.join(out_dir, f"{base}_{tag}.gpkg")
+            do_sieve = (params["min_size"] > 1 or bool(params.get("refs")) or bool(gps))
+            out_raster = None
+            tmp_raster = False
+            if do_sieve:
+                if params["save_raster"]:
+                    out_raster = os.path.join(out_dir, f"{base}_{tag}_cat.tif")
+                else:
+                    out_raster = os.path.join(out_dir, f"_tmp_{base}_{tag}_sieved.tif")
+                    tmp_raster = True
+            t0 = time.time()
             try:
-                _add_struct_fields(out_vector, attr_info, params.get("_type_names"),
-                                   parse_geomorph_names(params.get("geomorph_names", "")))
-                print(f"  ✓ Добавлены поля {FLD_STRUCT}, {FLD_GEO}, {FLD_TYPE}, "
-                      f"{FLD_GEOTYPE}", flush=True)
+                run(in_raster=src_in,
+                    min_size=params["min_size"],
+                    connectivity=params["connectivity"],
+                    out_raster=out_raster,
+                    out_vector=out_vector,
+                    smooth=params["smooth"],
+                    simplify=params["simplify"],
+                    edge_mode=params["edge_mode"],
+                    repair=params["repair"],
+                    tile=params["tile"],
+                    margin=params["margin"],
+                    no_expand=params.get("no_expand") or None,
+                    expand_tol=params.get("expand_tol", 0.0),
+                    refs=params.get("refs") or None,
+                    workers=params["workers"],
+                    output_mode=params["output_mode"],
+                    layer="classes",
+                    skip_vector=False,
+                    resume=False,
+                    verbose=True,
+                    struct_of=struct_of,
+                    geomorph=({"paths": gps, "min_size": params.get("geomorph_min", 10),
+                               "clip": tmp_in} if gps else None))
             except Exception as e:
-                print(f"  ! Не удалось добавить поля структурного класса: {e}", flush=True)
+                print(f"  ! Ошибка обработки {base}: {e}", flush=True)
+                continue
+            finally:
+                for fpath, flag in ((out_raster, tmp_raster), (src_in, tmp_in)):
+                    if flag and fpath and os.path.isfile(fpath):
+                        try:
+                            os.remove(fpath)
+                        except OSError:
+                            pass
+            dt = time.time() - t0
 
-        with open(os.path.join(out_dir, "run_info.txt"), "a", encoding="utf-8") as f:
-            f.write("07 - Generalization (sieve + marching squares)\n")
-            f.write(f"Запуск       : {stamp}\n")
-            f.write(f"Входной растр: {in_raster}\n")
-            for key, val in params.items():
-                if not key.startswith("_"):
-                    f.write(f"  {key:12s}= {val}\n")
-            f.write(f"Вектор       : {os.path.basename(out_vector)}\n")
-            if out_raster and not tmp_raster:
-                f.write(f"Растр        : {os.path.basename(out_raster)}\n")
-            f.write(f"Время работы : {dt / 60:.1f} мин\n\n")
+            if not os.path.isfile(out_vector):
+                print("  ! Вектор не создан.", flush=True)
+                continue
+            parts = os.path.splitext(out_vector)[0] + "_parts"
+            if os.path.isdir(parts):
+                shutil.rmtree(parts, ignore_errors=True)
 
-        created.append(out_vector)
+            id_to_name = _read_class_table(os.path.dirname(in_raster))
+            if id_to_name is None:
+                id_to_name = _read_class_table(os.path.join(os.getcwd(), FINAL_BASE_NAME))
+            if id_to_name and not gps:
+                try:
+                    _add_class_names(out_vector, id_to_name)
+                    print("  ✓ Добавлено поле class_name", flush=True)
+                except Exception as e:
+                    print(f"  ! Не удалось добавить class_name: {e}", flush=True)
+            elif not id_to_name:
+                print("  • таблица классов не найдена — в векторе только class_value",
+                      flush=True)
+            fields_info = attr_info if attr_info is not None else ({} if gps else None)
+            if fields_info is not None:
+                gnames = params.get("geomorph_names", "") or (DEFAULT_GEOMORPH_NAMES if gps else "")
+                try:
+                    _add_struct_fields(out_vector, fields_info, params.get("_type_names"),
+                                       parse_geomorph_names(gnames))
+                    print(f"  ✓ Добавлены поля {FLD_STRUCT}, {FLD_GEO}, {FLD_TYPE}, "
+                          f"{FLD_GEOTYPE}", flush=True)
+                except Exception as e:
+                    print(f"  ! Не удалось добавить поля структурного класса: {e}", flush=True)
 
-    print(f"\n{line}\n  ГОТОВО: векторов {len(created)} из {len(files)}\n{line}",
-          flush=True)
+            with open(os.path.join(out_dir, "run_info.txt"), "a", encoding="utf-8") as f:
+                f.write("07 - Generalization (sieve + marching squares)\n")
+                f.write(f"Версия       : {SCRIPT_VERSION}\n")
+                f.write(f"Запуск       : {stamp}\n")
+                f.write(f"Входной растр: {in_raster}\n")
+                if gps:
+                    f.write(f"Геоморфоны   : {'; '.join(gps)} (присоединены после "
+                            f"генерализации, код = геоморфон*1000 + тип)\n")
+                for key, val in params.items():
+                    if not key.startswith("_"):
+                        f.write(f"  {key:12s}= {val}\n")
+                f.write(f"Вектор       : {os.path.basename(out_vector)}\n")
+                if out_raster and not tmp_raster:
+                    f.write(f"Растр        : {os.path.basename(out_raster)}\n")
+                f.write(f"Время работы : {dt / 60:.1f} мин\n\n")
+            created.append(out_vector)
+
+    print(f"\n{line}\n  ГОТОВО: векторов {len(created)}\n{line}", flush=True)
     for c in created:
         print(f"  {c}", flush=True)
     return created
@@ -1882,6 +2051,30 @@ def _write_last_struct(root_dir: str, mode: str, table: str, geo: str = "") -> N
         with open(_last_struct_path(root_dir), "w", encoding="utf-8") as f:
             f.write(f"{mode}\n{table}\n{geo}\n")
     except Exception:
+        pass
+
+
+def _last_geomorph_path(root_dir: str) -> str:
+    return os.path.join(root_dir, OUT_BASE_NAME, "last_geomorph.json")
+
+
+def _read_last_geomorph(root_dir: str) -> dict:
+    import json
+    try:
+        with open(_last_geomorph_path(root_dir), encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_last_geomorph(root_dir: str, d: dict) -> None:
+    import json
+    try:
+        os.makedirs(os.path.join(root_dir, OUT_BASE_NAME), exist_ok=True)
+        with open(_last_geomorph_path(root_dir), "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False, indent=1)
+    except OSError:
         pass
 
 
@@ -2053,12 +2246,64 @@ def _gui_dialog(root_dir: str):
     ttk.Label(fr_st, text="лист ищется по колонке «Структурный класс»; "
               "конкретный лист: путь|имя листа; код 1110 = геоморфон 1 + тип 110").grid(
         row=2, column=0, columnspan=3, sticky="w", padx=6, pady=(0, 4))
-    ttk.Label(fr_st, text="Названия геоморфонов").grid(row=3, column=0, sticky="w", padx=6, pady=3)
-    ttk.Entry(fr_st, textvariable=v_geo_names, width=62).grid(row=3, column=1, sticky="we", padx=4)
-    ttk.Label(fr_st, text="первая цифра кода, например: 1=Водоразделы; 2=Склоны; "
-              "3=Долины; 4=Ложбины; 5=...  (пусто — «геоморфон N»)").grid(
-        row=4, column=0, columnspan=3, sticky="w", padx=6, pady=(0, 4))
     fr_st.columnconfigure(1, weight=1)
+
+    # --- геоморфоны (v11) ---
+    _lg = _read_last_geomorph(root_dir)
+    v_gm_on = tk.BooleanVar(value=bool(_lg.get("on", False)))
+    v_gm_min = tk.StringVar(value=str(_lg.get("min", d["geomorph_min"])))
+    v_gm_clip = tk.BooleanVar(value=bool(_lg.get("clip", d["geomorph_clip"])))
+    gm_files = [g for g in _lg.get("paths", []) if os.path.isfile(g)]
+    if not v_geo_names.get().strip():
+        v_geo_names.set(_lg.get("names", "") or DEFAULT_GEOMORPH_NAMES)
+    fr_gm = ttk.LabelFrame(
+        body, text="Геоморфоны (необязательно): присоединяются ПОСЛЕ генерализации, "
+                  "код = геоморфон*1000 + тип")
+    fr_gm.pack(fill="x", **pad)
+    ttk.Checkbutton(fr_gm, text="Присоединить геоморфоны", variable=v_gm_on).grid(
+        row=0, column=0, columnspan=3, sticky="w", padx=6, pady=3)
+    lb_gm = tk.Listbox(fr_gm, height=3, width=70, selectmode="extended")
+    lb_gm.grid(row=1, column=0, columnspan=2, sticky="we", padx=6, pady=3)
+    for g in gm_files:
+        lb_gm.insert("end", g)
+    fr_gmb = ttk.Frame(fr_gm)
+    fr_gmb.grid(row=1, column=2, sticky="n", padx=4)
+
+    def add_gm():
+        paths = filedialog.askopenfilenames(
+            parent=win, title="Растры геоморфонов (можно несколько)",
+            initialdir=os.path.dirname(gm_files[0]) if gm_files else root_dir,
+            filetypes=[("GeoTIFF", "*.tif *.tiff"), ("Все файлы", "*.*")])
+        for pth in paths:
+            pth = os.path.normpath(pth)
+            if pth not in gm_files:
+                gm_files.append(pth)
+                lb_gm.insert("end", pth)
+        if paths:
+            v_gm_on.set(True)
+
+    def del_gm():
+        for i in reversed(lb_gm.curselection()):
+            lb_gm.delete(i)
+            del gm_files[i]
+
+    ttk.Button(fr_gmb, text="Добавить…", command=add_gm).pack(fill="x", pady=1)
+    ttk.Button(fr_gmb, text="Убрать", command=del_gm).pack(fill="x", pady=1)
+    ttk.Label(fr_gm, text="Мин. участок геоморфона, пикс.").grid(
+        row=2, column=0, sticky="w", padx=6, pady=3)
+    ttk.Spinbox(fr_gm, from_=0, to=100000, textvariable=v_gm_min, width=10).grid(
+        row=2, column=1, sticky="w", padx=4)
+    ttk.Checkbutton(fr_gm, text="Только в охвате геоморфонов (отдельный GPKG на каждый файл)",
+                    variable=v_gm_clip).grid(row=3, column=0, columnspan=3, sticky="w",
+                                             padx=6, pady=3)
+    ttk.Label(fr_gm, text="Названия геоморфонов").grid(row=4, column=0, sticky="w", padx=6, pady=3)
+    ttk.Entry(fr_gm, textvariable=v_geo_names, width=62).grid(row=4, column=1, columnspan=2,
+                                                             sticky="we", padx=4)
+    ttk.Label(fr_gm, text="первая цифра кода: 1=...; 2=...; (пусто — «геоморфон N»); "
+              "используются и для готовых четырёхзначных кодов").grid(
+        row=5, column=0, columnspan=3, sticky="w", padx=6, pady=(0, 4))
+    fr_gm.columnconfigure(1, weight=1)
+
 
     fr_v = ttk.LabelFrame(body, text="Векторизация")
     fr_v.pack(fill="x", **pad)
@@ -2258,6 +2503,9 @@ def _gui_dialog(root_dir: str):
                 "struct_mode": v_st_mode.get(),
                 "struct_table": v_st_table.get().strip(),
                 "geomorph_names": v_geo_names.get().strip(),
+                "geomorph_paths": list(gm_files) if v_gm_on.get() else [],
+                "geomorph_min": int(v_gm_min.get()),
+                "geomorph_clip": bool(v_gm_clip.get()),
             }
         except (ValueError, tk.TclError):
             messagebox.showerror("Ошибка",
@@ -2272,8 +2520,17 @@ def _gui_dialog(root_dir: str):
                                        "Выберите таблицу структурных классов "
                                        "или режим «Не учитывать».", parent=win)
                 return
+        if v_gm_on.get() and not gm_files:
+            messagebox.showwarning("Геоморфоны", "Добавьте растры геоморфонов "
+                                   "или снимите флажок «Присоединить геоморфоны».",
+                                   parent=win)
+            return
         _write_last_struct(root_dir, params["struct_mode"], params["struct_table"],
                            params["geomorph_names"])
+        _write_last_geomorph(root_dir, {"on": bool(v_gm_on.get()), "paths": list(gm_files),
+                                        "min": params["geomorph_min"],
+                                        "clip": params["geomorph_clip"],
+                                        "names": params["geomorph_names"]})
         result.update(files=list(files), params=params,
                       out_base=v_out.get().strip() or os.path.join(root_dir, OUT_BASE_NAME))
         win.destroy()
@@ -2350,8 +2607,23 @@ def _console_dialog(root_dir: str):
         p["struct_mode"], p["struct_table"] = "prefix", ""
     elif raw:
         p["struct_mode"], p["struct_table"] = "table", raw
+    gm = []
+    raw = input("  присоединить геоморфоны после генерализации? Пути к растрам через «;» "
+                "(Enter = нет): ").strip()
+    if raw:
+        gm = [x.strip().strip('"') for x in raw.split(";") if x.strip()]
+        missing = [g for g in gm if not os.path.isfile(g)]
+        if missing:
+            print(f"    ! файлы не найдены и пропущены: {missing}")
+        gm = [g for g in gm if os.path.isfile(g)]
+    p["geomorph_paths"] = gm
+    if gm:
+        p["geomorph_min"] = _prompt_int("мин. участок геоморфона, пикс.", 10)
+        p["geomorph_clip"] = _prompt_yes("только в охвате геоморфонов, "
+                                         "отдельный GPKG на файл", True)
     p["geomorph_names"] = input("  названия геоморфонов (первая цифра кода), например "
-                                "«1=Водоразделы; 2=Склоны» (Enter = «геоморфон N»): ").strip()
+                                "«1=Водоразделы; 2=Склоны» (Enter = "
+                                + ("по умолчанию" if gm else "«геоморфон N»") + "): ").strip()
     p["save_raster"] = _prompt_yes("сохранить очищенный растр", False)
     return files, p, os.path.join(root_dir, OUT_BASE_NAME)
 
@@ -2454,6 +2726,13 @@ def main(argv=None):
                         "типа присоединяются к типам своего структурного класса")
     p.add_argument("--struct-prefix", action="store_true",
                    help="структурный класс = код // 10 (без таблицы)")
+    p.add_argument("--geomorph", action="append", default=[], metavar="ФАЙЛ",
+                   help="v11: растр геоморфонов, присоединяется ПОСЛЕ генерализации "
+                        "(код = геоморфон*1000 + тип); можно несколько раз")
+    p.add_argument("--geomorph-min", type=int, default=10,
+                   help="мин. участок геоморфона внутри типа, пикс.")
+    p.add_argument("--geomorph-clip", action="store_true",
+                   help="вне охвата геоморфонов — nodata")
     p.add_argument("--skip-vector", action="store_true")
     p.add_argument("--resume", action="store_true",
                    help="не удалять уже посчитанные тайлы")
@@ -2478,7 +2757,9 @@ def main(argv=None):
         a.smooth, a.simplify, a.edge_mode, not a.no_repair, a.tile, a.margin,
         no_expand, a.expand_tol, refs,
         a.workers, a.output_mode, a.layer, a.skip_vector, a.resume,
-        verbose=not a.quiet, struct_of=struct_of)
+        verbose=not a.quiet, struct_of=struct_of,
+        geomorph=({"paths": a.geomorph, "min_size": a.geomorph_min,
+                   "clip": a.geomorph_clip} if a.geomorph else None))
 
 
 if __name__ == "__main__":
