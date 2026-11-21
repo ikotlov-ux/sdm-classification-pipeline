@@ -43,3 +43,10 @@ pyyaml>=6.0
 jupyter
 ipykernel
 openpyxl>=3.0
+
+# --- Optional: segmentation/ (фрагменты подложек + samgeo) ---
+# requests
+# pillow
+# psutil
+# segment-geospatial
+# sam2               # + PyTorch: https://pytorch.org/get-started/locally/

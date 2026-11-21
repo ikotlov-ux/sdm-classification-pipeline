@@ -41,6 +41,7 @@ sdm-classification-pipeline/
 │   └── 00_Prepare_Layers.py
 ├── classification/         пайплайн классификации (шаги 01–05, 07)
 ├── sdm/                    пайплайн SDM (шаги 01s–06s)
+├── segmentation/           фрагменты подложек вокруг точек + samgeo (шаги 01g–02g)
 ├── docs/                   схема развилки и заметки
 ├── requirements.txt
 ├── .gitignore
@@ -68,6 +69,15 @@ python common/00_Prepare_Layers.py
 ```
 
 Готовит выровненный на общую сетку многослойный композит `Composite.tif` и его отфильтрованную по ZV/NZV версию `Composite_filtered.tif`, а также `predictor_names.pkl`.
+
+### Сегментация подложек вокруг точек (samgeo)
+
+```bash
+python segmentation/01g_download_sat_chips.py      # фрагменты 1×1 км Google/Bing/Yandex/ESRI вокруг точек
+python segmentation/02g_samgeo_segment_chips.py    # пакетная сегментация SAM 2 -> segments.gpkg
+```
+
+Подробно: `segmentation/README.md`.
 
 ### Ветвь классификации
 
