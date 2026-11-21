@@ -84,6 +84,7 @@ python common/00_Prepare_Layers.py
 ```bash
 python segmentation/10_download_sat_chips.py      # фрагменты 1×1 км Google/Bing/Yandex/ESRI вокруг точек
 python segmentation/11_samgeo_segment_chips.py    # пакетная сегментация SAM 2 -> segments.gpkg
+python segmentation/12_samgeo_point_segments.py   # сегмент каждой точки (SAM 2 + Махаланобис, как v12) -> point_segments.gpkg
 ```
 
 Подробно: `segmentation/README.md`.
