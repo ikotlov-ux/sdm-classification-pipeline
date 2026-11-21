@@ -49,6 +49,13 @@ SAM 2 с подсказкой-точкой (samgeo SamGeo2, automatic=False) и 
 оставшееся время; по каждой точке — площадь, доля, маска или причина отказа.
 Пробный запуск: TEST_N = 20 -> случайные фрагменты, в сумме ~20 точек, и
 прогноз на все.
+Настройки: при запуске (ASK_SETTINGS = True) после выбора папки открывается окно
+со всеми параметрами сегментов, модели и запуска, с пояснениями. В нём сразу
+видны площадь круга поиска, минимальный объект, порог χ² и сколько точек уже
+готово с такими параметрами. Кнопки: «Как в v12» (очистка 0, centroid),
+«Из шапки скрипта», «Запустить» (Enter), «Отмена» (Esc). Введённые значения
+сохраняются в _points/settings12.json и подставляются при следующем запуске
+в этой папке. Без графического окружения те же вопросы задаются в консоли.
 Повторный запуск продолжает с места остановки. Если изменить параметры
 шагов 1–6 (модель, MAX_RADIUS_M, CONFIDENCE, MIN_GOOD_RATIO, REF_RADIUS_M,
 REF_RADIUS_FIELD, ENHANCE, MIN_SAM_SCORE, MIN_HOLE_M2, MIN_PART_M2,
@@ -93,6 +100,10 @@ from pyproj import CRS, Transformer, Geod
 # НАСТРОЙКИ
 # ============================================================================
 CHIPS_DIR = None            # None -> окно выбора папки с chips_index.gpkg
+ASK_SETTINGS = True         # окно со всеми настройками при запуске (значения ниже —
+                            # исходные; последние введённые хранятся в
+                            # <папка фрагментов>/_points/settings12.json и
+                            # подставляются в окно при следующем запуске)
 SAM2_MODEL_ID = "sam2-hiera-large"   # sam2-hiera-tiny / -small / -base-plus / -large
 DEVICE = None               # None -> авто (cuda, если есть), "cpu", "cuda"
 
@@ -100,7 +111,7 @@ N_WORKERS = "auto"          # "auto" или число процессов (1 -> 
 THREADS_PER_WORKER = 8      # потоков PyTorch на процесс
 WORKERS_PER_GPU = 2         # процессов на видеокарту при N_WORKERS="auto"
 MEM_PER_WORKER_GB = 6       # запас ОЗУ на процесс при N_WORKERS="auto" на CPU
-TEST_N = 20                 # ТЕСТОВЫЙ ЗАПУСК на 20 точках; после проверки лога -> 0 (все)
+TEST_N = 20                 # ТЕСТОВЫЙ ЗАПУСК на ~20 точках; после проверки лога -> 0 (все)
 
 # --- параметры сегмента (как в sam_segment_v12.py) ---
 MAX_RADIUS_M = 150.0        # радиус поиска: наибольший радиус объекта от точки, м
@@ -219,6 +230,489 @@ def pick_dir():
     return d
 
 
+# ============================================================================
+# ОКНО НАСТРОЕК: все параметры сегментов спрашиваются при каждом запуске
+# ============================================================================
+# (группа, имя, подпись, тип, варианты/диапазон, пояснение)
+SPEC = [
+    ("Сегмент точки", "MAX_RADIUS_M", "Радиус поиска R, м", "float", (1, None),
+     "наибольший радиус объекта от точки; кадр SAM — квадрат 2R × 2R"),
+    ("Сегмент точки", "CONFIDENCE", "Достоверность (хи-квадрат)", "conf", ["0.80", "0.95", "0.99"],
+     "0.80 — мягкий отбор (больше пикселей), 0.99 — строгий; можно ввести своё"),
+    ("Сегмент точки", "MIN_GOOD_RATIO", "Мин. доля хороших пикселей", "float", (0, 1),
+     "от площади круга поиска; если меньше — точка отклоняется"),
+    ("Сегмент точки", "REF_RADIUS_M", "Радиус эталона, м", "float", (0.5, None),
+     "окно вокруг точки, по которому считается спектральный эталон"),
+    ("Сегмент точки", "REF_RADIUS_FIELD", "Поле радиуса эталона", "field", None,
+     "свой радиус эталона у точки; пусто или ≤ 0 — общий радиус"),
+    ("Сегмент точки", "MIN_SAM_SCORE", "Мин. оценка маски SAM", "float", (0, 1),
+     "маски с оценкой ниже не рассматриваются; 0 — как в v12"),
+    ("Сегмент точки", "ENHANCE", "Растяжка контраста для SAM", "bool", None,
+     "2–98% кадра; Махаланобис всегда по исходным яркостям"),
+    ("Очистка сегмента", "MIN_HOLE_M2", "Заливать дырки до, м²", "float", (0, None),
+     "0 — как в v12 (пиксельные дырки остаются)"),
+    ("Очистка сегмента", "MIN_PART_M2", "Удалять островки до, м²", "float", (0, None),
+     "0 — как в v12"),
+    ("Очистка сегмента", "MIN_PART_SHARE", "Удалять части меньше доли", "float", (0, 1),
+     "от площади полигона; в v12 — 0.01"),
+    ("Очистка сегмента", "KEEP_POINT_PART", "Только часть с точкой", "bool", None,
+     "из многочастного полигона оставить часть, в которой лежит точка"),
+    ("Очистка сегмента", "SIMPLIFY_M", "Упрощение контура, м", "float", (0, None),
+     "0 — пиксельные контуры, как в v12"),
+    ("Перекрытия", "REMOVE_OVERLAPS", "Устранять перекрытия", "bool", None,
+     "сегменты разных точек не перекрываются"),
+    ("Перекрытия", "OVERLAP_MODE", "Способ деления", "choice", ["voronoi", "centroid"],
+     "voronoi — каждый пиксель ближайшей точке; centroid — всё перекрытие точке, "
+     "ближайшей к его центру (как в v12)"),
+    ("Перекрытия", "COINCIDENT_M", "Одно место, если ближе, м", "float", (0, None),
+     "повторные описания одного места не делят перекрытие — у каждого свой сегмент"),
+    ("Модель и запуск", "SAM2_MODEL_ID", "Модель SAM 2", "choice",
+     ["sam2-hiera-large", "sam2-hiera-base-plus", "sam2-hiera-small", "sam2-hiera-tiny"],
+     "large — точнее, tiny — быстрее"),
+    ("Модель и запуск", "TEST_N", "Пробный запуск, точек", "int", (0, None),
+     "примерно столько точек (целыми фрагментами) и прогноз времени на все; 0 — все"),
+    ("Модель и запуск", "DEVICE", "Устройство", "device", ["авто", "cuda", "cpu"],
+     "авто — видеокарта, если доступна PyTorch"),
+    ("Модель и запуск", "N_WORKERS", "Процессов", "workers", None,
+     "auto или число; auto: на GPU — по числу карт × процессов на карту"),
+    ("Модель и запуск", "WORKERS_PER_GPU", "Процессов на видеокарту", "int", (1, 16),
+     "при «Процессов» = auto"),
+    ("Модель и запуск", "THREADS_PER_WORKER", "Потоков на процесс", "int", (1, 256),
+     "потоков PyTorch в каждом процессе"),
+    ("Результат", "OUT_NAME", "Файл результата", "str", None,
+     "GeoPackage в папке фрагментов"),
+    ("Результат", "OUT_EPSG", "EPSG результата", "int", (1024, 999999),
+     "32637 — UTM 37N (вся Московская обл.)"),
+]
+SETTING_NAMES = [s[1] for s in SPEC]
+SEG_PARAMS = ["SAM2_MODEL_ID", "MAX_RADIUS_M", "CONFIDENCE", "MIN_GOOD_RATIO", "REF_RADIUS_M",
+              "REF_RADIUS_FIELD", "ENHANCE", "MIN_SAM_SCORE", "MIN_HOLE_M2", "MIN_PART_M2",
+              "REMOVE_OVERLAPS", "OVERLAP_MODE", "COINCIDENT_M"]    # их изменение -> пересчёт
+V12 = dict(MIN_SAM_SCORE=0.0, MIN_HOLE_M2=0.0, MIN_PART_M2=0.0, MIN_PART_SHARE=0.01,
+           KEEP_POINT_PART=False, SIMPLIFY_M=0.0, ENHANCE=False, REMOVE_OVERLAPS=True,
+           OVERLAP_MODE="centroid")
+HEADER = {n: globals()[n] for n in SETTING_NAMES}      # значения из шапки скрипта
+SETTINGS_FILE = "settings12.json"                       # в <папка фрагментов>/_points/
+
+
+def settings_sig(cfg=None):
+    """Подпись параметров сегмента: при их изменении точки пересчитываются."""
+    c = cfg or globals()
+    s = repr((c["SAM2_MODEL_ID"], float(c["MAX_RADIUS_M"]), float(c["CONFIDENCE"]),
+              float(c["MIN_GOOD_RATIO"]), float(c["REF_RADIUS_M"]), c["REF_RADIUS_FIELD"] or "",
+              bool(c["ENHANCE"]), float(c["MIN_SAM_SCORE"]), float(c["MIN_HOLE_M2"]),
+              float(c["MIN_PART_M2"]), bool(c["REMOVE_OVERLAPS"]), c["OVERLAP_MODE"],
+              float(c["COINCIDENT_M"])))
+    return hashlib.md5(s.encode("utf-8")).hexdigest()[:8]
+
+
+def current_settings():
+    return {n: globals()[n] for n in SETTING_NAMES}
+
+
+def apply_settings(cfg):
+    globals().update({k: v for k, v in cfg.items() if k in SETTING_NAMES})
+
+
+def _to_text(kind, v):
+    if kind == "device":
+        return "авто" if v in (None, "", "auto") else str(v)
+    if kind == "conf":
+        return f"{float(v):.2f}"
+    if v is None:
+        return ""
+    if isinstance(v, float):
+        return f"{v:g}"
+    return str(v)
+
+
+def _parse(spec, v):
+    """Значение из окна/консоли -> значение параметра; ValueError с пояснением."""
+    _, name, label, kind, opt, _ = spec
+    if kind == "bool":
+        if isinstance(v, str):
+            t = v.strip().lower()
+            if t in ("1", "y", "yes", "true", "да", "д", "+"):
+                return True
+            if t in ("0", "n", "no", "false", "нет", "н", "-"):
+                return False
+            raise ValueError(f"{label}: да / нет")
+        return bool(v)
+    t = str(v).strip().replace(",", ".")
+    if kind == "str":
+        if not t:
+            raise ValueError(f"{label}: пусто")
+        return t if t.lower().endswith(".gpkg") else t + ".gpkg"
+    if kind == "field":
+        return t
+    if kind == "choice":                        # точное имя, номер (1, 2, ...) или часть имени
+        if t in opt:
+            return t
+        if t.isdigit() and 1 <= int(t) <= len(opt):
+            return opt[int(t) - 1]
+        hit = [o for o in opt if t.lower() and t.lower() in o.lower()]
+        if len(hit) == 1:
+            return hit[0]
+        raise ValueError(f"{label}: один из {', '.join(opt)} (или номер 1–{len(opt)})")
+    if kind == "device":
+        t = t.lower()
+        if t in ("", "авто", "auto", "none"):
+            return None
+        if t not in ("cuda", "cpu"):
+            raise ValueError(f"{label}: авто, cuda или cpu")
+        return t
+    if kind == "workers":
+        if t.lower() in ("auto", "авто", ""):
+            return "auto"
+        try:
+            n = int(t)
+        except ValueError:
+            raise ValueError(f"{label}: auto или целое число") from None
+        if n < 1:
+            raise ValueError(f"{label}: не меньше 1")
+        return n
+    if kind == "conf":
+        try:
+            x = float(t)
+        except ValueError:
+            raise ValueError(f"{label}: число, например 0.95") from None
+        if x > 1:                                   # 95 -> 0.95
+            x /= 100
+        if not 0.5 <= x < 1:
+            raise ValueError(f"{label}: от 0.50 до 0.999")
+        return x
+    try:
+        x = int(t) if kind == "int" else float(t)
+    except ValueError:
+        raise ValueError(f"{label}: {'целое ' if kind == 'int' else ''}число") from None
+    lo, hi = opt
+    if (lo is not None and x < lo) or (hi is not None and x > hi):
+        rng = f"от {lo:g}" if hi is None else f"от {lo:g} до {hi:g}"
+        raise ValueError(f"{label}: {rng}")
+    return x
+
+
+def _settings_path(d):
+    return os.path.join(d, "_points", SETTINGS_FILE)
+
+
+def load_saved_settings(d):
+    """Последние введённые настройки для этой папки (или {})."""
+    import json
+    p = _settings_path(d)
+    if not os.path.exists(p):
+        return {}
+    try:
+        with open(p, encoding="utf-8") as f:
+            raw = json.load(f)
+    except Exception:
+        return {}
+    out = {}
+    for sp in SPEC:
+        if sp[1] in raw:
+            try:
+                out[sp[1]] = _parse(sp, raw[sp[1]] if sp[3] != "device" else
+                                    _to_text("device", raw[sp[1]]))
+            except ValueError:
+                pass
+    return out
+
+
+def save_settings(d, cfg):
+    import json
+    os.makedirs(os.path.join(d, "_points"), exist_ok=True)
+    with open(_settings_path(d), "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=1)
+    return _settings_path(d)
+
+
+def _folder_facts(d):
+    """Поля точек, число точек/фрагментов, радиус фрагментов, готовые точки по подписи."""
+    facts = dict(fields=[], n_pts=None, n_chips=None, r_chip=None, done={})
+    try:
+        import pyogrio
+        info = pyogrio.read_info(os.path.join(d, "chips_points.gpkg"))
+        facts["fields"] = [c for c in info["fields"] if c not in ("point_id", "chip_id")]
+        facts["n_pts"] = int(info["features"])
+    except Exception:
+        try:
+            g = gpd.read_file(os.path.join(d, "chips_points.gpkg"))
+            facts["fields"] = [c for c in g.columns if c not in ("geometry", "point_id",
+                                                                 "chip_id")]
+            facts["n_pts"] = len(g)
+        except Exception:
+            pass
+    try:
+        idx = gpd.read_file(os.path.join(d, "chips_index.gpkg"), ignore_geometry=True)
+        facts["n_chips"] = int((idx["file"].fillna("") != "").sum())
+        if "radius_m" in idx:
+            facts["r_chip"] = float(pd.to_numeric(idx["radius_m"], errors="coerce").min())
+    except Exception:
+        pass
+    try:
+        st = read_status(os.path.join(d, "_points", "status.csv"))
+        st = st[st.status.isin(["ok", "rejected"])].drop_duplicates("token")
+        facts["done"] = st.groupby("sig").size().to_dict()
+    except Exception:
+        pass
+    return facts
+
+
+def _info_text(cfg, facts):
+    """Пояснение к текущим значениям: площади, порог, готовые точки."""
+    from scipy.stats import chi2
+    R = float(cfg["MAX_RADIUS_M"])
+    circ = math.pi * R ** 2
+    lines = [f"Круг поиска: {circ / 1e4:.2f} га; минимальный объект: "
+             f"{cfg['MIN_GOOD_RATIO'] * circ / 1e4:.2f} га хороших пикселей; порог хи-квадрат "
+             f"{chi2.ppf(cfg['CONFIDENCE'], df=3):.3f}; окно эталона "
+             f"{math.pi * cfg['REF_RADIUS_M'] ** 2:,.0f} м²".replace(",", " ")]
+    warn = []
+    if facts.get("r_chip") and R > facts["r_chip"]:
+        warn.append(f"R больше радиуса фрагментов ({facts['r_chip']:g} м) — круг будет "
+                    f"обрезан краем")
+    if cfg["REF_RADIUS_M"] >= R:
+        warn.append("радиус эталона не меньше радиуса поиска")
+    sig = settings_sig(cfg)
+    n_done = facts.get("done", {}).get(sig, 0)
+    n_pts = facts.get("n_pts")
+    if n_done:
+        lines.append(f"С этими параметрами сегмента уже готово {n_done} точек — они не "
+                     f"пересчитываются.")
+    elif facts.get("done"):
+        lines.append("С этими параметрами сегмента готовых точек нет: все точки будут "
+                     "посчитаны заново (прежние результаты в _points сохраняются).")
+    if cfg["TEST_N"]:
+        lines.append(f"Пробный запуск: ~{cfg['TEST_N']} точек"
+                     f"{f' из {n_pts}' if n_pts else ''} и прогноз времени на все.")
+    else:
+        lines.append(f"Полный запуск: все точки{f' ({n_pts})' if n_pts else ''}.")
+    if warn:
+        lines.append("Внимание: " + "; ".join(warn) + ".")
+    return "\n".join(lines)
+
+
+def _tk_dpi():
+    if os.name == "nt":                    # чёткие шрифты на мониторах с масштабом > 100%
+        try:
+            import ctypes
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:
+            pass
+
+
+def gui_settings(d, init, facts):
+    """Окно со всеми настройками. Возвращает dict или None (Отмена)."""
+    import tkinter as tk
+    from tkinter import ttk, messagebox
+    _tk_dpi()
+    root = tk.Tk()
+    root.title("12_samgeo_point_segments — настройки сегментов")
+    root.attributes("-topmost", True)
+    root.after(800, lambda: root.attributes("-topmost", False))
+    try:
+        ttk.Style().theme_use("vista" if os.name == "nt" else "clam")
+    except Exception:
+        pass
+    fam = "Segoe UI" if os.name == "nt" else "DejaVu Sans"
+    try:
+        from tkinter import font as tkfont
+        for fn in ("TkDefaultFont", "TkTextFont", "TkMenuFont"):
+            tkfont.nametofont(fn).configure(family=fam, size=9)
+    except Exception:
+        pass
+    small = (fam, 8)
+    out = {"cfg": None}
+    vars_, widgets = {}, {}
+    FIELD_NONE = "(общий радиус)"
+
+    top = ttk.Frame(root, padding=(10, 8, 10, 0))
+    top.grid(row=0, column=0, sticky="ew")
+    src = []
+    if facts.get("n_pts") is not None:
+        src.append(f"точек: {facts['n_pts']}")
+    if facts.get("n_chips") is not None:
+        src.append(f"фрагментов: {facts['n_chips']}")
+    if facts.get("r_chip"):
+        src.append(f"радиус фрагментов: {facts['r_chip']:g} м")
+    ttk.Label(top, text=f"Папка: {os.path.abspath(d)}").grid(row=0, column=0, sticky="w")
+    ttk.Label(top, text="; ".join(src) + (f".  Значения — с прошлого запуска в этой папке "
+                                          f"(_points/{SETTINGS_FILE})."
+                                          if init.get("_saved") else
+                                          ".  Значения — из шапки скрипта."),
+              foreground="#555").grid(row=1, column=0, sticky="w")
+
+    body = ttk.Frame(root, padding=10)
+    body.grid(row=1, column=0, sticky="nsew")
+    cols = {"Сегмент точки": 0, "Очистка сегмента": 0,
+            "Перекрытия": 1, "Модель и запуск": 1, "Результат": 1}
+    frames, rows, col_row = {}, {}, {0: 0, 1: 0}
+    for grp, name, label, kind, opt, hint in SPEC:
+        if grp not in frames:
+            c = cols[grp]
+            fr = ttk.LabelFrame(body, text=grp, padding=(8, 4))
+            fr.grid(row=col_row[c], column=c, sticky="new", padx=6, pady=4)
+            col_row[c] += 1
+            frames[grp], rows[grp] = fr, 0
+        fr, r = frames[grp], rows[grp]
+        rows[grp] += 1
+        val = init[name]
+        if kind == "bool":
+            v = tk.BooleanVar(value=bool(val))
+            w = ttk.Checkbutton(fr, variable=v)
+        else:
+            v = tk.StringVar(value=_to_text(kind, val))
+            if kind in ("choice", "device"):
+                w = ttk.Combobox(fr, textvariable=v, values=opt, state="readonly", width=20)
+            elif kind == "conf":
+                w = ttk.Combobox(fr, textvariable=v, values=opt, width=20)
+            elif kind == "field":
+                fl = [FIELD_NONE] + facts.get("fields", [])
+                if val and val not in fl:
+                    fl.append(val)
+                v.set(val or FIELD_NONE)
+                w = ttk.Combobox(fr, textvariable=v, values=fl, state="readonly", width=20)
+            else:
+                w = ttk.Entry(fr, textvariable=v, width=22)
+        ttk.Label(fr, text=label, width=28).grid(row=r, column=0, sticky="w", pady=2)
+        w.grid(row=r, column=1, sticky="w", padx=6, pady=2)
+        ttk.Label(fr, text=hint, foreground="#666", font=small, wraplength=300,
+                  justify="left").grid(row=r, column=2, sticky="w", pady=2)
+        vars_[name], widgets[name] = v, w
+
+    info = tk.StringVar()
+    ttk.Label(root, textvariable=info, padding=(16, 0), justify="left", wraplength=1150,
+              foreground="#1a4d8f").grid(row=2, column=0, sticky="w")
+
+    def read():
+        cfg, errs = {}, []
+        for sp in SPEC:
+            name, kind = sp[1], sp[3]
+            raw = vars_[name].get()
+            if kind == "field" and raw == FIELD_NONE:
+                raw = ""
+            try:
+                cfg[name] = _parse(sp, raw)
+            except ValueError as e:
+                errs.append(str(e))
+                cfg[name] = init[name]
+        return cfg, errs
+
+    def refresh(*_):
+        cfg, errs = read()
+        on = bool(vars_["REMOVE_OVERLAPS"].get())
+        for n in ("OVERLAP_MODE", "COINCIDENT_M"):
+            widgets[n].configure(state=("readonly" if n == "OVERLAP_MODE" else "normal")
+                                 if on else "disabled")
+        try:
+            txt = _info_text(cfg, facts)
+        except Exception:
+            txt = ""
+        info.set(txt + (("\nНеверные значения: " + "; ".join(errs)) if errs else ""))
+
+    def set_values(vals):
+        for sp in SPEC:
+            name, kind = sp[1], sp[3]
+            if name not in vals:
+                continue
+            if kind == "bool":
+                vars_[name].set(bool(vals[name]))
+            elif kind == "field":
+                vars_[name].set(vals[name] or FIELD_NONE)
+            else:
+                vars_[name].set(_to_text(kind, vals[name]))
+
+    def start(*_):
+        cfg, errs = read()
+        if errs:
+            messagebox.showerror("Проверьте значения", "\n".join(errs), parent=root)
+            return
+        out["cfg"] = cfg
+        root.destroy()
+
+    def cancel(*_):
+        root.destroy()
+
+    btn = ttk.Frame(root, padding=(10, 6, 10, 10))
+    btn.grid(row=3, column=0, sticky="ew")
+    btn.columnconfigure(2, weight=1)
+    ttk.Button(btn, text="Как в v12", command=lambda: set_values(V12)).grid(row=0, column=0,
+                                                                            padx=4)
+    ttk.Button(btn, text="Из шапки скрипта",
+               command=lambda: set_values(HEADER)).grid(row=0, column=1, padx=4)
+    ttk.Button(btn, text="Запустить", command=start).grid(row=0, column=3, padx=4)
+    ttk.Button(btn, text="Отмена", command=cancel).grid(row=0, column=4, padx=4)
+    for v in vars_.values():
+        v.trace_add("write", refresh)
+    refresh()
+    root.bind("<Return>", start)
+    root.bind("<Escape>", cancel)
+    root.protocol("WM_DELETE_WINDOW", cancel)
+    root.update_idletasks()
+    w, h = root.winfo_reqwidth(), root.winfo_reqheight()
+    x = max(0, (root.winfo_screenwidth() - w) // 2)
+    y = max(0, (root.winfo_screenheight() - h) // 3)
+    root.geometry(f"+{x}+{y}")
+    root.mainloop()
+    return out["cfg"]
+
+
+def console_settings(init, facts):
+    """Те же вопросы в консоли (если окно не открывается). Enter — оставить значение."""
+    print("\nНастройки сегментов (Enter — оставить значение в скобках):")
+    cfg, grp = {}, None
+    for sp in SPEC:
+        g, name, label, kind, opt, hint = sp
+        if g != grp:
+            print(f"\n  --- {g} ---")
+            grp = g
+        cur = _to_text(kind, init[name]) if kind != "bool" else ("да" if init[name] else "нет")
+        if kind == "choice":
+            var = " (" + ", ".join(f"{i}: {o}" for i, o in enumerate(opt, 1)) + ")"
+        elif kind in ("device", "conf"):
+            var = f" ({'/'.join(opt)})"
+        else:
+            var = " (да/нет)" if kind == "bool" else ""
+        if kind == "field" and facts.get("fields"):
+            print(f"    поля точек: {', '.join(facts['fields'])} ('-' — общий радиус)")
+        while True:
+            t = input(f"  {label}{var} — {hint} [{cur}]: ").strip().strip('"')
+            if not t:
+                cfg[name] = init[name]
+                break
+            try:
+                cfg[name] = _parse(sp, "" if kind == "field" and t == "-" else t)
+                break
+            except ValueError as e:
+                print(f"    {e}")
+    print("\n" + _info_text(cfg, facts))
+    if (input("\nНачать? (y/n) [y]: ").strip().lower() or "y") not in ("y", "д", "да", "yes"):
+        return None
+    return cfg
+
+
+def ask_settings(d):
+    """Окно (или консоль) со всеми настройками; значения — с прошлого запуска в этой
+    папке, иначе из шапки. Возвращает dict или None (отмена)."""
+    init = dict(HEADER)
+    saved = load_saved_settings(d)
+    init.update(saved)
+    facts = _folder_facts(d)
+    try:
+        cfg = gui_settings(d, dict(init, _saved=bool(saved)), facts)
+    except Exception as e:                  # нет графического окружения
+        if sys.stdin is not None and sys.stdin.isatty():
+            print(f"[i] Окно настроек недоступно ({e.__class__.__name__}) — вопросы в консоли.")
+            cfg = console_settings(init, facts)
+        else:
+            print(f"[i] Окно настроек недоступно ({e.__class__.__name__}), консоль без ввода — "
+                  f"используются значения {'с прошлого запуска' if saved else 'из шапки'}.")
+            cfg = init
+    if cfg is not None:
+        cfg.pop("_saved", None)
+    return cfg
+
+
 def gpu_count(verbose=True):
     """Определение видеокарт NVIDIA: через PyTorch и (для диагностики) nvidia-smi.
     Предупреждает, если карта в системе есть, а PyTorch установлен без CUDA."""
@@ -282,15 +776,6 @@ def physical_cores():
         pass
     return max(1, (os.cpu_count() or 2) // 2)
 
-
-
-def settings_sig():
-    """Подпись параметров сегмента: при их изменении точки пересчитываются."""
-    s = repr((SAM2_MODEL_ID, float(MAX_RADIUS_M), float(CONFIDENCE), float(MIN_GOOD_RATIO),
-              float(REF_RADIUS_M), REF_RADIUS_FIELD or "", bool(ENHANCE),
-              float(MIN_SAM_SCORE), float(MIN_HOLE_M2), float(MIN_PART_M2),
-              bool(REMOVE_OVERLAPS), OVERLAP_MODE, float(COINCIDENT_M)))
-    return hashlib.md5(s.encode("utf-8")).hexdigest()[:8]
 
 
 def load_model(device):
@@ -673,7 +1158,8 @@ def process_chip(task):
     return task["chip_id"], results, n_ov, time.time() - t1, err
 
 
-def worker_loop(wid, task_q, res_q, chips_dir, n_gpu, threads):
+def worker_loop(wid, task_q, res_q, chips_dir, n_gpu, threads, cfg):
+    apply_settings(cfg)                 # настройки из окна (процесс заново импортирует модуль)
     t = time.time()
     try:
         init_worker(wid, chips_dir, n_gpu, threads)
@@ -964,12 +1450,27 @@ def main():
     d = pick_dir()
     if not d:
         print("Папка не выбрана."); return
+    if not os.path.exists(os.path.join(d, "chips_index.gpkg")):
+        print(f"В папке нет chips_index.gpkg: {d}"); return
+    src = "шапка скрипта"
+    if os.environ.get("SEG12_SETTINGS"):            # запуск из Jupyter: окно уже было
+        import json
+        with open(os.environ["SEG12_SETTINGS"], encoding="utf-8") as f:
+            apply_settings(json.load(f))
+        src = "окно настроек"
+    elif ASK_SETTINGS:
+        cfg = ask_settings(d)
+        if cfg is None:
+            print("Отменено."); return
+        apply_settings(cfg)
+        save_settings(d, cfg)
+        src = "окно настроек"
     log_path, stamp = start_log(os.path.join(d, "_logs"), "12_point_segments")
     print("=" * 78)
     print("12_samgeo_point_segments.py" + ("  [ТЕСТОВЫЙ ЗАПУСК]" if TEST_N else ""))
     print("=" * 78)
     print(system_info())
-    print("Настройки:")
+    print(f"Настройки ({src}):")
     print(settings_info(["SAM2_MODEL_ID", "DEVICE", "N_WORKERS", "THREADS_PER_WORKER",
                          "WORKERS_PER_GPU", "TEST_N", "MAX_RADIUS_M", "CONFIDENCE",
                          "MIN_GOOD_RATIO", "REF_RADIUS_M", "REF_RADIUS_FIELD", "ENHANCE",
@@ -1105,7 +1606,8 @@ def main():
 
     def spawn(wid):
         p = ctx.Process(target=worker_loop, daemon=True,
-                        args=(wid, task_q, res_q, d, n_gpu, THREADS_PER_WORKER))
+                        args=(wid, task_q, res_q, d, n_gpu, THREADS_PER_WORKER,
+                              current_settings()))
         p.start()
         return p
 
@@ -1245,7 +1747,8 @@ def main():
     print(f"Статус точек: {status_f}")
     print(f"Лог: {log_path}")
     if TEST_N:
-        print("Тест завершён. Пришлите лог; для полного запуска поставьте TEST_N = 0.")
+        print("Тест завершён. Пришлите лог; для полного запуска в окне настроек поставьте "
+              "«Пробный запуск, точек» = 0.")
 
 
 def _in_jupyter():
@@ -1260,7 +1763,14 @@ def run_from_jupyter():
     d = pick_dir()
     if not d:
         print("Папка не выбрана."); return
+    if not os.path.exists(os.path.join(d, "chips_index.gpkg")):
+        print(f"В папке нет chips_index.gpkg: {d}"); return
     env = dict(os.environ, SEG12_CHILD="1", PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1")
+    if ASK_SETTINGS:                        # окно — здесь: у дочернего процесса нет ввода
+        cfg = ask_settings(d)
+        if cfg is None:
+            print("Отменено."); return
+        env["SEG12_SETTINGS"] = save_settings(d, cfg)
     print(f"Запуск в отдельном процессе: {sys.executable} {os.path.abspath(__file__)}", flush=True)
     p = subprocess.Popen([sys.executable, "-u", os.path.abspath(__file__), d], env=env,
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
