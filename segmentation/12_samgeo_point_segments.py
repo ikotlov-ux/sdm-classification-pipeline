@@ -14,6 +14,12 @@ SAM 2 с подсказкой-точкой (samgeo SamGeo2, automatic=False) и 
   3. Эталон — яркости RGB в окне радиусом REF_RADIUS_M вокруг точки (или из
      поля REF_RADIUS_FIELD). Для каждого пикселя считается расстояние
      Махаланобиса d² до эталона; «хорошие» пиксели: d² <= χ²(CONFIDENCE, 3).
+     CONFIDENCE — доля пикселей самого эталона, которые проходят порог: чем
+     ВЫШЕ, тем МЯГЧЕ отбор (0.99 пропускает почти всё похожее и не очень),
+     чем НИЖЕ — тем строже (0.80, 0.50). При SMOOTH_M > 0 яркости перед этим
+     сглаживаются (Гаусс, сигма SMOOTH_M м): сравниваются участки, а не
+     отдельные пиксели, поэтому непохожие участки (дороги, прогалины, вырубки)
+     отсекаются целиком, а не мелкими дырками.
   4. Для каждой маски: доля = (хорошие пиксели маски внутри круга R) / πR².
      Доля считается от площади круга, а не маски. Выбирается маска с
      наибольшей долей; если она меньше MIN_GOOD_RATIO, точка отклоняется.
@@ -58,7 +64,7 @@ SAM 2 с подсказкой-точкой (samgeo SamGeo2, automatic=False) и 
 в этой папке. Без графического окружения те же вопросы задаются в консоли.
 Повторный запуск продолжает с места остановки. Если изменить параметры
 шагов 1–6 (модель, MAX_RADIUS_M, CONFIDENCE, MIN_GOOD_RATIO, REF_RADIUS_M,
-REF_RADIUS_FIELD, ENHANCE, MIN_SAM_SCORE, MIN_HOLE_M2, MIN_PART_M2,
+REF_RADIUS_FIELD, SMOOTH_M, ENHANCE, MIN_SAM_SCORE, MIN_HOLE_M2, MIN_PART_M2,
 REMOVE_OVERLAPS, OVERLAP_MODE, COINCIDENT_M), точки пересчитываются заново;
 MIN_PART_SHARE, KEEP_POINT_PART и SIMPLIFY_M меняются без пересчёта —
 достаточно запустить скрипт ещё раз.
@@ -116,13 +122,17 @@ TEST_N = 20                 # ТЕСТОВЫЙ ЗАПУСК на ~20 точка�
 # --- параметры сегмента (как в sam_segment_v12.py) ---
 MAX_RADIUS_M = 150.0        # радиус поиска: наибольший радиус объекта от точки, м
                             # (кадр SAM — квадрат 2R x 2R; R не больше RADIUS_M фрагментов)
-CONFIDENCE = 0.95           # уровень достоверности χ²: 0.80 мягкий / 0.95 / 0.99 строгий
+CONFIDENCE = 0.95           # порог χ² (доля пикселей эталона, проходящих порог):
+                            # ВЫШЕ — МЯГЧЕ (0.99), НИЖЕ — СТРОЖЕ (0.80, 0.50)
 MIN_GOOD_RATIO = 0.25       # мин. доля хороших пикселей маски от площади круга πR² (0–1)
 REF_RADIUS_M = 20.0         # радиус эталонного окна вокруг точки, м
 REF_RADIUS_FIELD = ""       # поле точки с радиусом эталона, м ("" -> общий REF_RADIUS_M;
                             # пустое значение или <= 0 -> тоже общий)
 ENHANCE = False             # растяжка контраста 2–98% кадра для SAM (Махаланобис —
                             # всегда по исходным яркостям)
+SMOOTH_M = 0.0              # сглаживание яркостей перед Махаланобисом, м (сигма Гаусса):
+                            # сравниваются участки, а не отдельные пиксели — отсев
+                            # непохожих участков целиком (0 -> по пикселям, как в v12)
 MIN_SAM_SCORE = 0.0         # маски SAM с оценкой ниже не рассматриваются (0 -> как в v12)
 MIN_HOLE_M2 = 10.0          # дырки сегмента меньше (м²) заливаются (0 -> как в v12)
 MIN_PART_M2 = 10.0          # островки сегмента меньше (м²) удаляются (0 -> как в v12)
@@ -237,14 +247,17 @@ def pick_dir():
 SPEC = [
     ("Сегмент точки", "MAX_RADIUS_M", "Радиус поиска R, м", "float", (1, None),
      "наибольший радиус объекта от точки; кадр SAM — квадрат 2R × 2R"),
-    ("Сегмент точки", "CONFIDENCE", "Достоверность (хи-квадрат)", "conf", ["0.80", "0.95", "0.99"],
-     "0.80 — мягкий отбор (больше пикселей), 0.99 — строгий; можно ввести своё"),
+    ("Сегмент точки", "CONFIDENCE", "Достоверность (хи-квадрат)", "conf",
+     ["0.50", "0.80", "0.90", "0.95", "0.99"],
+     "НИЖЕ — СТРОЖЕ: меньше непохожих пикселей (0.80, 0.50); выше — мягче (0.99)"),
     ("Сегмент точки", "MIN_GOOD_RATIO", "Мин. доля хороших пикселей", "float", (0, 1),
      "от площади круга поиска; если меньше — точка отклоняется"),
     ("Сегмент точки", "REF_RADIUS_M", "Радиус эталона, м", "float", (0.5, None),
      "окно вокруг точки, по которому считается спектральный эталон"),
     ("Сегмент точки", "REF_RADIUS_FIELD", "Поле радиуса эталона", "field", None,
      "свой радиус эталона у точки; пусто или ≤ 0 — общий радиус"),
+    ("Сегмент точки", "SMOOTH_M", "Сглаживание, м", "float", (0, 20),
+     "1–3 м: непохожие участки отсекаются целиком, а не мелкими дырками; 0 — как в v12"),
     ("Сегмент точки", "MIN_SAM_SCORE", "Мин. оценка маски SAM", "float", (0, 1),
      "маски с оценкой ниже не рассматриваются; 0 — как в v12"),
     ("Сегмент точки", "ENHANCE", "Растяжка контраста для SAM", "bool", None,
@@ -286,9 +299,9 @@ SPEC = [
 ]
 SETTING_NAMES = [s[1] for s in SPEC]
 SEG_PARAMS = ["SAM2_MODEL_ID", "MAX_RADIUS_M", "CONFIDENCE", "MIN_GOOD_RATIO", "REF_RADIUS_M",
-              "REF_RADIUS_FIELD", "ENHANCE", "MIN_SAM_SCORE", "MIN_HOLE_M2", "MIN_PART_M2",
+              "REF_RADIUS_FIELD", "SMOOTH_M", "ENHANCE", "MIN_SAM_SCORE", "MIN_HOLE_M2", "MIN_PART_M2",
               "REMOVE_OVERLAPS", "OVERLAP_MODE", "COINCIDENT_M"]    # их изменение -> пересчёт
-V12 = dict(MIN_SAM_SCORE=0.0, MIN_HOLE_M2=0.0, MIN_PART_M2=0.0, MIN_PART_SHARE=0.01,
+V12 = dict(SMOOTH_M=0.0, MIN_SAM_SCORE=0.0, MIN_HOLE_M2=0.0, MIN_PART_M2=0.0, MIN_PART_SHARE=0.01,
            KEEP_POINT_PART=False, SIMPLIFY_M=0.0, ENHANCE=False, REMOVE_OVERLAPS=True,
            OVERLAP_MODE="centroid")
 HEADER = {n: globals()[n] for n in SETTING_NAMES}      # значения из шапки скрипта
@@ -302,7 +315,8 @@ def settings_sig(cfg=None):
               float(c["MIN_GOOD_RATIO"]), float(c["REF_RADIUS_M"]), c["REF_RADIUS_FIELD"] or "",
               bool(c["ENHANCE"]), float(c["MIN_SAM_SCORE"]), float(c["MIN_HOLE_M2"]),
               float(c["MIN_PART_M2"]), bool(c["REMOVE_OVERLAPS"]), c["OVERLAP_MODE"],
-              float(c["COINCIDENT_M"])))
+              float(c["COINCIDENT_M"]))
+             + ((float(c["SMOOTH_M"]),) if float(c.get("SMOOTH_M", 0) or 0) else ()))
     return hashlib.md5(s.encode("utf-8")).hexdigest()[:8]
 
 
@@ -378,8 +392,8 @@ def _parse(spec, v):
             raise ValueError(f"{label}: число, например 0.95") from None
         if x > 1:                                   # 95 -> 0.95
             x /= 100
-        if not 0.5 <= x < 1:
-            raise ValueError(f"{label}: от 0.50 до 0.999")
+        if not 0.05 <= x < 1:
+            raise ValueError(f"{label}: от 0.05 до 0.999")
         return x
     try:
         x = int(t) if kind == "int" else float(t)
@@ -912,8 +926,13 @@ def point_mask(sam, raw_full, T, to_ll, colf, rowf, ref_r):
     res["scores"] = ";".join(f"{s:.3f}" for s in scores)
 
     # эталон и расстояние Махаланобиса для всех пикселей кадра
-    ref = raw[:, max(0, lr - ref_px):min(h, lr + ref_px + 1),
-              max(0, lc - ref_px):min(w, lc + ref_px + 1)].reshape(nb, -1).T.astype(np.float64)
+    spec_img = raw.astype(np.float64)
+    if SMOOTH_M and SMOOTH_M > 0:            # сглаживание: сравниваются участки, а не пиксели
+        from scipy import ndimage
+        sg = SMOOTH_M / px_m
+        spec_img = np.stack([ndimage.gaussian_filter(b, sg, mode="nearest") for b in spec_img])
+    ref = spec_img[:, max(0, lr - ref_px):min(h, lr + ref_px + 1),
+                   max(0, lc - ref_px):min(w, lc + ref_px + 1)].reshape(nb, -1).T
     if ref.shape[0] < nb + 1:
         res["reason"] = "мало пикселей в эталонном окне"
         return res, None
@@ -924,7 +943,7 @@ def point_mask(sam, raw_full, T, to_ll, colf, rowf, ref_r):
     except np.linalg.LinAlgError:
         res["reason"] = "вырожденная ковариация эталона"
         return res, None
-    diff = raw.reshape(nb, -1).T.astype(np.float64) - mean
+    diff = spec_img.reshape(nb, -1).T - mean
     d2 = np.einsum("ij,jk,ik->i", diff, icov, diff).reshape(h, w)
     good = d2 <= chi2.ppf(CONFIDENCE, df=nb)
 
@@ -1473,7 +1492,8 @@ def main():
     print(f"Настройки ({src}):")
     print(settings_info(["SAM2_MODEL_ID", "DEVICE", "N_WORKERS", "THREADS_PER_WORKER",
                          "WORKERS_PER_GPU", "TEST_N", "MAX_RADIUS_M", "CONFIDENCE",
-                         "MIN_GOOD_RATIO", "REF_RADIUS_M", "REF_RADIUS_FIELD", "ENHANCE",
+                         "MIN_GOOD_RATIO", "REF_RADIUS_M", "REF_RADIUS_FIELD", "SMOOTH_M",
+                         "ENHANCE",
                          "MIN_SAM_SCORE", "REMOVE_OVERLAPS", "OVERLAP_MODE", "COINCIDENT_M",
                          "MIN_HOLE_M2", "MIN_PART_M2", "MIN_PART_SHARE", "KEEP_POINT_PART",
                          "SIMPLIFY_M",
