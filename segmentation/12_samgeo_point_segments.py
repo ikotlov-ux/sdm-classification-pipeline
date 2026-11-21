@@ -11,9 +11,20 @@ SAM 2 с подсказкой-точкой (samgeo SamGeo2, automatic=False) и 
   1. Из её фрагмента читается квадрат 2R x 2R вокруг точки, R = MAX_RADIUS_M
      (радиус поиска — наибольший радиус объекта от точки).
   2. SAM 2 получает точку как положительную подсказку и возвращает 3 маски.
-  3. Эталон — яркости RGB в окне радиусом REF_RADIUS_M вокруг точки (или из
-     поля REF_RADIUS_FIELD). Для каждого пикселя считается расстояние
-     Махаланобиса d² до эталона; «хорошие» пиксели: d² <= χ²(CONFIDENCE, 3).
+  3. Эталон — признаки пикселей в окне радиусом REF_RADIUS_M вокруг точки (или
+     из поля REF_RADIUS_FIELD). Признаки (FEATURES): rgb — яркость R, G, B
+     (3 признака; только rgb — как в v12) и текстура яркости в скользящем окне
+     TEX_WINDOW_M: std — неоднородность (СКО), contrast — контраст соседних
+     пикселей (как GLCM, сдвиг 1 м), edges — плотность границ (средний
+     градиент Собеля), crowns — выраженность крон (разность Гауссов),
+     shadow — доля теней (пиксели темнее порога Оцу кадра). Текстура отличает
+     лес от луга и воды одинаковой яркости и «склеивает» кроны с тенями между
+     ними в один полог. Для каждого пикселя считается расстояние Махаланобиса
+     d² до эталона; «хорошие» пиксели: d² <= χ²(CONFIDENCE, k), k — число
+     признаков. При DIST_HALF_M = H > 0 вероятность принадлежности
+     P = χ²-хвост(d², k) · 0.5^((r/H)²) убывает с расстоянием r от точки;
+     хорошие пиксели: P >= 1 − CONFIDENCE, поэтому дальше
+     r = H · sqrt(log2(1 / (1 − CONFIDENCE))) от точки их нет вовсе.
      CONFIDENCE — доля пикселей самого эталона, которые проходят порог: чем
      ВЫШЕ, тем МЯГЧЕ отбор (0.99 пропускает почти всё похожее и не очень),
      чем НИЖЕ — тем строже (0.80, 0.50). При SMOOTH_M > 0 яркости перед этим
@@ -21,13 +32,19 @@ SAM 2 с подсказкой-точкой (samgeo SamGeo2, automatic=False) и 
      отдельные пиксели, поэтому непохожие участки (дороги, прогалины, вырубки)
      отсекаются целиком, а не мелкими дырками.
   4. Для каждой маски: доля = (хорошие пиксели маски внутри круга R) / πR².
-     Доля считается от площади круга, а не маски. Выбирается маска с
+     Доля считается от площади круга, а не маски (при DIST_HALF_M > 0 —
+     и пиксели, и круг с весом 0.5^((r/H)²)). Выбирается маска с
      наибольшей долей; если она меньше MIN_GOOD_RATIO, точка отклоняется.
      Пример: R = 150 м, 0.25 -> у объекта должно быть не меньше
      0.25 · π · 150² ≈ 1.77 га хороших пикселей.
   5. Сегмент = выбранная маска ∩ круг R ∩ хорошие пиксели; дырки меньше
      MIN_HOLE_M2 заливаются, островки меньше MIN_PART_M2 удаляются (на
      шумных снимках 0,3 м без этого в сегменте тысячи дырок-пикселей).
+     CONTOUR_SMOOTH_M > 0 — сглаживание контура: маска размывается Гауссом
+     (сигма CONTOUR_SMOOTH_M м) и снова режется по 0.5 — выступы и заливы
+     меньше ~2 x значения исчезают, площадь почти не меняется. SMOOTH_M
+     сглаживает не контур, а яркости перед сравнением; SIMPLIFY_M только
+     уменьшает число вершин.
   6. Перекрытия сегментов разных точек устраняются (OVERLAP_MODE):
      "voronoi" — пиксель отходит ближайшей точке из тех, чьи сегменты его
      покрывают (перекрытие делится серединным перпендикуляром); "centroid" —
@@ -65,14 +82,15 @@ SAM 2 с подсказкой-точкой (samgeo SamGeo2, automatic=False) и 
 Настройки: при запуске (ASK_SETTINGS = True) после выбора папки открывается окно
 со всеми параметрами сегментов, модели и запуска, с пояснениями. В нём сразу
 видны площадь круга поиска, минимальный объект, порог χ² и сколько точек уже
-готово с такими параметрами. Кнопки: «Как в v12» (очистка 0, centroid),
+готово с такими параметрами. Кнопки: «Как в v12» (только RGB, без спада и очистки, centroid),
 «Из шапки скрипта», «Запустить» (Enter), «Отмена» (Esc). Введённые значения
 сохраняются в _points/settings12.json и подставляются при следующем запуске
 в этой папке. Без графического окружения те же вопросы задаются в консоли.
 Повторный запуск продолжает с места остановки. Если изменить параметры
 шагов 1–6 (модель, MAX_RADIUS_M, CONFIDENCE, MIN_GOOD_RATIO, REF_RADIUS_M,
-REF_RADIUS_FIELD, SMOOTH_M, ENHANCE, MIN_SAM_SCORE, MIN_HOLE_M2, MIN_PART_M2,
-REMOVE_OVERLAPS, OVERLAP_MODE, COINCIDENT_M), точки пересчитываются заново;
+REF_RADIUS_FIELD, SMOOTH_M, FEATURES, TEX_WINDOW_M, DIST_HALF_M, ENHANCE,
+MIN_SAM_SCORE, MIN_HOLE_M2, MIN_PART_M2, CONTOUR_SMOOTH_M, REMOVE_OVERLAPS,
+OVERLAP_MODE, COINCIDENT_M), точки пересчитываются заново;
 MIN_PART_SHARE, KEEP_POINT_PART и SIMPLIFY_M меняются без пересчёта —
 достаточно запустить скрипт ещё раз.
 
@@ -129,20 +147,32 @@ TEST_N = 20                 # ТЕСТОВЫЙ ЗАПУСК на ~20 точка�
 # --- параметры сегмента (как в sam_segment_v12.py) ---
 MAX_RADIUS_M = 150.0        # радиус поиска: наибольший радиус объекта от точки, м
                             # (кадр SAM — квадрат 2R x 2R; R не больше RADIUS_M фрагментов)
-CONFIDENCE = 0.95           # порог χ² (доля пикселей эталона, проходящих порог):
+CONFIDENCE = 0.90           # порог χ² (доля пикселей эталона, проходящих порог):
                             # ВЫШЕ — МЯГЧЕ (0.99), НИЖЕ — СТРОЖЕ (0.80, 0.50)
-MIN_GOOD_RATIO = 0.25       # мин. доля хороших пикселей маски от площади круга πR² (0–1)
+MIN_GOOD_RATIO = 0.10       # мин. доля хороших пикселей маски от площади круга πR² (0–1)
 REF_RADIUS_M = 20.0         # радиус эталонного окна вокруг точки, м
 REF_RADIUS_FIELD = ""       # поле точки с радиусом эталона, м ("" -> общий REF_RADIUS_M;
                             # пустое значение или <= 0 -> тоже общий)
 ENHANCE = False             # растяжка контраста 2–98% кадра для SAM (Махаланобис —
                             # всегда по исходным яркостям)
-SMOOTH_M = 0.0              # сглаживание яркостей перед Махаланобисом, м (сигма Гаусса):
+SMOOTH_M = 2.0              # сглаживание яркостей RGB перед Махаланобисом, м (сигма Гаусса):
                             # сравниваются участки, а не отдельные пиксели — отсев
                             # непохожих участков целиком (0 -> по пикселям, как в v12)
+FEATURES = "rgb,std,shadow,crowns"   # признаки сравнения с эталоном (через запятую):
+                            # rgb — яркость R, G, B (только он — как в v12); текстура
+                            # яркости в окне TEX_WINDOW_M: std — неоднородность (СКО),
+                            # contrast — контраст соседних пикселей (как GLCM, сдвиг 1 м),
+                            # edges — плотность границ (средний градиент), crowns —
+                            # выраженность крон (разность Гауссов), shadow — доля теней
+TEX_WINDOW_M = 6.0          # окно текстуры, м (примерно диаметр кроны)
+DIST_HALF_M = 80.0          # расстояние от точки, м, на котором вероятность принадлежности
+                            # падает вдвое (0 -> не зависит от расстояния, как в v12);
+                            # дальше H·sqrt(log2(1/(1-CONFIDENCE))) хороших пикселей нет
 MIN_SAM_SCORE = 0.0         # маски SAM с оценкой ниже не рассматриваются (0 -> как в v12)
 MIN_HOLE_M2 = 10.0          # дырки сегмента меньше (м²) заливаются (0 -> как в v12)
-MIN_PART_M2 = 10.0          # островки сегмента меньше (м²) удаляются (0 -> как в v12)
+MIN_PART_M2 = 50.0          # островки сегмента меньше (м²) удаляются (0 -> как в v12)
+CONTOUR_SMOOTH_M = 5.0      # сглаживание контура сегмента, м: убирает выступы и заливы
+                            # меньше ~2 x значения (0 -> пиксельный контур, как в v12)
 
 # --- перекрытия и очистка ---
 REMOVE_OVERLAPS = True      # устранять перекрытия сегментов разных точек
@@ -252,6 +282,8 @@ def pick_dir():
 # ============================================================================
 # ОКНО НАСТРОЕК: все параметры сегментов спрашиваются при каждом запуске
 # ============================================================================
+FEATURE_CODES = ["rgb", "std", "contrast", "edges", "crowns", "shadow"]
+TEXTURES = ("std", "contrast", "edges", "crowns", "shadow")
 # (группа, имя, подпись, тип, варианты/диапазон, пояснение)
 SPEC = [
     ("Сегмент точки", "MAX_RADIUS_M", "Радиус поиска R, м", "float", (1, None),
@@ -265,8 +297,16 @@ SPEC = [
      "окно вокруг точки, по которому считается спектральный эталон"),
     ("Сегмент точки", "REF_RADIUS_FIELD", "Поле радиуса эталона", "field", None,
      "свой радиус эталона у точки; пусто или ≤ 0 — общий радиус"),
-    ("Сегмент точки", "SMOOTH_M", "Сглаживание, м", "float", (0, 20),
-     "1–3 м: непохожие участки отсекаются целиком, а не мелкими дырками; 0 — как в v12"),
+    ("Сегмент точки", "FEATURES", "Признаки сравнения", "multi", FEATURE_CODES,
+     "с чем сравнивается эталон: RGB — яркость каналов (только он — как в v12); остальное — "
+     "текстура яркости в окне: СКО — неоднородность, контраст — соседних пикселей (GLCM), "
+     "границы — средний градиент, кроны — выраженность крон, тени — доля теней"),
+    ("Сегмент точки", "TEX_WINDOW_M", "Окно текстуры, м", "float", (1, 50),
+     "примерно диаметр кроны; больше — ровнее сегмент, но грубее граница"),
+    ("Сегмент точки", "SMOOTH_M", "Сглаживание яркости, м", "float", (0, 20),
+     "RGB перед сравнением; 1–3 м: непохожие участки отсекаются целиком; 0 — как в v12"),
+    ("Сегмент точки", "DIST_HALF_M", "Спад с расстоянием, м", "float", (0, 10000),
+     "на этом расстоянии от точки вероятность принадлежности вдвое ниже; 0 — без спада"),
     ("Сегмент точки", "MIN_SAM_SCORE", "Мин. оценка маски SAM", "float", (0, 1),
      "маски с оценкой ниже не рассматриваются; 0 — как в v12"),
     ("Сегмент точки", "ENHANCE", "Растяжка контраста для SAM", "bool", None,
@@ -275,6 +315,8 @@ SPEC = [
      "0 — как в v12 (пиксельные дырки остаются)"),
     ("Очистка сегмента", "MIN_PART_M2", "Удалять островки до, м²", "float", (0, None),
      "0 — как в v12"),
+    ("Очистка сегмента", "CONTOUR_SMOOTH_M", "Сглаживание контура, м", "float", (0, 50),
+     "убирает выступы и заливы мельче ~2× значения; 0 — пиксельный контур"),
     ("Очистка сегмента", "MIN_PART_SHARE", "Удалять части меньше доли", "float", (0, 1),
      "от площади полигона; в v12 — 0.01"),
     ("Очистка сегмента", "KEEP_POINT_PART", "Только часть с точкой", "bool", None,
@@ -309,10 +351,14 @@ SPEC = [
      "32637 — UTM 37N (вся Московская обл.)"),
 ]
 SETTING_NAMES = [s[1] for s in SPEC]
+FEATURE_LABELS = dict(rgb="RGB", std="СКО", contrast="контраст", edges="границы",
+                      crowns="кроны", shadow="тени")
 SEG_PARAMS = ["SAM2_MODEL_ID", "MAX_RADIUS_M", "CONFIDENCE", "MIN_GOOD_RATIO", "REF_RADIUS_M",
-              "REF_RADIUS_FIELD", "SMOOTH_M", "ENHANCE", "MIN_SAM_SCORE", "MIN_HOLE_M2", "MIN_PART_M2",
+              "REF_RADIUS_FIELD", "SMOOTH_M", "FEATURES", "TEX_WINDOW_M", "DIST_HALF_M",
+              "ENHANCE", "MIN_SAM_SCORE", "MIN_HOLE_M2", "MIN_PART_M2", "CONTOUR_SMOOTH_M",
               "REMOVE_OVERLAPS", "OVERLAP_MODE", "COINCIDENT_M"]    # их изменение -> пересчёт
-V12 = dict(SMOOTH_M=0.0, MIN_SAM_SCORE=0.0, MIN_HOLE_M2=0.0, MIN_PART_M2=0.0, MIN_PART_SHARE=0.01,
+V12 = dict(SMOOTH_M=0.0, FEATURES="rgb", DIST_HALF_M=0.0, CONTOUR_SMOOTH_M=0.0,
+           MIN_SAM_SCORE=0.0, MIN_HOLE_M2=0.0, MIN_PART_M2=0.0, MIN_PART_SHARE=0.01,
            KEEP_POINT_PART=False, SIMPLIFY_M=0.0, ENHANCE=False, REMOVE_OVERLAPS=True,
            OVERLAP_MODE="centroid", FALLBACK_SQUARE_M=0.0)
 HEADER = {n: globals()[n] for n in SETTING_NAMES}      # значения из шапки скрипта
@@ -327,8 +373,34 @@ def settings_sig(cfg=None):
               bool(c["ENHANCE"]), float(c["MIN_SAM_SCORE"]), float(c["MIN_HOLE_M2"]),
               float(c["MIN_PART_M2"]), bool(c["REMOVE_OVERLAPS"]), c["OVERLAP_MODE"],
               float(c["COINCIDENT_M"]))
-             + ((float(c["SMOOTH_M"]),) if float(c.get("SMOOTH_M", 0) or 0) else ()))
+             + ((float(c["SMOOTH_M"]),) if float(c.get("SMOOTH_M", 0) or 0) else ())
+             + _sig_extra(c))
     return hashlib.md5(s.encode("utf-8")).hexdigest()[:8]
+
+
+def _feat_list(v):
+    """'rgb, std' / ['rgb', 'std'] -> ['rgb', 'std'] в каноническом порядке."""
+    if isinstance(v, (list, tuple)):
+        items = v
+    else:
+        items = str(v or "").replace(";", ",").replace(" ", ",").split(",")
+    got = {str(x).strip().lower() for x in items if str(x).strip()}
+    return [f for f in FEATURE_CODES if f in got]
+
+
+def _sig_extra(c):
+    """Новые параметры входят в подпись, только если отличаются от v12 — старые
+    результаты с прежними параметрами остаются готовыми."""
+    ex = ()
+    fl = _feat_list(c.get("FEATURES", "rgb")) or ["rgb"]
+    if fl != ["rgb"]:
+        ex += ("F", ",".join(fl),
+               float(c.get("TEX_WINDOW_M", 0)) if any(f in TEXTURES for f in fl) else 0.0)
+    if float(c.get("DIST_HALF_M", 0) or 0):
+        ex += ("D", float(c["DIST_HALF_M"]))
+    if float(c.get("CONTOUR_SMOOTH_M", 0) or 0):
+        ex += ("C", float(c["CONTOUR_SMOOTH_M"]))
+    return ex
 
 
 def current_settings():
@@ -340,6 +412,8 @@ def apply_settings(cfg):
 
 
 def _to_text(kind, v):
+    if kind == "multi":
+        return ",".join(_feat_list(v))
     if kind == "device":
         return "авто" if v in (None, "", "auto") else str(v)
     if kind == "conf":
@@ -363,6 +437,28 @@ def _parse(spec, v):
                 return False
             raise ValueError(f"{label}: да / нет")
         return bool(v)
+    if kind == "multi":                         # коды, подписи или номера через запятую
+        toks = str(v).replace(";", ",").replace(" ", ",").split(",")
+        lab = {l.lower(): c for c, l in FEATURE_LABELS.items()}
+        got, bad = [], []
+        for x in (t.strip().lower() for t in toks):
+            if not x:
+                continue
+            if x in opt:
+                got.append(x)
+            elif x in lab:
+                got.append(lab[x])
+            elif x.isdigit() and 1 <= int(x) <= len(opt):
+                got.append(opt[int(x) - 1])
+            else:
+                bad.append(x)
+        if bad:
+            raise ValueError(f"{label}: неизвестно {', '.join(bad)}; варианты: "
+                             f"{', '.join(f'{c} ({FEATURE_LABELS[c]})' for c in opt)}")
+        fl = _feat_list(got)
+        if not fl:
+            raise ValueError(f"{label}: нужен хотя бы один признак")
+        return ",".join(fl)
     t = str(v).strip().replace(",", ".")
     if kind == "str":
         if not t:
@@ -495,15 +591,31 @@ def _folder_facts(d):
     return facts
 
 
+def _n_features(fl):
+    return 3 * ("rgb" in fl) + sum(f in TEXTURES for f in fl)
+
+
 def _info_text(cfg, facts):
     """Пояснение к текущим значениям: площади, порог, готовые точки."""
     from scipy.stats import chi2
     R = float(cfg["MAX_RADIUS_M"])
     circ = math.pi * R ** 2
+    fl = _feat_list(cfg.get("FEATURES", "rgb")) or ["rgb"]
+    k = _n_features(fl)
+    hd = float(cfg.get("DIST_HALF_M", 0) or 0)
     lines = [f"Круг поиска: {circ / 1e4:.2f} га; минимальный объект: "
-             f"{cfg['MIN_GOOD_RATIO'] * circ / 1e4:.2f} га хороших пикселей; порог хи-квадрат "
-             f"{chi2.ppf(cfg['CONFIDENCE'], df=3):.3f}; окно эталона "
+             f"{cfg['MIN_GOOD_RATIO'] * circ / 1e4:.2f} га хороших пикселей"
+             f"{' (доля взвешена по расстоянию)' if hd else ''}; окно эталона "
              f"{math.pi * cfg['REF_RADIUS_M'] ** 2:,.0f} м²".replace(",", " ")]
+    num = "число" if k % 10 == 1 and k % 100 != 11 else (
+        "числа" if k % 10 in (2, 3, 4) and k % 100 not in (12, 13, 14) else "чисел")
+    txt = (f"Признаки: {', '.join(FEATURE_LABELS[f] for f in fl)} — {k} {num} на пиксель; "
+           f"порог хи-квадрат ({k} ст. св.) {chi2.ppf(cfg['CONFIDENCE'], df=k):.2f}")
+    if hd:
+        r_lim = hd * math.sqrt(math.log2(1 / (1 - cfg["CONFIDENCE"])))
+        txt += (f". Спад: в {hd:g} м от точки вероятность ×0.5, в {2 * hd:g} м ×0.06; "
+                f"дальше {r_lim:.0f} м не войдёт даже пиксель, совпадающий с эталоном")
+    lines.append(txt)
     g = facts.get("px_m")
     if g:
         a = g * g
@@ -513,7 +625,12 @@ def _info_text(cfg, facts):
             f"местности ({a:.2f} м²). Пороги — в м² на местности: дырки до "
             f"{cfg['MIN_HOLE_M2']:g} м² ~ {npx(cfg['MIN_HOLE_M2'])} пикс., островки до "
             f"{cfg['MIN_PART_M2']:g} м² ~ {npx(cfg['MIN_PART_M2'])} пикс.; сглаживание "
-            f"{cfg['SMOOTH_M']:g} м ~ {cfg['SMOOTH_M'] / g:.1f} пикс.")
+            f"{cfg['SMOOTH_M']:g} м ~ {cfg['SMOOTH_M'] / g:.1f} пикс."
+            + (f"; окно текстуры {cfg.get('TEX_WINDOW_M', 0):g} м ~ "
+               f"{cfg.get('TEX_WINDOW_M', 0) / g:.0f} пикс."
+               if any(f in TEXTURES for f in fl) else "")
+            + f"; сглаживание контура {cfg.get('CONTOUR_SMOOTH_M', 0):g} м ~ "
+              f"{cfg.get('CONTOUR_SMOOTH_M', 0) / g:.0f} пикс.")
     warn = []
     if facts.get("r_chip") and R > facts["r_chip"]:
         warn.append(f"R больше радиуса фрагментов ({facts['r_chip']:g} м) — круг будет "
@@ -570,7 +687,7 @@ def gui_settings(d, init, facts):
         pass
     small = (fam, 8)
     out = {"cfg": None}
-    vars_, widgets = {}, {}
+    vars_, widgets, multi = {}, {}, {}
     FIELD_NONE = "(общий радиус)"
 
     top = ttk.Frame(root, padding=(10, 8, 10, 0))
@@ -591,19 +708,45 @@ def gui_settings(d, init, facts):
 
     body = ttk.Frame(root, padding=10)
     body.grid(row=1, column=0, sticky="nsew")
-    cols = {"Сегмент точки": 0, "Очистка сегмента": 0,
-            "Перекрытия": 1, "Модель и запуск": 1, "Результат": 1}
+    cols = {"Сегмент точки": 0, "Перекрытия": 0,
+            "Очистка сегмента": 1, "Модель и запуск": 1, "Результат": 1}
     frames, rows, col_row = {}, {}, {0: 0, 1: 0}
+    colfr = {}
+    for c in (0, 1):                         # две колонки, группы в каждой — друг под другом
+        colfr[c] = ttk.Frame(body)
+        colfr[c].grid(row=0, column=c, sticky="n")
     for grp, name, label, kind, opt, hint in SPEC:
         if grp not in frames:
             c = cols[grp]
-            fr = ttk.LabelFrame(body, text=grp, padding=(8, 4))
-            fr.grid(row=col_row[c], column=c, sticky="new", padx=6, pady=4)
+            fr = ttk.LabelFrame(colfr[c], text=grp, padding=(8, 4))
+            fr.grid(row=col_row[c], column=0, sticky="new", padx=6, pady=4)
+            colfr[c].columnconfigure(0, weight=1)
             col_row[c] += 1
             frames[grp], rows[grp] = fr, 0
         fr, r = frames[grp], rows[grp]
         rows[grp] += 1
         val = init[name]
+        if kind == "multi":                  # флажки в одну строку, пояснение — под ними
+            v = tk.StringVar(value=_to_text(kind, val))
+            w = ttk.Frame(fr)
+            bvs = {}
+            cur = set(_feat_list(val))
+
+            def sync(v=v, bvs=bvs):
+                v.set(",".join(c for c in bvs if bvs[c].get()))
+            for j, c in enumerate(opt):
+                bvs[c] = tk.BooleanVar(value=c in cur)
+                ttk.Checkbutton(w, text=FEATURE_LABELS[c], variable=bvs[c],
+                                command=sync).grid(row=0, column=j, padx=(0, 8), sticky="w")
+            multi[name] = bvs
+            ttk.Label(fr, text=label, width=28).grid(row=r, column=0, sticky="w", pady=2)
+            w.grid(row=r, column=1, columnspan=2, sticky="w", padx=6, pady=2)
+            rows[grp] += 1
+            ttk.Label(fr, text=hint, foreground="#666", font=small, wraplength=520,
+                      justify="left").grid(row=r + 1, column=1, columnspan=2, sticky="w",
+                                           padx=6, pady=(0, 4))
+            vars_[name], widgets[name] = v, w
+            continue
         if kind == "bool":
             v = tk.BooleanVar(value=bool(val))
             w = ttk.Checkbutton(fr, variable=v)
@@ -629,7 +772,7 @@ def gui_settings(d, init, facts):
 
     info = tk.StringVar()
     ttk.Label(root, textvariable=info, padding=(16, 0), justify="left", wraplength=1150,
-              foreground="#1a4d8f").grid(row=2, column=0, sticky="w")
+              foreground="#1a4d8f").grid(row=2, column=0, sticky="ew")
 
     def read():
         cfg, errs = {}, []
@@ -647,6 +790,8 @@ def gui_settings(d, init, facts):
 
     def refresh(*_):
         cfg, errs = read()
+        tex_on = any(f in TEXTURES for f in _feat_list(vars_["FEATURES"].get()))
+        widgets["TEX_WINDOW_M"].configure(state="normal" if tex_on else "disabled")
         on = bool(vars_["REMOVE_OVERLAPS"].get())
         for n in ("OVERLAP_MODE", "COINCIDENT_M"):
             widgets[n].configure(state=("readonly" if n == "OVERLAP_MODE" else "normal")
@@ -664,6 +809,11 @@ def gui_settings(d, init, facts):
                 continue
             if kind == "bool":
                 vars_[name].set(bool(vals[name]))
+            elif kind == "multi":
+                on = set(_feat_list(vals[name]))
+                for c, bv in multi[name].items():
+                    bv.set(c in on)
+                vars_[name].set(_to_text(kind, vals[name]))
             elif kind == "field":
                 vars_[name].set(vals[name] or FIELD_NONE)
             else:
@@ -718,6 +868,9 @@ def console_settings(init, facts):
             var = " (" + ", ".join(f"{i}: {o}" for i, o in enumerate(opt, 1)) + ")"
         elif kind in ("device", "conf"):
             var = f" ({'/'.join(opt)})"
+        elif kind == "multi":
+            var = (" (через запятую: " + ", ".join(f"{i}: {c} — {FEATURE_LABELS[c]}"
+                                                  for i, c in enumerate(opt, 1)) + ")")
         else:
             var = " (да/нет)" if kind == "bool" else ""
         if kind == "field" and facts.get("fields"):
@@ -915,6 +1068,67 @@ def _clean(seg, px_m, holes=True, parts=True):
     return seg
 
 
+def _otsu(x):
+    """Порог Оцу (тени / освещённое) по гистограмме яркости кадра."""
+    hst, e = np.histogram(x, bins=256)
+    c = (e[:-1] + e[1:]) / 2
+    w0 = np.cumsum(hst).astype(np.float64)
+    w1 = w0[-1] - w0
+    m0 = np.cumsum(hst * c)
+    mu0 = m0 / np.maximum(w0, 1)
+    mu1 = (m0[-1] - m0) / np.maximum(w1, 1)
+    return float(c[int(np.argmax(w0 * w1 * (mu0 - mu1) ** 2))])
+
+
+def feature_stack(raw_full, r0, r1, c0, c1, px_m, feats):
+    """Признаки для кадра [r0:r1, c0:c1] -> (k, h, w) float64. Текстура считается по
+    яркости L = (R + G + B) / 3 в гауссовом окне TEX_WINDOW_M (сигма = окно / 2) на кадре
+    с запасом по краям, чтобы у края кадра окно было полным."""
+    from scipy import ndimage as ndi
+    if feats == ["rgb"]:                     # как в v12 и прежних версиях — те же результаты
+        img = raw_full[:3, r0:r1, c0:c1].astype(np.float64)
+        if SMOOTH_M and SMOOTH_M > 0:
+            img = np.stack([ndi.gaussian_filter(b, SMOOTH_M / px_m, mode="nearest") for b in img])
+        return img
+    tex = [f for f in feats if f in TEXTURES]
+    s_rgb = SMOOTH_M / px_m if (SMOOTH_M and SMOOTH_M > 0 and "rgb" in feats) else 0.0
+    s_w = max(TEX_WINDOW_M / px_m / 2, 0.5) if tex else 0.0
+    lag = max(1, int(round(1.0 / px_m)))                     # сдвиг контраста — 1 м
+    big = max(s_rgb, s_w, (TEX_WINDOW_M / 2 / px_m) if "crowns" in tex else 0.0)
+    pad = int(math.ceil(3 * big)) + lag + 2 if big else 0
+    _, H, W = raw_full.shape
+    R0, R1, C0, C1 = max(0, r0 - pad), min(H, r1 + pad), max(0, c0 - pad), min(W, c1 + pad)
+    a = raw_full[:3, R0:R1, C0:C1].astype(np.float32)
+    cr = (slice(r0 - R0, r1 - R0), slice(c0 - C0, c1 - C0))
+    out = []
+    if "rgb" in feats:
+        for b in a:
+            out.append(ndi.gaussian_filter(b, s_rgb, mode="reflect")[cr] if s_rgb else b[cr])
+    if tex:
+        L = a.mean(axis=0)
+
+        def G(x):
+            return ndi.gaussian_filter(x, s_w, mode="reflect")
+        if "std" in tex:                      # неоднородность: СКО яркости в окне
+            m = G(L)
+            out.append(np.sqrt(np.maximum(G(L * L) - m * m, 0))[cr])
+        if "contrast" in tex:                 # контраст GLCM: средний квадрат разности
+            acc = np.zeros_like(L)            # соседних пикселей (сдвиг 1 м, 4 направления)
+            for dy, dx in ((0, lag), (lag, 0), (lag, lag), (lag, -lag)):
+                acc += (L - np.roll(L, (dy, dx), axis=(0, 1))) ** 2
+            out.append(np.sqrt(G(acc / 4))[cr])
+        if "edges" in tex:                    # плотность границ: средний градиент
+            Ls = ndi.gaussian_filter(L, max(0.5 / px_m, 0.7))
+            out.append(G(np.hypot(ndi.sobel(Ls, 0), ndi.sobel(Ls, 1)))[cr])
+        if "crowns" in tex:                   # кроны: энергия разности Гауссов (окно/6, окно/2)
+            dog = (ndi.gaussian_filter(L, TEX_WINDOW_M / 6 / px_m) -
+                   ndi.gaussian_filter(L, TEX_WINDOW_M / 2 / px_m))
+            out.append(np.sqrt(G(dog * dog))[cr])
+        if "shadow" in tex:                   # доля теней: пиксели темнее порога Оцу кадра
+            out.append(G((L < _otsu(L)).astype(np.float32))[cr])
+    return np.stack(out).astype(np.float64)
+
+
 def point_mask(sam, raw_full, T, to_ll, colf, rowf, ref_r):
     """Сегмент одной точки на фрагменте (логика sam_segment_v12).
     Возвращает (res, (r0, c0, seg) или None)."""
@@ -958,33 +1172,46 @@ def point_mask(sam, raw_full, T, to_ll, colf, rowf, ref_r):
     scores = np.asarray(scores, dtype=float)
     res["scores"] = ";".join(f"{s:.3f}" for s in scores)
 
-    # эталон и расстояние Махаланобиса для всех пикселей кадра
-    spec_img = raw.astype(np.float64)
-    if SMOOTH_M and SMOOTH_M > 0:            # сглаживание: сравниваются участки, а не пиксели
-        from scipy import ndimage
-        sg = SMOOTH_M / px_m
-        spec_img = np.stack([ndimage.gaussian_filter(b, sg, mode="nearest") for b in spec_img])
+    # признаки кадра, эталон и расстояние Махаланобиса для всех пикселей
+    feats = _feat_list(FEATURES) or ["rgb"]
+    spec_img = feature_stack(raw_full, r0, r1, c0, c1, px_m, feats)
+    nb = spec_img.shape[0]
     ref = spec_img[:, max(0, lr - ref_px):min(h, lr + ref_px + 1),
                    max(0, lc - ref_px):min(w, lc + ref_px + 1)].reshape(nb, -1).T
     if ref.shape[0] < nb + 1:
         res["reason"] = "мало пикселей в эталонном окне"
         return res, None
     mean = ref.mean(axis=0)
-    cov = np.cov(ref, rowvar=False) + np.eye(nb) * 1e-6
+    cov = np.atleast_2d(np.cov(ref, rowvar=False)) + np.eye(nb) * 1e-6
+    if feats != ["rgb"]:                     # признаки разного масштаба и связаны друг с другом
+        cov += np.diag(np.diag(cov)) * 1e-3
     try:
         icov = np.linalg.inv(cov)
     except np.linalg.LinAlgError:
         res["reason"] = "вырожденная ковариация эталона"
         return res, None
     diff = spec_img.reshape(nb, -1).T - mean
+    del spec_img
     d2 = np.einsum("ij,jk,ik->i", diff, icov, diff).reshape(h, w)
-    good = d2 <= chi2.ppf(CONFIDENCE, df=nb)
+    del diff
 
     yy, xx = np.ogrid[:h, :w]
-    circle = ((yy - lr) ** 2 + (xx - lc) ** 2) <= half ** 2
-    circle_area = math.pi * half ** 2
+    rr2 = (yy - lr) ** 2 + (xx - lc) ** 2                  # квадрат расстояния, пикс.
+    circle = rr2 <= half ** 2
+    if DIST_HALF_M and DIST_HALF_M > 0:
+        # вероятность принадлежности = p(χ²) · 0.5^((r / DIST_HALF_M)²) >= 1 - CONFIDENCE
+        wgt = np.power(0.5, rr2 * (px_m / DIST_HALF_M) ** 2)
+        good = chi2.sf(d2, df=nb) * wgt >= 1 - CONFIDENCE
+        den = float(wgt[circle].sum())
+    else:
+        wgt = None
+        good = d2 <= chi2.ppf(CONFIDENCE, df=nb)
+        den = math.pi * half ** 2
     gc_ = good & circle
-    ratios = [float((m & gc_).sum()) / circle_area if m.any() else -1.0 for m in masks]
+    if wgt is None:
+        ratios = [float((m & gc_).sum()) / den if m.any() else -1.0 for m in masks]
+    else:                                    # доля, взвешенная по расстоянию от точки
+        ratios = [float(wgt[m & gc_].sum()) / den if m.any() else -1.0 for m in masks]
     res["ratios"] = ";".join("empty" if r < 0 else f"{r:.3f}" for r in ratios)
     cand = [r if sc >= MIN_SAM_SCORE else -1.0 for r, sc in zip(ratios, scores)]
     best = int(np.argmax(cand))                             # первая из максимальных, как в v12
@@ -994,7 +1221,12 @@ def point_mask(sam, raw_full, T, to_ll, colf, rowf, ref_r):
     if ratios[best] < MIN_GOOD_RATIO:
         res["reason"] = f"доля хороших пикселей {max(ratios[best], 0):.2f} < {MIN_GOOD_RATIO}"
         return res, None
-    seg = _clean(masks[best] & gc_, px_m)
+    seg = masks[best] & gc_
+    if CONTOUR_SMOOTH_M and CONTOUR_SMOOTH_M > 0:            # сглаживание контура
+        from scipy import ndimage
+        seg = (ndimage.gaussian_filter(seg.astype(np.float32), CONTOUR_SMOOTH_M / px_m,
+                                       mode="constant") >= 0.5) & circle
+    seg = _clean(seg, px_m)
     if not seg.any():
         res["reason"] = "пустой сегмент"
         return res, None
@@ -1563,6 +1795,7 @@ def main():
     print(settings_info(["SAM2_MODEL_ID", "DEVICE", "N_WORKERS", "THREADS_PER_WORKER",
                          "WORKERS_PER_GPU", "TEST_N", "MAX_RADIUS_M", "CONFIDENCE",
                          "MIN_GOOD_RATIO", "REF_RADIUS_M", "REF_RADIUS_FIELD", "SMOOTH_M",
+                         "FEATURES", "TEX_WINDOW_M", "DIST_HALF_M", "CONTOUR_SMOOTH_M",
                          "ENHANCE",
                          "MIN_SAM_SCORE", "REMOVE_OVERLAPS", "OVERLAP_MODE", "COINCIDENT_M",
                          "MIN_HOLE_M2", "MIN_PART_M2", "MIN_PART_SHARE", "KEEP_POINT_PART",
@@ -1570,7 +1803,8 @@ def main():
                          "OUT_EPSG", "OUT_NAME"]))
     from scipy.stats import chi2
     sig = settings_sig()
-    print(f"  χ²-порог ({CONFIDENCE * 100:.0f}%, 3 канала): {chi2.ppf(CONFIDENCE, df=3):.3f}; "
+    nf = _n_features(_feat_list(FEATURES) or ["rgb"])
+    print(f"  χ²-порог ({CONFIDENCE * 100:.0f}%, {nf} признаков): {chi2.ppf(CONFIDENCE, df=nf):.3f}; "
           f"круг R = {MAX_RADIUS_M:g} м: {math.pi * MAX_RADIUS_M ** 2 / 1e4:.2f} га, минимум "
           f"хороших пикселей {MIN_GOOD_RATIO * math.pi * MAX_RADIUS_M ** 2 / 1e4:.2f} га; "
           f"подпись параметров {sig}")
