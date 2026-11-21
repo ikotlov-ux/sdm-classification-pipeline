@@ -44,8 +44,17 @@ sdm-classification-pipeline/
 ├── segmentation/           фрагменты подложек вокруг точек + samgeo (шаги 10–11)
 ├── docs/                   схема развилки и заметки
 ├── requirements.txt
+├── update_CLASS.ps1      обновление скриптов в рабочей папке CLASS
 ├── .gitignore
 └── LICENSE
+```
+
+## Обновление скриптов в рабочей папке (Windows)
+
+[`update_CLASS.ps1`](update_CLASS.ps1) берёт свежую версию репозитория (git или zip-архив), копирует все `.py`, `requirements.txt` и сам себя в `I:\ikotlov\Yandex.Disk\MOS_OBL\2026\CLASS`, показывает `.py`, которых нет в репозитории, и удаляет их только после ответа `y`; папки `_backup_*` удаляются. Путь к папке задаётся переменной `$dst` в начале файла.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File "I:\ikotlov\Yandex.Disk\MOS_OBL\2026\CLASS\update_CLASS.ps1"
 ```
 
 ## Быстрый старт
