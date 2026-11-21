@@ -26,7 +26,10 @@
   * CPU: несколько процессов, у каждого своя копия модели и THREADS_PER_WORKER
     потоков (один процесс PyTorch плохо загружает 64 ядра; 8 x 8 — заметно
     быстрее). "auto" -> физические ядра / THREADS_PER_WORKER.
-  * GPU NVIDIA: "auto" -> по одному процессу на видеокарту.
+  * GPU NVIDIA: "auto" -> WORKERS_PER_GPU процессов на каждую видеокарту.
+  Веса модели скачиваются один раз в главном процессе до запуска рабочих
+  (одновременная запись в кэш Hugging Face из нескольких процессов на Windows
+  даёт PermissionError); рабочие процессы читают кэш без обращения к сети.
   Фрагменты раздаются динамически (кто освободился — берёт следующий).
   Каждый процесс пишет свой файл _parts/segments_<pid>.gpkg; в конце все
   части сливаются в segments.gpkg (дубли после прерванных запусков убираются).
@@ -77,7 +80,9 @@ SAM1_MODEL_TYPE = "vit_h"            # vit_b / vit_l / vit_h
 DEVICE = None               # None -> авто (cuda, если есть), "cpu", "cuda", "mps"
 
 N_WORKERS = "auto"          # "auto" или число процессов (1 -> последовательно)
-THREADS_PER_WORKER = 8      # потоков PyTorch на процесс (только CPU)
+THREADS_PER_WORKER = 8      # потоков PyTorch на процесс
+WORKERS_PER_GPU = 2         # процессов на видеокарту при N_WORKERS="auto": пока один процесс
+                            # готовит маски и контуры на процессоре, другой занимает карту
 MEM_PER_WORKER_GB = 16      # запас ОЗУ на процесс при N_WORKERS="auto" (large + quality);
                             # процессов не больше, чем свободная ОЗУ / MEM_PER_WORKER_GB
 TEST_N = 20                 # ТЕСТОВЫЙ ЗАПУСК на 20 фрагментах; после проверки лога -> 0 (все)
@@ -231,10 +236,25 @@ def gpu_count(verbose=True):
                 print(f"  GPU {i}: {nm}")
         elif smi:
             print("[!] Видеокарта есть, но PyTorch её не видит: установлена CPU-версия.\n"
-                  "    Переустановите PyTorch с CUDA (https://pytorch.org/get-started/locally/),\n"
-                  "    например: pip install torch torchvision --index-url "
-                  "https://download.pytorch.org/whl/cu124")
+                  "    Закройте Jupyter и другие процессы Python и выполните в PowerShell\n"
+                  "    от имени администратора (скачивается ~3 ГБ):\n    "
+                  + torch_cuda_cmd()
+                  + "\n    Другие версии: https://pytorch.org/get-started/locally/")
     return n
+
+
+def torch_cuda_cmd():
+    """Команда PowerShell для замены CPU-сборки PyTorch на сборку с CUDA 12.6 той же версии
+    (сборки cu126 есть для PyTorch 2.6–2.9; драйвер NVIDIA для CUDA 12.x: от 527.41)."""
+    from importlib import metadata
+    pk = []
+    for name in ("torch", "torchvision"):
+        try:
+            pk.append(f"{name}=={metadata.version(name).split('+')[0]}+cu126")
+        except Exception:
+            pass
+    return (f'& "{sys.executable}" -m pip install --force-reinstall --no-deps '
+            f'{" ".join(pk) or "torch torchvision"} --index-url https://download.pytorch.org/whl/cu126')
 
 
 def physical_cores():
@@ -303,6 +323,31 @@ def load_model(device):
         f = mod.generate_crop_boxes
         mod.generate_crop_boxes = _adaptive_crop_boxes(getattr(f, "_orig", f))
     return sam
+
+
+def prefetch_weights():
+    """Скачивает веса модели один раз в главном процессе (до запуска рабочих).
+    Возвращает True, если веса есть в кэше и рабочие процессы могут работать без сети."""
+    t = time.time()
+    try:
+        if MODEL == "sam2":
+            from huggingface_hub import hf_hub_download
+            from sam2.build_sam import HF_MODEL_ID_TO_FILENAMES
+            repo = SAM2_MODEL_ID if "/" in SAM2_MODEL_ID else f"facebook/{SAM2_MODEL_ID}"
+            path = hf_hub_download(repo_id=repo, filename=HF_MODEL_ID_TO_FILENAMES[repo][1])
+        else:
+            import warnings
+            warnings.filterwarnings("ignore")
+            sam = load_model("cpu")                 # SamGeo сам скачивает чекпойнт, если его нет
+            path = getattr(sam, "checkpoint", "") or "чекпойнт SAM 1"
+            del sam
+            gc.collect()
+        print(f"Веса модели: {path} ({time.time() - t:.0f} с)", flush=True)
+        return True
+    except Exception as e:
+        print(f"[!] Не удалось заранее загрузить веса модели: {e!r}\n"
+              f"    Рабочие процессы попробуют загрузить их сами.", flush=True)
+        return False
 
 
 def stretch(img, lo=2, hi=98):
@@ -425,15 +470,22 @@ def init_worker(wid, chips_dir, n_gpu, threads):
         for v in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
             os.environ[v] = str(threads)
     import torch
+    torch.set_num_threads(threads)      # и на GPU: иначе каждый процесс берёт все 128 потоков
     if device == "cpu":
-        torch.set_num_threads(threads)
         try:
             torch.set_num_interop_threads(1)
         except RuntimeError:
             pass
     import warnings
     warnings.filterwarnings("ignore")
-    _W["sam"] = load_model(device)
+    for attempt in range(3):            # файлы кэша на Windows бывают кратковременно заняты
+        try:
+            _W["sam"] = load_model(device)
+            break
+        except OSError:
+            if attempt == 2:
+                raise
+            time.sleep(5 + 2 * attempt + wid)
     _W["dir"] = chips_dir
     os.makedirs(os.path.join(chips_dir, "_parts"), exist_ok=True)
     _W["part"] = os.path.join(chips_dir, "_parts", f"segments_{os.getpid()}.gpkg")
@@ -581,8 +633,8 @@ def main():
     print(system_info())
     print("Настройки:")
     print(settings_info(["MODEL", "SAM2_MODEL_ID", "SAM1_MODEL_TYPE", "DEVICE", "N_WORKERS",
-                         "THREADS_PER_WORKER", "TEST_N", "PRESET", "AMG_KWARGS", "ENHANCE",
-                         "MIN_REGION_PX", "ADAPTIVE_CROPS", "CROP_MAX_PX", "MIN_AREA_M2",
+                         "THREADS_PER_WORKER", "WORKERS_PER_GPU", "TEST_N", "PRESET",
+                         "AMG_KWARGS", "ENHANCE", "MIN_REGION_PX", "ADAPTIVE_CROPS", "CROP_MAX_PX", "MIN_AREA_M2",
                          "SIMPLIFY_M", "CLIP_TO_CIRCLE", "OUT_EPSG"]))
     print(f"Папка фрагментов: {os.path.abspath(d)}")
     print(f"Лог: {log_path}")
@@ -636,7 +688,8 @@ def main():
     if DEVICE == "cuda" and n_gpu == 0:
         raise RuntimeError("DEVICE = 'cuda', но видеокарта недоступна PyTorch")
     if N_WORKERS == "auto":
-        nw = n_gpu if n_gpu > 0 else max(1, physical_cores() // THREADS_PER_WORKER)
+        nw = (n_gpu * max(1, int(WORKERS_PER_GPU)) if n_gpu > 0
+              else max(1, physical_cores() // THREADS_PER_WORKER))
         if n_gpu == 0:
             try:
                 import psutil
@@ -651,7 +704,8 @@ def main():
     else:
         nw = int(N_WORKERS)
     nw = max(1, min(nw, len(todo)))
-    dev = f"GPU x{n_gpu}" if n_gpu else f"CPU, {THREADS_PER_WORKER} потоков на процесс"
+    dev = (f"GPU x{n_gpu}, процессов на карту: {math.ceil(nw / n_gpu)}" if n_gpu
+           else f"CPU, {THREADS_PER_WORKER} потоков на процесс")
     print(f"Процессов: {nw} ({dev}); модель {SAM2_MODEL_ID if MODEL == 'sam2' else SAM1_MODEL_TYPE}, "
           f"preset {PRESET}. Загрузка моделей...")
 
@@ -667,12 +721,15 @@ def main():
     tokens = {r["chip_id"]: r["token"] for r in rows}
     cost_todo = sum(cost.values())
 
+    if prefetch_weights():
+        os.environ["HF_HUB_OFFLINE"] = "1"      # рабочие процессы: только кэш, без записи и сети
     ctx = mp.get_context("spawn")
     task_q, res_q = ctx.Queue(), ctx.Queue()
     for r in rows:
         task_q.put(r)                   # «стоп»-сигналы отправляются после завершения всех задач
     row_by_id = {r["chip_id"]: r for r in rows}
     retries = {}
+    fails = {}
 
     def spawn(wid):
         p = ctx.Process(target=worker_loop, daemon=True,
@@ -756,9 +813,19 @@ def main():
             print(f"  процесс {wid} (pid {data[0]}) готов, модель загружена за {data[1]:.0f} с "
                   f"{tag}", flush=True)
         elif kind == "fail":
-            print(f"[!] Процесс {wid} не смог загрузить модель: {data.splitlines()[0]}")
+            fails[wid] = fails.get(wid, 0) + 1
+            print(f"[!] Процесс {wid} не смог загрузить модель (попытка {fails[wid]}): "
+                  f"{data.splitlines()[0]}", flush=True)
+            if fails[wid] == 1:
+                print("    Повторный запуск процесса.", flush=True)
+                workers[wid] = spawn(wid)
+                continue
             print(data)
-            raise SystemExit(1)
+            workers.pop(wid, None)
+            if not workers:
+                print("Ни один процесс не загрузил модель — остановлено.")
+                raise SystemExit(1)
+            print(f"    Работа продолжается без него, процессов: {len(workers)}.", flush=True)
         elif kind == "start":
             inflight[wid] = data
         elif kind == "done":

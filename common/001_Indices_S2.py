@@ -464,8 +464,21 @@ def pick_device():
         why = f"PyTorch не установлен ({type(e).__name__})"
     if smi:
         why += f"; nvidia-smi: {'; '.join(smi)}"
-        hint = ("\n    Карта есть, но PyTorch установлен без CUDA. Установка с CUDA:\n"
-                "    pip install torch --index-url https://download.pytorch.org/whl/cu126")
+        try:
+            from importlib import metadata
+            tv = metadata.version("torch").split("+")[0]
+            pk = f"torch=={tv}+cu126"
+            try:
+                pk += f" torchvision=={metadata.version('torchvision').split('+')[0]}+cu126"
+            except Exception:
+                pass
+        except Exception:
+            pk = "torch"
+        hint = ("\n    Карта есть, но PyTorch установлен без CUDA. Закройте Jupyter и другие\n"
+                "    процессы Python и выполните в PowerShell от имени администратора:\n"
+                f'    & "{sys.executable}" -m pip install --force-reinstall --no-deps {pk} '
+                "--index-url https://download.pytorch.org/whl/cu126\n"
+                "    Другие версии: https://pytorch.org/get-started/locally/")
     else:
         why += "; видеокарт NVIDIA не найдено"
         hint = ""
