@@ -61,6 +61,10 @@ import sys
 import time
 import traceback
 
+# Hugging Face на Windows без прав на символические ссылки хранит копии файлов —
+# работает, но каждый раз пишет длинное предупреждение
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+
 import numpy as np
 import pandas as pd
 import geopandas as gpd
@@ -334,7 +338,11 @@ def prefetch_weights():
             from huggingface_hub import hf_hub_download
             from sam2.build_sam import HF_MODEL_ID_TO_FILENAMES
             repo = SAM2_MODEL_ID if "/" in SAM2_MODEL_ID else f"facebook/{SAM2_MODEL_ID}"
-            path = hf_hub_download(repo_id=repo, filename=HF_MODEL_ID_TO_FILENAMES[repo][1])
+            fn = HF_MODEL_ID_TO_FILENAMES[repo][1]
+            try:                                    # уже скачаны -> без обращения к сети
+                path = hf_hub_download(repo_id=repo, filename=fn, local_files_only=True)
+            except Exception:
+                path = hf_hub_download(repo_id=repo, filename=fn)
         else:
             import warnings
             warnings.filterwarnings("ignore")
@@ -477,7 +485,9 @@ def init_worker(wid, chips_dir, n_gpu, threads):
         except RuntimeError:
             pass
     import warnings
+    import logging
     warnings.filterwarnings("ignore")
+    logging.getLogger("rasterio._env").setLevel(logging.ERROR)   # GDAL 3.11: 'Memory' -> 'MEM'
     for attempt in range(3):            # файлы кэша на Windows бывают кратковременно заняты
         try:
             _W["sam"] = load_model(device)
@@ -549,6 +559,55 @@ def worker_loop(wid, task_q, res_q, chips_dir, n_gpu, threads):
             break
         res_q.put(("start", wid, row["chip_id"]))
         res_q.put(("done", wid, process_chip(row)))
+
+
+# ============================================================================
+# ЗАГРУЗКА ВИДЕОКАРТ (nvidia-smi раз в GPU_SAMPLE_S секунд, итог — в конце)
+# ============================================================================
+class GpuMonitor:
+    def __init__(self, every=10):
+        import shutil
+        import threading
+        self.ok = bool(shutil.which("nvidia-smi"))
+        self.every, self.samples = every, {}
+        self._stop = threading.Event()
+        self._t = threading.Thread(target=self._run, daemon=True)
+
+    def start(self):
+        if self.ok:
+            self._t.start()
+        return self
+
+    def _run(self):
+        import subprocess
+        while not self._stop.wait(self.every):
+            try:
+                r = subprocess.run(["nvidia-smi", "--query-gpu=index,utilization.gpu,memory.used,"
+                                    "memory.total", "--format=csv,noheader,nounits"],
+                                   capture_output=True, text=True, timeout=15)
+                for line in r.stdout.splitlines():
+                    i, u, m, mt = [v.strip() for v in line.split(",")]
+                    self.samples.setdefault(int(i), []).append((float(u), float(m), float(mt)))
+            except Exception:
+                pass
+
+    def report(self, n_gpu, per_gpu):
+        self._stop.set()
+        if not self.samples:
+            return
+        low, room = True, True
+        for i, ss in sorted(self.samples.items()):
+            if i >= n_gpu:
+                continue
+            u = [x[0] for x in ss]
+            mem, tot = max(x[1] for x in ss), ss[0][2]
+            print(f"Загрузка GPU {i}: средняя {np.mean(u):.0f}%, медиана {np.median(u):.0f}%, "
+                  f"память до {mem / 1024:.1f} из {tot / 1024:.0f} ГБ ({len(ss)} замеров)")
+            low &= np.median(u) < 70
+            room &= mem / per_gpu * (per_gpu + 1) < 0.85 * tot
+        if low and room:
+            print(f"  Видеокарты загружены не полностью и памяти хватает: можно поставить "
+                  f"WORKERS_PER_GPU = {per_gpu + 1} (сейчас {per_gpu}).")
 
 
 # ============================================================================
@@ -746,6 +805,7 @@ def main():
                                 "worker_peak_ram_gb", "error"])
     print(f"Модели загружаются в {nw} процессах (первый фрагмент появится после загрузки)...",
           flush=True)
+    gmon = GpuMonitor().start() if n_gpu else None
     t0 = time.time()
     k = segs = errs = 0
     pts_run = 0
@@ -841,6 +901,8 @@ def main():
 
     el = time.time() - t0
     print(f"\nОбработано {k} фрагментов за {fmt_t(el)}; ошибок {errs}.")
+    if gmon:
+        gmon.report(n_gpu, math.ceil(nw / n_gpu))
     if TEST_N and cost_done:
         # оставшиеся фрагменты: из плана 10_ (_plan.json, все места) или из индекса
         done_ids = {t.split("|")[0] for t in done}
@@ -898,8 +960,12 @@ def run_from_jupyter():
         for line in p.stdout:
             print(line, end="", flush=True)
     except KeyboardInterrupt:
-        p.terminate()
-        print("\nОстановлено пользователем (готовые фрагменты сохранены).")
+        if os.name == "nt":             # вместе с рабочими процессами (иначе они держат GPU)
+            subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True)
+        else:
+            p.terminate()
+        print("\nОстановлено пользователем (готовые фрагменты сохранены; "
+              "повторный запуск продолжит с места остановки).")
     p.wait()
 
 
