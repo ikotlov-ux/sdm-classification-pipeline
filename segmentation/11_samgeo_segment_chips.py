@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-02g_samgeo_segment_chips.py
+11_samgeo_segment_chips.py
 ==========================
-Пакетная сегментация всех фрагментов, созданных 01g_download_sat_chips.py,
+Пакетная сегментация всех фрагментов, созданных 10_download_sat_chips.py,
 через segment-geospatial (samgeo): SAM 2 (по умолчанию) или SAM 1.
 
 Результат — ОДИН векторный слой segments.gpkg на все точки:
@@ -29,7 +29,7 @@
 _errors.csv, работа не прерывается.
 
 Ускорение ценой мелких контуров: PRESET = "fast" (crop_n_layers=0, ~3x
-быстрее) и/или фрагменты zoom 17 в скрипте 01g.
+быстрее) и/или фрагменты zoom 17 в скрипте 10.
 
 Установка:
   pip install segment-geospatial sam2 geopandas rasterio      # + PyTorch (CUDA при наличии GPU)
@@ -431,9 +431,9 @@ def main():
     d = pick_dir()
     if not d:
         print("Папка не выбрана."); return
-    log_path, stamp = start_log(os.path.join(d, "_logs"), "02g_segment")
+    log_path, stamp = start_log(os.path.join(d, "_logs"), "11_segment")
     print("=" * 78)
-    print("02g_samgeo_segment_chips.py" + ("  [ТЕСТОВЫЙ ЗАПУСК]" if TEST_N else ""))
+    print("11_samgeo_segment_chips.py" + ("  [ТЕСТОВЫЙ ЗАПУСК]" if TEST_N else ""))
     print("=" * 78)
     print(system_info())
     print("Настройки:")
@@ -508,7 +508,7 @@ def main():
 
     workers = {w: spawn(w) for w in range(nw)}
     inflight = {}                       # wid -> chip_id
-    timing_f = os.path.join(d, "_logs", f"02g_timing_{stamp}.csv")
+    timing_f = os.path.join(d, "_logs", f"11_timing_{stamp}.csv")
     with open(timing_f, "w", newline="", encoding="utf-8-sig") as f:
         csv.writer(f).writerow(["chip_id", "n_points", "n_segments", "seconds", "worker_pid",
                                 "worker_peak_ram_gb", "error"])
@@ -599,7 +599,7 @@ def main():
     if TEST_N:
         rest = len(idx[~idx.chip_id.isin(done)])
         plan = os.path.join(d, "_plan.json")
-        if os.path.exists(plan):                     # тест после тестовой загрузки 01g
+        if os.path.exists(plan):                     # тест после тестовой загрузки 10
             import json
             rest = max(rest, json.load(open(plan, encoding="utf-8"))["n_places"] - len(done))
         per_chip = sec_sum / max(k, 1)

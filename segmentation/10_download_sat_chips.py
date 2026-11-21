@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-01g_download_sat_chips.py
+10_download_sat_chips.py
 ========================
 Выгрузка фрагментов спутниковых подложек высокого разрешения (Google / Bing /
 Yandex / ESRI World Imagery) вокруг точек: окружность радиусом RADIUS_M,
@@ -531,9 +531,9 @@ def main():
 
     out_dir = OUT_DIR or os.path.join(os.path.dirname(os.path.abspath(files[0])),
                                       f"sat_chips_{PROVIDER}_z{ZOOM}")
-    log_path, stamp = start_log(os.path.join(out_dir, "_logs"), "01g_download")
+    log_path, stamp = start_log(os.path.join(out_dir, "_logs"), "10_download")
     print("=" * 78)
-    print("01g_download_sat_chips.py" + ("  [ТЕСТОВЫЙ ЗАПУСК]" if TEST_N else ""))
+    print("10_download_sat_chips.py" + ("  [ТЕСТОВЫЙ ЗАПУСК]" if TEST_N else ""))
     print("=" * 78)
     print(system_info())
     print("Настройки:")
