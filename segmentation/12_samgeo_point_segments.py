@@ -609,7 +609,7 @@ def gui_settings(d, init, facts):
                 v.set(val or FIELD_NONE)
                 w = ttk.Combobox(fr, textvariable=v, values=fl, state="readonly", width=20)
             else:
-                w = ttk.Entry(fr, textvariable=v, width=22)
+                w = ttk.Entry(fr, textvariable=v, width=34 if name == "OUT_NAME" else 22)
         ttk.Label(fr, text=label, width=28).grid(row=r, column=0, sticky="w", pady=2)
         w.grid(row=r, column=1, sticky="w", padx=6, pady=2)
         ttk.Label(fr, text=hint, foreground="#666", font=small, wraplength=300,
