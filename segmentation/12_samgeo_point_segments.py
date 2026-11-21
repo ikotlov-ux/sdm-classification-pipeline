@@ -461,6 +461,18 @@ def _folder_facts(d):
         facts["n_chips"] = int((idx["file"].fillna("") != "").sum())
         if "radius_m" in idx:
             facts["r_chip"] = float(pd.to_numeric(idx["radius_m"], errors="coerce").min())
+        f0 = next(f for f in idx["file"].fillna("") if f)
+        with rasterio.open(os.path.join(d, f0)) as src:        # пиксель на местности
+            res, epsg = float(src.res[0]), src.crs.to_epsg()
+            cx, cy = (src.bounds.left + src.bounds.right) / 2, (src.bounds.bottom + src.bounds.top) / 2
+            if src.crs.is_geographic:
+                gpx = None
+            elif epsg in (3857, 3395, 900913):
+                lat = Transformer.from_crs(src.crs, 4326, always_xy=True).transform(cx, cy)[1]
+                gpx = res * math.cos(math.radians(lat))
+            else:
+                gpx = res
+        facts.update(res=res, epsg=epsg, px_m=gpx)
     except Exception:
         pass
     try:
@@ -481,6 +493,16 @@ def _info_text(cfg, facts):
              f"{cfg['MIN_GOOD_RATIO'] * circ / 1e4:.2f} га хороших пикселей; порог хи-квадрат "
              f"{chi2.ppf(cfg['CONFIDENCE'], df=3):.3f}; окно эталона "
              f"{math.pi * cfg['REF_RADIUS_M'] ** 2:,.0f} м²".replace(",", " ")]
+    g = facts.get("px_m")
+    if g:
+        a = g * g
+        npx = lambda m2: f"{m2 / a:,.0f}".replace(",", " ")
+        lines.append(
+            f"Пиксель снимка: {facts['res']:.2f} ед. EPSG:{facts['epsg']} = {g:.2f} м на "
+            f"местности ({a:.2f} м²). Пороги — в м² на местности: дырки до "
+            f"{cfg['MIN_HOLE_M2']:g} м² ~ {npx(cfg['MIN_HOLE_M2'])} пикс., островки до "
+            f"{cfg['MIN_PART_M2']:g} м² ~ {npx(cfg['MIN_PART_M2'])} пикс.; сглаживание "
+            f"{cfg['SMOOTH_M']:g} м ~ {cfg['SMOOTH_M'] / g:.1f} пикс.")
     warn = []
     if facts.get("r_chip") and R > facts["r_chip"]:
         warn.append(f"R больше радиуса фрагментов ({facts['r_chip']:g} м) — круг будет "
