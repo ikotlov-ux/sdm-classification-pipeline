@@ -7,9 +7,20 @@
 
 Результат — ОДИН векторный слой segments.gpkg на все точки:
   chip_id, members (все точки фрагмента), n_points, seg_id, area_m2,
-  cut_by_circle, center_dist_m (от центра сегмента до точки), geometry.
+  cut_by_circle (сегмент обрезан границей кругов), points_in / n_pts_in (точки
+  внутри сегмента), near_point / near_dist_m (ближайшая точка и расстояние от
+  контура сегмента до неё, 0 — точка внутри), geometry.
 Полигоны — в метрической проекции (OUT_EPSG, по умолчанию UTM 37N),
-(опц.) обрезаны по окружности RADIUS_M вокруг точки.
+(опц.) обрезаны по кругам RADIUS_M вокруг всех точек фрагмента
+(координаты точек — из chips_points.gpkg, который пишет 10_).
+
+Общие фрагменты (несколько близких точек, до 2 км): чтобы детальность была
+такой же, как у одиночного фрагмента 1 км, крупный фрагмент делится на
+больше кадров SAM (ADAPTIVE_CROPS, кадр не больше CROP_MAX_PX). Время
+обработки фрагмента растёт примерно пропорционально его площади; прогноз
+считается по числу кадров. Маски хранятся в сжатом виде (RLE), а мелкие
+островки убираются на растре меток (MIN_REGION_PX) — так расход памяти
+почти не зависит от размера фрагмента.
 
 Параллельная работа (N_WORKERS):
   * CPU: несколько процессов, у каждого своя копия модели и THREADS_PER_WORKER
@@ -40,6 +51,7 @@ _errors.csv, работа не прерывается.
 import csv
 import gc
 import glob
+import math
 import multiprocessing as mp
 import os
 import sys
@@ -83,15 +95,18 @@ AMG_KWARGS = dict(
     stability_score_thresh=0.85,
     crop_n_layers=1,
     crop_n_points_downscale_factor=2,
-    min_mask_region_area=100,       # пикс., удаление мелких "дырок" и островков
-)
+    min_mask_region_area=0,         # 0: мелкие "дырки" и островки убираются ниже
+)                                   # (MIN_REGION_PX) — экономнее по памяти, чем в SAM
 if PRESET == "fast":
     AMG_KWARGS["crop_n_layers"] = 0
+MIN_REGION_PX = 100         # островки и дырки меньше (пикс.) сливаются с соседним сегментом
+ADAPTIVE_CROPS = True       # крупные (общие) фрагменты -> больше кадров, детальность как у 1 км
+CROP_MAX_PX = 2000          # наибольший размер кадра SAM, пикс. (у фрагмента 1 км z18 ~2000)
 
 ENHANCE = True              # растяжка контраста 2–98 перцентиль по каналам перед SAM
 MIN_AREA_M2 = 50.0          # отбросить сегменты меньше (м²)
 SIMPLIFY_M = 0.5            # упрощение контуров, м (0 -> без упрощения)
-CLIP_TO_CIRCLE = True       # обрезать сегменты по окружности RADIUS_M вокруг точки
+CLIP_TO_CIRCLE = True       # обрезать сегменты по кругам RADIUS_M вокруг точек фрагмента
 OUT_EPSG = 32637            # UTM 37N — вся Московская обл.; None -> CRS фрагмента
 KEEP_MASK_TIF = False       # сохранять растр масок (LZW) рядом с фрагментом
 OUT_NAME = "segments.gpkg"
@@ -114,6 +129,9 @@ class _Tee:
     def flush(self):
         self.stream.flush()
         self.fh.flush()
+
+    def __getattr__(self, name):          # encoding, isatty и т.п. — от исходного потока
+        return getattr(self.stream, name)
 
 
 _LOG = {}
@@ -230,13 +248,61 @@ def physical_cores():
     return max(1, (os.cpu_count() or 2) // 2)
 
 
+def _crop_grid(n_px):
+    """Число кадров SAM по стороне фрагмента (не меньше 2, как в SAM)."""
+    ov = int(512 / 1500 * CROP_MAX_PX)                     # перекрытие кадров, как в SAM
+    return max(2, math.ceil((n_px - ov) / (CROP_MAX_PX - ov)))
+
+
+def _adaptive_crop_boxes(orig):
+    """Замена generate_crop_boxes SAM: слой 1 — сетка nx x ny кадров не больше
+    CROP_MAX_PX. Для обычного фрагмента (2 x 2) — исходная функция SAM."""
+    def fn(im_size, n_layers, overlap_ratio):
+        h, w = im_size
+        if n_layers != 1:
+            return orig(im_size, n_layers, overlap_ratio)
+        nx, ny = _crop_grid(w), _crop_grid(h)
+        if nx == 2 and ny == 2:
+            return orig(im_size, n_layers, overlap_ratio)
+        ov = int(overlap_ratio * CROP_MAX_PX)
+        cw = math.ceil((ov * (nx - 1) + w) / nx)
+        ch = math.ceil((ov * (ny - 1) + h) / ny)
+        boxes, layers = [[0, 0, w, h]], [0]
+        for i in range(nx):
+            for j in range(ny):
+                x0, y0 = int((cw - ov) * i), int((ch - ov) * j)
+                boxes.append([x0, y0, min(x0 + cw, w), min(y0 + ch, h)])
+                layers.append(1)
+        return boxes, layers
+    fn._orig = orig
+    return fn
+
+
+def n_crops(w, h):
+    """Сколько кадров SAM обработает для фрагмента w x h (для прогноза времени)."""
+    L = int(AMG_KWARGS.get("crop_n_layers", 0))
+    if L == 0:
+        return 1
+    if L == 1:
+        return 1 + (_crop_grid(w) * _crop_grid(h) if ADAPTIVE_CROPS else 4)
+    return sum(4 ** i for i in range(L + 1))
+
+
 def load_model(device):
     if MODEL == "sam2":
         from samgeo import SamGeo2
-        return SamGeo2(model_id=SAM2_MODEL_ID, automatic=True, device=device, **AMG_KWARGS)
-    from samgeo import SamGeo
-    return SamGeo(model_type=SAM1_MODEL_TYPE, automatic=True, device=device,
-                  sam_kwargs=AMG_KWARGS)
+        sam = SamGeo2(model_id=SAM2_MODEL_ID, automatic=True, device=device, **AMG_KWARGS)
+    else:
+        from samgeo import SamGeo
+        sam = SamGeo(model_type=SAM1_MODEL_TYPE, automatic=True, device=device,
+                     sam_kwargs=AMG_KWARGS)
+    mg = sam.mask_generator
+    mg.output_mode = "uncompressed_rle"      # маски в RLE: память не растёт с размером фрагмента
+    if ADAPTIVE_CROPS:
+        mod = sys.modules[type(mg).__module__]
+        f = mod.generate_crop_boxes
+        mod.generate_crop_boxes = _adaptive_crop_boxes(getattr(f, "_orig", f))
+    return sam
 
 
 def stretch(img, lo=2, hi=98):
@@ -249,11 +315,22 @@ def stretch(img, lo=2, hi=98):
     return out
 
 
+def _rle_to_mask(seg, h, w):
+    if isinstance(seg, np.ndarray):
+        return seg
+    counts = np.asarray(seg["counts"], dtype=np.int64)
+    vals = (np.arange(len(counts)) % 2).astype(bool)
+    return np.repeat(vals, counts).reshape(w, h).T          # RLE SAM — по столбцам
+
+
 def masks_to_labels(masks, h, w):
-    """Список масок SAM -> растр меток (крупные снизу, мелкие поверх)."""
-    lab = np.zeros((h, w), dtype=np.uint32)
+    """Список масок SAM -> растр меток (крупные снизу, мелкие поверх); маски
+    раскодируются по одной. Мелкие островки и дырки -> соседний сегмент."""
+    lab = np.zeros((h, w), dtype=np.int32)
     for k, m in enumerate(sorted(masks, key=lambda x: x["area"], reverse=True), 1):
-        lab[m["segmentation"]] = k
+        lab[_rle_to_mask(m["segmentation"], h, w)] = k
+    if MIN_REGION_PX and MIN_REGION_PX > 1:
+        lab = features.sieve(lab, size=int(MIN_REGION_PX), connectivity=4)
     return lab
 
 
@@ -268,6 +345,7 @@ def segment_chip(sam, path, row, out_epsg):
     with rasterio.open(path) as src:
         h, w, transform, crs = src.height, src.width, src.transform, src.crs
         img = np.moveaxis(src.read([1, 2, 3]), 0, 2)
+    _W["meta"] = (w, h, n_crops(w, h))
     if ENHANCE:
         img = stretch(img)
     sam.generate(img, output=None)           # маски остаются в sam.masks
@@ -276,6 +354,8 @@ def segment_chip(sam, path, row, out_epsg):
         return gpd.GeoDataFrame(columns=["chip_id", "geometry"], geometry="geometry",
                                 crs=out_epsg or crs)
     lab = masks_to_labels(masks, h, w)
+    sam.masks = None
+    del masks, img
 
     if KEEP_MASK_TIF:
         mp = os.path.splitext(path)[0] + "_mask.tif"
@@ -285,16 +365,23 @@ def segment_chip(sam, path, row, out_epsg):
             dst.write(lab.astype(dst.dtypes[0]), 1)
 
     geoms, vals = [], []
-    for g, v in features.shapes(lab.astype(np.int32), mask=lab > 0, transform=transform):
+    for g, v in features.shapes(lab, mask=lab > 0, transform=transform):
         geoms.append(shape(g)); vals.append(int(v))
+    del lab
     gdf = gpd.GeoDataFrame({"seg_id": vals}, geometry=geoms, crs=crs)
     gdf = gdf.dissolve("seg_id", as_index=False)
     if out_epsg:
         gdf = gdf.to_crs(out_epsg)
     epsg = gdf.crs.to_epsg()
 
-    circ = circle_geom(row.lon, row.lat, float(row.radius_m), epsg)
+    # точки фрагмента (из chips_points.gpkg; для старых индексов — центр фрагмента)
+    pts = row.get("pts") or [[row.chip_id, row.lon, row.lat]]
+    pid = [str(p[0]) for p in pts]
+    pg = gpd.GeoSeries(gpd.points_from_xy([p[1] for p in pts], [p[2] for p in pts]),
+                       crs=4326).to_crs(gdf.crs)
     if CLIP_TO_CIRCLE:
+        from shapely.ops import unary_union
+        circ = unary_union([circle_geom(p[1], p[2], float(row.radius_m), epsg) for p in pts])
         inner = circ.buffer(-1.0)
         gdf["cut_by_circle"] = ~gdf.within(inner)
         gdf["geometry"] = gdf.intersection(circ)
@@ -305,13 +392,20 @@ def segment_chip(sam, path, row, out_epsg):
         gdf["geometry"] = gdf.simplify(SIMPLIFY_M, preserve_topology=True)
     gdf = gdf[gdf.geometry.is_valid & ~gdf.is_empty].copy()
     gdf["area_m2"] = gdf.area.round(1) if gdf.crs.is_projected else np.nan
-    gdf = gdf[gdf["area_m2"].fillna(MIN_AREA_M2) >= MIN_AREA_M2]
-    pt = gpd.GeoSeries([Point(row.lon, row.lat)], crs=4326).to_crs(gdf.crs).iloc[0]
-    gdf["center_dist_m"] = gdf.representative_point().distance(pt).round(1)
+    gdf = gdf[gdf["area_m2"].fillna(MIN_AREA_M2) >= MIN_AREA_M2].copy()
+
+    # связь сегментов с точками
+    if len(gdf):
+        dist = np.array([[g.distance(p) for p in pg] for g in gdf.geometry])
+        inside = dist <= 1e-6
+        gdf["points_in"] = [";".join(np.array(pid)[m]) for m in inside]
+        gdf["n_pts_in"] = inside.sum(1)
+        j = dist.argmin(1)
+        gdf["near_point"] = np.array(pid)[j]
+        gdf["near_dist_m"] = dist[np.arange(len(gdf)), j].round(1)
     gdf.insert(0, "chip_id", row.chip_id)
     gdf.insert(1, "members", row.members if "members" in row else row.chip_id)
     return gdf
-
 
 
 # ============================================================================
@@ -365,10 +459,12 @@ def peak_ram_gb():
 def process_chip(row):
     sam, d = _W["sam"], _W["dir"]
     t1 = time.time()
+    _W["meta"] = (0, 0, 0)
     try:
         gdf = segment_chip(sam, os.path.join(d, row["file"]), row, OUT_EPSG)
         if len(gdf):
             gdf["n_points"] = int(row.get("n_points", 1) or 1)
+            gdf["chip_key"] = _key(row.get("key"))
             gdf.to_file(_W["part"], layer="segments", driver="GPKG",
                         mode="a" if os.path.exists(_W["part"]) else "w")
         res = (row["chip_id"], len(gdf), time.time() - t1, None)
@@ -384,7 +480,7 @@ def process_chip(row):
             torch.cuda.empty_cache()
     except Exception:
         pass
-    return res + (os.getpid(), rss)
+    return res + (os.getpid(), rss) + tuple(_W["meta"])
 
 
 def worker_loop(wid, task_q, res_q, chips_dir, n_gpu, threads):
@@ -406,7 +502,7 @@ def worker_loop(wid, task_q, res_q, chips_dir, n_gpu, threads):
 # ============================================================================
 # СЛИЯНИЕ ЧАСТЕЙ
 # ============================================================================
-def merge_parts(d, done):
+def merge_parts(d, done, valid=None):
     parts = sorted(glob.glob(os.path.join(d, "_parts", "segments_*.gpkg")))
     if not parts:
         print("Нет частей для слияния."); return
@@ -416,9 +512,18 @@ def merge_parts(d, done):
             g = gpd.read_file(p, layer="segments")
         except Exception as e:
             print(f"  [!] часть {os.path.basename(p)} не читается: {e}"); continue
-        g = g[g.chip_id.isin(done) & ~g.chip_id.isin(seen)]   # один источник на фрагмент
-        seen |= set(g.chip_id.unique())
+        tok = [_token(c, k) for c, k in zip(g.chip_id, g["chip_key"] if "chip_key" in g
+                                            else [""] * len(g))]
+        g = g.assign(_tok=tok)
+        ok = g._tok.isin(done) & ~g._tok.isin(seen)      # один источник на фрагмент
+        if valid is not None:
+            ok &= g._tok.isin(valid)                     # только фрагменты текущего индекса
+        g = g[ok].drop(columns="_tok")
+        seen |= set(t for t, o in zip(tok, ok) if o)
         chunks.append(g)
+    chunks = [c for c in chunks if len(c)]
+    if not chunks:
+        print("Нет готовых сегментов для слияния."); return
     out = pd.concat(chunks, ignore_index=True)
     out = gpd.GeoDataFrame(out, geometry="geometry", crs=chunks[0].crs)
     out.insert(0, "uid", np.arange(1, len(out) + 1))
@@ -434,6 +539,32 @@ def merge_parts(d, done):
 # ============================================================================
 # MAIN
 # ============================================================================
+def _key(v):
+    return v if isinstance(v, str) and v and v.lower() != "nan" else ""
+
+
+def _token(chip_id, key):
+    """Метка готового фрагмента в _done.txt: chip_id|key (key меняется при смене состава точек)."""
+    k = _key(key)
+    return f"{chip_id}|{k}" if k else str(chip_id)
+
+
+def _dims(d, r):
+    """Размер фрагмента (w, h) в пикселях: из индекса или из файла."""
+    v = r.get("size_px")
+    if isinstance(v, str) and "x" in v:
+        try:
+            w, h = v.lower().split("x")
+            return int(w), int(h)
+        except ValueError:
+            pass
+    try:
+        with rasterio.open(os.path.join(d, r["file"])) as src:
+            return src.width, src.height
+    except Exception:
+        return 3000, 3000
+
+
 def fmt_t(sec):
     sec = int(sec)
     return f"{sec // 3600} ч {sec % 3600 // 60:02d} мин" if sec >= 3600 else f"{sec // 60} мин {sec % 60:02d} с"
@@ -451,7 +582,8 @@ def main():
     print("Настройки:")
     print(settings_info(["MODEL", "SAM2_MODEL_ID", "SAM1_MODEL_TYPE", "DEVICE", "N_WORKERS",
                          "THREADS_PER_WORKER", "TEST_N", "PRESET", "AMG_KWARGS", "ENHANCE",
-                         "MIN_AREA_M2", "SIMPLIFY_M", "CLIP_TO_CIRCLE", "OUT_EPSG"]))
+                         "MIN_REGION_PX", "ADAPTIVE_CROPS", "CROP_MAX_PX", "MIN_AREA_M2",
+                         "SIMPLIFY_M", "CLIP_TO_CIRCLE", "OUT_EPSG"]))
     print(f"Папка фрагментов: {os.path.abspath(d)}")
     print(f"Лог: {log_path}")
     idx = gpd.read_file(os.path.join(d, "chips_index.gpkg"))
@@ -462,21 +594,43 @@ def main():
     if "n_points" not in idx:
         idx["n_points"] = 1
     idx["n_points"] = idx["n_points"].fillna(1).astype(int)
+    if "key" not in idx:
+        idx["key"] = ""
+    idx["token"] = [_token(c, k) for c, k in zip(idx.chip_id, idx.key)]
+    wh = [_dims(d, r) for r in idx.to_dict("records")]
+    idx["w_px"], idx["h_px"] = [a for a, _ in wh], [b for _, b in wh]
+    idx["cost"] = [n_crops(a, b) for a, b in wh]
+    print(f"  кадров SAM на фрагмент: {idx.cost.value_counts().sort_index().to_dict()}")
+
+    # координаты всех точек фрагментов (для обрезки по кругам и связи сегментов с точками)
+    pts_by_chip = {}
+    pp = os.path.join(d, "chips_points.gpkg")
+    if os.path.exists(pp):
+        cp = gpd.read_file(pp, columns=["point_id", "chip_id", "lon", "lat"])
+        cp["point_id"] = cp["point_id"].astype(str)
+        for cid, g in cp.groupby("chip_id"):
+            pts_by_chip[cid] = g[["point_id", "lon", "lat"]].values.tolist()
+        print(f"Точки фрагментов: {len(cp)} (chips_points.gpkg)")
+    else:
+        print("[i] chips_points.gpkg нет (индекс прежней версии 10_): круг строится вокруг "
+              "центра фрагмента")
 
     done_f = os.path.join(d, "_done.txt")
     err_f = os.path.join(d, "_errors.csv")
     done = set(open(done_f, encoding="utf-8").read().split()) if os.path.exists(done_f) else set()
-    todo = idx[~idx.chip_id.isin(done)]
+    todo = idx[~idx.token.isin(done)]
     if TEST_N and TEST_N > 0:
         todo = todo.sample(min(TEST_N, len(todo)), random_state=0)
 
     N_ch, N_pt = len(idx), int(idx.n_points.sum())
-    done_ch = int(idx.chip_id.isin(done).sum())
-    done_pt = int(idx.loc[idx.chip_id.isin(done), "n_points"].sum())
-    print(f"Фрагментов: {N_ch} (точек {N_pt}); готово ранее: {done_ch} ({done_pt} точек); "
-          f"к обработке сейчас: {len(todo)}{' [ПРОБНЫЙ ЗАПУСК]' if TEST_N else ''}")
+    is_done = idx.token.isin(done)
+    done_ch, done_pt = int(is_done.sum()), int(idx.loc[is_done, "n_points"].sum())
+    print(f"Фрагментов: {N_ch} (точек {N_pt}, кадров SAM {int(idx.cost.sum())}); готово ранее: "
+          f"{done_ch} ({done_pt} точек); к обработке сейчас: {len(todo)} "
+          f"(кадров {int(todo.cost.sum())}){' [ПРОБНЫЙ ЗАПУСК]' if TEST_N else ''}")
+    valid = set(idx.token)
     if todo.empty:
-        merge_parts(d, done); return
+        merge_parts(d, done, valid); return
 
     n_gpu = gpu_count() if DEVICE in (None, "cuda") else 0
     if DEVICE == "cuda" and n_gpu == 0:
@@ -501,9 +655,17 @@ def main():
     print(f"Процессов: {nw} ({dev}); модель {SAM2_MODEL_ID if MODEL == 'sam2' else SAM1_MODEL_TYPE}, "
           f"preset {PRESET}. Загрузка моделей...")
 
-    keep = ["chip_id", "file", "lon", "lat", "radius_m", "n_points", "members"]
+    keep = ["chip_id", "file", "lon", "lat", "radius_m", "n_points", "members", "key", "token",
+            "cost"]
     rows = todo[[c for c in keep if c in todo.columns]].to_dict("records")
+    for r in rows:
+        r["key"] = _key(r.get("key"))
+        if r["chip_id"] in pts_by_chip:
+            r["pts"] = pts_by_chip[r["chip_id"]]
     npts = {r["chip_id"]: int(r["n_points"]) for r in rows}
+    cost = {r["chip_id"]: int(r["cost"]) for r in rows}
+    tokens = {r["chip_id"]: r["token"] for r in rows}
+    cost_todo = sum(cost.values())
 
     ctx = mp.get_context("spawn")
     task_q, res_q = ctx.Queue(), ctx.Queue()
@@ -522,7 +684,8 @@ def main():
     inflight = {}                       # wid -> chip_id
     timing_f = os.path.join(d, "_logs", f"11_timing_{stamp}.csv")
     with open(timing_f, "w", newline="", encoding="utf-8-sig") as f:
-        csv.writer(f).writerow(["chip_id", "n_points", "n_segments", "seconds", "worker_pid",
+        csv.writer(f).writerow(["chip_id", "n_points", "n_segments", "seconds", "width_px",
+                                "height_px", "n_crops", "sec_per_crop", "worker_pid",
                                 "worker_peak_ram_gb", "error"])
     print(f"Модели загружаются в {nw} процессах (первый фрагмент появится после загрузки)...",
           flush=True)
@@ -530,15 +693,18 @@ def main():
     k = segs = errs = 0
     pts_run = 0
     sec_sum = 0.0
+    cost_done = 0
     n_ready = 0
     import queue as _queue
 
-    def finish(chip_id, nseg, sec, err, pid, rss):
-        nonlocal k, segs, errs, pts_run, sec_sum
+    def finish(chip_id, nseg, sec, err, pid, rss, w=0, h=0, nc=0):
+        nonlocal k, segs, errs, pts_run, sec_sum, cost_done
         k += 1
         sec_sum += sec
+        cost_done += cost[chip_id]
         with open(timing_f, "a", newline="", encoding="utf-8-sig") as f:
-            csv.writer(f).writerow([chip_id, npts[chip_id], nseg, round(sec, 1), pid,
+            csv.writer(f).writerow([chip_id, npts[chip_id], nseg, round(sec, 1), w, h, nc,
+                                    round(sec / nc, 2) if nc else "", pid,
                                     round(rss, 2), (err or "")[:300]])
         if err:
             errs += 1
@@ -547,14 +713,14 @@ def main():
             msg = f"ОШИБКА {err.splitlines()[0][:150]}"
         else:
             with open(done_f, "a", encoding="utf-8") as f:
-                f.write(chip_id + "\n")
-            done.add(chip_id)
+                f.write(tokens[chip_id] + "\n")
+            done.add(tokens[chip_id])
             segs += nseg
             pts_run += npts[chip_id]
             msg = f"{nseg} сегм."
         el = time.time() - t0
         rate = k / el
-        eta = (len(todo) - k) / rate if rate else 0
+        eta = (cost_todo - cost_done) / (cost_done / el) if cost_done else 0
         ch_all = done_ch + k - errs
         pt_all = done_pt + pts_run
         print(f"[фрагм. {k}/{len(todo)} {k / len(todo):6.1%} | всего {ch_all}/{N_ch} "
@@ -608,29 +774,36 @@ def main():
 
     el = time.time() - t0
     print(f"\nОбработано {k} фрагментов за {fmt_t(el)}; ошибок {errs}.")
-    if TEST_N:
-        rest = len(idx[~idx.chip_id.isin(done)])
+    if TEST_N and cost_done:
+        # оставшиеся фрагменты: из плана 10_ (_plan.json, все места) или из индекса
+        done_ids = {t.split("|")[0] for t in done}
+        rest_cost = {r.chip_id: r.cost for r in idx.itertuples() if r.token not in done}
         plan = os.path.join(d, "_plan.json")
-        if os.path.exists(plan):                     # тест после тестовой загрузки 10
+        if os.path.exists(plan):                     # тест после тестовой загрузки 10_
             import json
-            rest = max(rest, json.load(open(plan, encoding="utf-8"))["n_places"] - len(done))
-        per_chip = sec_sum / max(k, 1)
-        thr = k / el
-        print(f"Тестовый запуск: {per_chip:.0f} с на фрагмент в одном процессе, "
-              f"общая скорость {thr * 3600:.0f} фрагм./ч при {nw} процессах "
-              f"(включая загрузку моделей — реальная будет немного выше).")
-        print(f"Прогноз на оставшиеся {rest} фрагментов: ~{fmt_t(rest / thr)}")
+            pj = json.load(open(plan, encoding="utf-8"))
+            for cid, (w, h) in (pj.get("chips") or {}).items():
+                if cid not in done_ids and cid not in rest_cost:
+                    rest_cost[cid] = n_crops(w, h)
+        rc = sum(rest_cost.values())
+        thr = cost_done / el                          # кадров SAM в секунду, все процессы
+        print(f"Тестовый запуск: {sec_sum / cost_done:.1f} с на кадр SAM в одном процессе "
+              f"(одиночный фрагмент 1 км = {n_crops(2976, 2976)} кадров), "
+              f"{thr * 3600:.0f} кадров/ч при {nw} процессах (включая загрузку моделей — "
+              f"реальная скорость будет немного выше).")
+        print(f"Прогноз на оставшиеся {len(rest_cost)} фрагментов ({rc} кадров): ~{fmt_t(rc / thr)}")
     try:
         tdf = pd.read_csv(timing_f, encoding="utf-8-sig")
         ok = tdf[tdf.error.isna()]
         if len(ok):
             print(f"Время на фрагмент в одном процессе: медиана {ok.seconds.median():.0f} с, "
-                  f"мин {ok.seconds.min():.0f}, макс {ok.seconds.max():.0f}; "
-                  f"сегментов на фрагмент: медиана {ok.n_segments.median():.0f}; "
-                  f"пик ОЗУ процесса {tdf.worker_peak_ram_gb.max():.1f} ГБ")
+                  f"мин {ok.seconds.min():.0f}, макс {ok.seconds.max():.0f}; на кадр SAM: "
+                  f"медиана {ok.sec_per_crop.median():.1f} с; сегментов на фрагмент: медиана "
+                  f"{ok.n_segments.median():.0f}; пик ОЗУ процесса "
+                  f"{tdf.worker_peak_ram_gb.max():.1f} ГБ")
     except Exception:
         pass
-    merge_parts(d, done)
+    merge_parts(d, done, valid)
     print(f"Таблица времени: {timing_f}")
     print(f"Лог: {log_path}")
     if TEST_N:
