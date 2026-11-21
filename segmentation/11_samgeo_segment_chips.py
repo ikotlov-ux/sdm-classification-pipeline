@@ -116,14 +116,26 @@ class _Tee:
         self.fh.flush()
 
 
+_LOG = {}
+
+
 def start_log(folder, prefix):
     os.makedirs(folder, exist_ok=True)
     stamp = time.strftime("%Y%m%d_%H%M%S")
     path = os.path.join(folder, f"{prefix}_{stamp}.log")
     fh = open(path, "w", encoding="utf-8")
-    sys.stdout = _Tee(sys.__stdout__, fh)
-    sys.stderr = _Tee(sys.__stderr__, fh)
+    _LOG["orig"] = (sys.stdout, sys.stderr)
+    _LOG["fh"] = fh
+    # оборачиваем ТЕКУЩИЙ вывод (в Jupyter это ячейка, в консоли — терминал)
+    sys.stdout = _Tee(sys.stdout, fh)
+    sys.stderr = _Tee(sys.stderr, fh)
     return path, stamp
+
+
+def stop_log():
+    if "orig" in _LOG:
+        sys.stdout, sys.stderr = _LOG.pop("orig")
+        _LOG.pop("fh").close()
 
 
 def system_info():
@@ -625,6 +637,38 @@ def main():
         print("Тест завершён. Пришлите лог; для полного запуска поставьте TEST_N = 0.")
 
 
+def _in_jupyter():
+    return "ipykernel" in sys.modules and os.environ.get("SEG11_CHILD") != "1"
+
+
+def run_from_jupyter():
+    """В Jupyter (%run) параллельные процессы Windows не могут импортировать функции
+    из ячейки, поэтому скрипт перезапускает сам себя обычным python и выводит его
+    строки в ячейку по мере работы."""
+    import subprocess
+    d = pick_dir()
+    if not d:
+        print("Папка не выбрана."); return
+    env = dict(os.environ, SEG11_CHILD="1", PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1")
+    print(f"Запуск в отдельном процессе: {sys.executable} {os.path.abspath(__file__)}", flush=True)
+    p = subprocess.Popen([sys.executable, "-u", os.path.abspath(__file__), d], env=env,
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                         encoding="utf-8", errors="replace", bufsize=1)
+    try:
+        for line in p.stdout:
+            print(line, end="", flush=True)
+    except KeyboardInterrupt:
+        p.terminate()
+        print("\nОстановлено пользователем (готовые фрагменты сохранены).")
+    p.wait()
+
+
 if __name__ == "__main__":
     mp.freeze_support()
-    main()
+    if _in_jupyter():
+        run_from_jupyter()
+    else:
+        try:
+            main()
+        finally:
+            stop_log()

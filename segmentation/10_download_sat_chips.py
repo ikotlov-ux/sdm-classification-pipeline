@@ -133,14 +133,26 @@ class _Tee:
         self.fh.flush()
 
 
+_LOG = {}
+
+
 def start_log(folder, prefix):
     os.makedirs(folder, exist_ok=True)
     stamp = time.strftime("%Y%m%d_%H%M%S")
     path = os.path.join(folder, f"{prefix}_{stamp}.log")
     fh = open(path, "w", encoding="utf-8")
-    sys.stdout = _Tee(sys.__stdout__, fh)
-    sys.stderr = _Tee(sys.__stderr__, fh)
+    _LOG["orig"] = (sys.stdout, sys.stderr)
+    _LOG["fh"] = fh
+    # оборачиваем ТЕКУЩИЙ вывод (в Jupyter это ячейка, в консоли — терминал)
+    sys.stdout = _Tee(sys.stdout, fh)
+    sys.stderr = _Tee(sys.stderr, fh)
     return path, stamp
+
+
+def stop_log():
+    if "orig" in _LOG:
+        sys.stdout, sys.stderr = _LOG.pop("orig")
+        _LOG.pop("fh").close()
 
 
 def system_info():
@@ -640,4 +652,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        stop_log()
