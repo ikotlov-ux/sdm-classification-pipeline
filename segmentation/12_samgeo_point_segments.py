@@ -40,13 +40,20 @@ SAM 2 с подсказкой-точкой (samgeo SamGeo2, automatic=False) и 
   7. Части меньше MIN_PART_M2 и меньше MIN_PART_SHARE площади полигона
      удаляются (KEEP_POINT_PART — оставить только часть с точкой).
   8. В полигоны переносятся все атрибуты точки (из chips_points.gpkg).
+  9. Если сегмент не сформирован (точка отклонена или её сегмент целиком
+     отошёл соседям), в слой segments пишется квадрат FALLBACK_SQUARE_M x
+     FALLBACK_SQUARE_M м с центром в точке (seg_type = "square", причина — в
+     поле reason). Квадрат делит перекрытия с соседними сегментами по тем же
+     правилам; 0 -> квадратов нет, такие точки только в слое rejected.
 
 Результат — point_segments.gpkg (UTM 37N):
   слой segments — один полигон на точку: seg_id, все атрибуты точки,
-    area_m2, area_raw_m2 (до деления перекрытий), good_ratio, mask_idx,
+    seg_type (segment — сегмент SAM, square — квадрат вместо него), reason
+    (почему квадрат), area_m2, area_raw_m2 (до деления перекрытий), good_ratio, mask_idx,
     sam_score, ratios (доли 3 масок), ref_r_m, ref_src (field/default),
     max_r_m, edge (круг R вышел за край фрагмента);
-  слой rejected — точки без сегмента с причиной и долями масок.
+  слой rejected — точки, у которых сегмент не сформирован, с причиной и
+    долями масок (при FALLBACK_SQUARE_M > 0 у них есть квадрат в segments).
 
 Параллельная работа: GPU — WORKERS_PER_GPU процессов на карту; CPU —
 физические ядра / THREADS_PER_WORKER. Процесс берёт фрагмент целиком (все
@@ -98,7 +105,7 @@ import geopandas as gpd
 import rasterio
 from rasterio import features
 from shapely import wkb
-from shapely.geometry import shape, MultiPolygon, Polygon
+from shapely.geometry import shape, box, MultiPolygon, Polygon
 from shapely.ops import unary_union, transform as shp_transform
 from pyproj import CRS, Transformer, Geod
 
@@ -148,6 +155,8 @@ COINCIDENT_M = 1.0          # точки ближе (м) — одно место
 MIN_PART_SHARE = 0.01       # удалить части полигона меньше этой доли его площади (v12)
 KEEP_POINT_PART = False     # оставить только часть, в которой лежит точка (или ближайшую)
 SIMPLIFY_M = 0.0            # упрощение контуров, м (0 -> пиксельные контуры, как в v12)
+FALLBACK_SQUARE_M = 20.0    # сегмент не сформирован -> квадрат со стороной (м) вокруг точки
+                            # (seg_type = "square"); 0 -> такие точки только в rejected
 OUT_EPSG = 32637            # UTM 37N — вся Московская обл.
 OUT_NAME = "point_segments.gpkg"
 
@@ -292,6 +301,8 @@ SPEC = [
      "при «Процессов» = auto"),
     ("Модель и запуск", "THREADS_PER_WORKER", "Потоков на процесс", "int", (1, 256),
      "потоков PyTorch в каждом процессе"),
+    ("Результат", "FALLBACK_SQUARE_M", "Квадрат без сегмента, м", "float", (0, 1000),
+     "сторона квадрата вокруг точки, если сегмент не сформирован; 0 — без квадратов"),
     ("Результат", "OUT_NAME", "Файл результата", "str", None,
      "GeoPackage в папке фрагментов"),
     ("Результат", "OUT_EPSG", "EPSG результата", "int", (1024, 999999),
@@ -303,7 +314,7 @@ SEG_PARAMS = ["SAM2_MODEL_ID", "MAX_RADIUS_M", "CONFIDENCE", "MIN_GOOD_RATIO", "
               "REMOVE_OVERLAPS", "OVERLAP_MODE", "COINCIDENT_M"]    # их изменение -> пересчёт
 V12 = dict(SMOOTH_M=0.0, MIN_SAM_SCORE=0.0, MIN_HOLE_M2=0.0, MIN_PART_M2=0.0, MIN_PART_SHARE=0.01,
            KEEP_POINT_PART=False, SIMPLIFY_M=0.0, ENHANCE=False, REMOVE_OVERLAPS=True,
-           OVERLAP_MODE="centroid")
+           OVERLAP_MODE="centroid", FALLBACK_SQUARE_M=0.0)
 HEADER = {n: globals()[n] for n in SETTING_NAMES}      # значения из шапки скрипта
 SETTINGS_FILE = "settings12.json"                       # в <папка фрагментов>/_points/
 
@@ -1406,37 +1417,68 @@ def merge_results(d, pts, sig, stamp):
 
     attrs = pts.drop(columns=[c for c in ("file", "key", "radius_m", "token", "chip_token", "ref_r")
                               if c in pts.columns])
-    ren = {c: f"{c}_pt" for c in attrs.columns if c in SERVICE_COLS}
+    ren = {c: f"{c}_pt" for c in attrs.columns if c in SERVICE_COLS + ["seg_type", "reason"]}
     if ren:
         attrs = attrs.rename(columns=ren)
-    ok_pts = pts[pts.token.isin(geom_by_tok)]
-    geoms = [geom_by_tok[t] for t in ok_pts.token]
-    pxy = [(g.x, g.y) for g in ok_pts.geometry]
+    rej_tok = st.index[st.status == "rejected"]
+    use_sq = bool(FALLBACK_SQUARE_M and FALLBACK_SQUARE_M > 0)
+    # точки с сегментом + (при квадратах) отклонённые точки
+    sel = pts[pts.token.isin(geom_by_tok) | (pts.token.isin(rej_tok) & use_sq)]
+    pxy = [(g.x, g.y) for g in sel.geometry]
+    h = float(FALLBACK_SQUARE_M) / 2
+
+    def square(xy):
+        return box(xy[0] - h, xy[1] - h, xy[0] + h, xy[1] + h)
+
+    is_sq = [t not in geom_by_tok for t in sel.token]
+    why = [str(st.at[t, "reason"]) if q else "" for t, q in zip(sel.token, is_sq)]
+    geoms = [square(xy) if q else geom_by_tok[t] for t, xy, q in zip(sel.token, pxy, is_sq)]
+    # квадрат сравнивается со всеми сегментами (у него свой «фрагмент»)
+    grp = [f"square|{t}" if q else c for t, c, q in zip(sel.token, sel.chip_id, is_sq)]
+
+    def tidy(gs):
+        return [_polys_only(g, MIN_PART_SHARE, 0, 0 if q else MIN_PART_M2,
+                            xy if KEEP_POINT_PART else None)
+                for g, xy, q in zip(gs, pxy, is_sq)]
+
     n_ov = 0
     t_ov = time.time()
     if REMOVE_OVERLAPS and len(geoms) > 1:
-        geoms, n_ov = resolve_overlaps(geoms, pxy, list(ok_pts.chip_id))
-    geoms = [_polys_only(g, MIN_PART_SHARE, 0, MIN_PART_M2, xy if KEEP_POINT_PART else None)
-             for g, xy in zip(geoms, pxy)]
+        geoms, n_ov = resolve_overlaps(geoms, pxy, grp)
+    geoms = tidy(geoms)
+    lost_i = [i for i, g in enumerate(geoms) if (g is None or g.is_empty) and not is_sq[i]]
+    if use_sq and lost_i:                    # сегмент целиком ушёл соседям -> квадрат
+        for i in lost_i:
+            geoms[i], is_sq[i], grp[i] = square(pxy[i]), True, f"square|{sel.token.iloc[i]}"
+            why[i] = "сегмент целиком отошёл соседним точкам"
+        if REMOVE_OVERLAPS:
+            geoms, n2 = resolve_overlaps(geoms, pxy, grp)
+            n_ov += n2
+        geoms = tidy(geoms)
     if SIMPLIFY_M:
-        geoms = [g.simplify(SIMPLIFY_M, preserve_topology=True) if g is not None else None
-                 for g in geoms]
+        geoms = [g.simplify(SIMPLIFY_M, preserve_topology=True) if g is not None and not q
+                 else g for g, q in zip(geoms, is_sq)]
     keep = [i for i, g in enumerate(geoms) if g is not None and not g.is_empty]
-    lost = len(geoms) - len(keep)
+    lost = len(lost_i)
 
-    out = attrs.loc[ok_pts.index[keep]].drop(columns="geometry").reset_index(drop=True)
-    s = st.loc[ok_pts.token.iloc[keep]].reset_index(drop=True)
+    out = attrs.loc[sel.index[keep]].drop(columns="geometry").reset_index(drop=True)
+    s = st.loc[sel.token.iloc[keep]].reset_index(drop=True)
     out = gpd.GeoDataFrame(out, geometry=[geoms[i] for i in keep], crs=OUT_EPSG)
     out.insert(0, "seg_id", np.arange(1, len(out) + 1))
+    out.insert(1, "seg_type", ["square" if is_sq[i] else "segment" for i in keep])
     out["area_m2"] = out.area.round(1)
     for c in SERVICE_COLS[2:]:
         out[c] = s[c].values if c in s else np.nan
+    out["reason"] = [why[i] for i in keep]
+    sq = out.seg_type == "square"
+    out.loc[sq, "area_raw_m2"] = round(float(FALLBACK_SQUARE_M) ** 2, 1)
+    out.loc[sq, "mask_idx"] = np.nan
+    out.loc[sq, "sam_score"] = np.nan
     out["mask_idx"] = pd.to_numeric(out["mask_idx"], errors="coerce").astype("Int64")
     out["edge"] = pd.to_numeric(out["edge"], errors="coerce").astype("Int64")
     for c in ("area_raw_m2", "good_ratio", "sam_score", "ref_r_m", "max_r_m"):
         out[c] = pd.to_numeric(out[c], errors="coerce")
 
-    rej_tok = st.index[st.status == "rejected"]
     rej = attrs.loc[pts.index[pts.token.isin(rej_tok)]].copy()
     rs = st.loc[pts.token[pts.token.isin(rej_tok)]]
     for c in ("reason", "ratios", "scores", "ref_r_m"):
@@ -1465,14 +1507,20 @@ def merge_results(d, pts, sig, stamp):
         print(f"[!] {path} занят другой программой — результат записан в {alt}")
         path = alt
     print(f"Результат: {path}")
-    print(f"  слой segments: {len(out)} полигонов (по одному на точку); перекрытий между "
-          f"соседними фрагментами: {n_ov} ({time.time() - t_ov:.0f} с)"
-          f"{f'; {lost} сегментов целиком ушли соседним точкам' if lost else ''}")
-    if len(out):
-        a = out.area_m2
-        print(f"  площадь сегмента, га: медиана {a.median() / 1e4:.2f}, мин {a.min() / 1e4:.2f}, "
+    n_sq = int(sq.sum()) if len(out) else 0
+    sq_txt = f"{FALLBACK_SQUARE_M:g} × {FALLBACK_SQUARE_M:g} м"
+    print(f"  слой segments: {len(out)} полигонов (по одному на точку): сегментов SAM "
+          f"{len(out) - n_sq}{f', квадратов {sq_txt} {n_sq}' if use_sq else ''}; перекрытий, "
+          f"поделённых при сборке: {n_ov} ({time.time() - t_ov:.0f} с)")
+    if lost:
+        print(f"  {lost} сегментов целиком ушли соседним точкам"
+              f"{f' — вместо них квадраты {sq_txt}' if use_sq else ' — их точек нет в segments'}")
+    if len(out) - n_sq:
+        a = out.area_m2[~sq]
+        print(f"  площадь сегмента SAM, га: медиана {a.median() / 1e4:.2f}, мин {a.min() / 1e4:.2f}, "
               f"макс {a.max() / 1e4:.2f}; сумма {a.sum() / 1e4:,.1f} га")
-    print(f"  слой rejected: {len(rej)} точек без сегмента")
+    print(f"  слой rejected: {len(rej)} точек без сегмента SAM"
+          f"{f' (у них квадраты {sq_txt} в segments)' if use_sq and len(rej) else ''}")
 
 
 # ============================================================================
@@ -1518,7 +1566,7 @@ def main():
                          "ENHANCE",
                          "MIN_SAM_SCORE", "REMOVE_OVERLAPS", "OVERLAP_MODE", "COINCIDENT_M",
                          "MIN_HOLE_M2", "MIN_PART_M2", "MIN_PART_SHARE", "KEEP_POINT_PART",
-                         "SIMPLIFY_M",
+                         "SIMPLIFY_M", "FALLBACK_SQUARE_M",
                          "OUT_EPSG", "OUT_NAME"]))
     from scipy.stats import chi2
     sig = settings_sig()
@@ -1696,6 +1744,8 @@ def main():
                     key = f"доля хороших пикселей < {MIN_GOOD_RATIO}"
                 reasons[key] = reasons.get(key, 0) + 1
                 msg = f"ОТКЛОНЕНА: {res['reason']} (доли масок {res.get('ratios') or '-'})"
+                if FALLBACK_SQUARE_M:
+                    msg += f" -> квадрат {FALLBACK_SQUARE_M:g} × {FALLBACK_SQUARE_M:g} м"
             else:
                 errs += 1
                 msg = f"ОШИБКА {res['reason'].splitlines()[0][:150]}"
