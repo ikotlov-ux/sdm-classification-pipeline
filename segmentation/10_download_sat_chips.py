@@ -854,17 +854,34 @@ def main():
     cur_files = {os.path.basename(f) for f in files}
     plan_key = dict(zip(chips.chip_id, chips.key))
     if old is not None and len(old):
-        keep = []
+        keep, rekey = [], {}
+        plan_row = {c.chip_id: c for c in chips.itertuples()}
         for r in old.itertuples():
             if r.chip_id in set(idx.chip_id):
                 continue
+            has_file = isinstance(r.file, str) and r.file and \
+                os.path.exists(os.path.join(out_dir, r.file))
+            if not has_file:
+                continue
             if r.chip_id in plan_key:              # фрагмент плана, не обработанный сейчас
-                ok = getattr(r, "key", None) == plan_key[r.chip_id]
+                k_old = getattr(r, "key", None)
+                if isinstance(k_old, str) and k_old:
+                    ok = k_old == plan_key[r.chip_id]
+                else:                              # индекс прежней версии: сверка охвата
+                    c = plan_row[r.chip_id]
+                    mem = pts.iloc[c.idx_pts]
+                    g = chip_geom(mem.geometry.x, mem.geometry.y, RADIUS_M, epsg_t)
+                    ok = _chip_is_current(os.path.join(out_dir, r.file), c, {}, g)
+                    if ok:
+                        rekey[r.Index] = plan_key[r.chip_id]
             else:                                  # от других файлов точек
                 ok = not (set(str(r.src_file).split(";")) & cur_files)
-            if ok and isinstance(r.file, str) and r.file and \
-                    os.path.exists(os.path.join(out_dir, r.file)):
+            if ok:
                 keep.append(r.Index)
+        if "key" not in old:
+            old["key"] = None
+        for i, k in rekey.items():
+            old.at[i, "key"] = k
         old = old.loc[keep].copy()
         if len(old):
             fix = old.geometry.geom_type != "Polygon"         # индекс прежних версий: точки
@@ -928,8 +945,9 @@ def main():
         else:
             print("Новых фрагментов в этом запуске нет (все уже были скачаны), поэтому прогноз "
                   "времени не рассчитан.")
+    known = set(chips.chip_id) | set(idx.chip_id)      # весь план (не только тест) + другие файлы
     stale = sorted(f for f in os.listdir(out_dir) if f.endswith(ext)
-                   and os.path.splitext(f)[0] not in set(idx.chip_id))
+                   and os.path.splitext(f)[0] not in known)
     if stale:
         sp = os.path.join(out_dir, "_stale_chips.txt")
         with open(sp, "w", encoding="utf-8") as f:
