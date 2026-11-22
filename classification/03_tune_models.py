@@ -1,5 +1,12 @@
 # =============================================================================
-# 03_tune_models_v56.py (workspace: 03_tune_models_v6.py)
+# 03_tune_models_v57.py
+# v57: критерий выбора лучшей модели задаётся отдельно от весов классов:
+#         [1] Overall Accuracy, [2] Balanced Accuracy, [3] (OA + BA) / 2.
+#         По нему подбираются гиперпараметры (среднее по фолдам) и
+#         ранжируются модели (по OOF-прогнозу). Режим весов по умолчанию
+#         подстраивается под критерий. Вывод 5 лучших комбинаций сетки,
+#         лучшие параметры и разброс по фолдам сохраняются в run_info.txt.
+# (история) 03_tune_models_v56.py (workspace: 03_tune_models_v6.py)
 # v6/v56: режим равной априорной вероятности классов (по умолчанию):
 #         sample_weight с одинаковой суммой весов на класс (+ выравнивание
 #         полигонов n_pixels^-0.5) для RF/CatBoost/LightGBM/логистических/SVM,
@@ -556,12 +563,32 @@ def _estimate_nparams(model, n_predictors: int, n_classes: int) -> int:
 EQUAL_CLASS_PRIOR = False   # устанавливается в main() по выбору пользователя
 POLY_ALPHA = 0.0            # степень выравнивания полигонов (0 = не выравнивать)
 
+# v57: критерий выбора лучшей модели (устанавливается в main())
+#   "oa"    - Overall Accuracy: доля верно классифицированных образцов;
+#   "ba"    - Balanced Accuracy: средняя полнота (recall) по классам;
+#   "oa_ba" - компромисс (OA + BA) / 2.
+SELECT_METRIC = "oa"
+SELECT_METRIC_LABELS = {
+    "oa": "Overall Accuracy",
+    "ba": "Balanced Accuracy",
+    "oa_ba": "(OA + BA) / 2",
+}
+SELECT_METRIC_COLUMNS = {
+    "oa": "OverallAccuracy",
+    "ba": "BalancedAccuracy",
+    "oa_ba": "OA_BA",
+}
+
 
 def _score_fn(y_true, y_pred) -> float:
-    """Критерий выбора гиперпараметров: Balanced Accuracy в режиме равных
-    вероятностей классов, иначе Overall Accuracy."""
-    if EQUAL_CLASS_PRIOR:
+    """Критерий подбора гиперпараметров на одном фолде (SELECT_METRIC)."""
+    if SELECT_METRIC == "ba":
         return float(balanced_accuracy_score(y_true, y_pred))
+    if SELECT_METRIC == "oa_ba":
+        return 0.5 * (
+            float(accuracy_score(y_true, y_pred))
+            + float(balanced_accuracy_score(y_true, y_pred))
+        )
     return float(accuracy_score(y_true, y_pred))
 
 
@@ -1081,8 +1108,12 @@ def main():
         with open(data_info_path, "rb") as f:
             data_info = pickle.load(f)
         cv_method = data_info.get("cv_method", "stratified_kfold")
-        if cv_method == "spatial_block_cv":
-            cv_method_label = "Spatial Block CV + стратификация"
+        cv_method_label = {
+            "stratified_kfold": "Stratified KFold (пиксели, без групп)",
+            "stratified_group_kfold": "Stratified GroupKFold по polygon_id",
+            "spatial_block_cv": "Spatial Block CV + стратификация (пиксели)",
+            "spatial_block_cv_grouped": "Spatial Block CV по polygon_id",
+        }.get(cv_method, str(cv_method))
     print(f"  ✓ CV метод: {cv_method_label}")
 
     # --- Быстрая векторная проверка sd предикторов по CV-фолдам ---
@@ -1212,10 +1243,31 @@ def main():
     print(f"\n✓ Будет использовано ядер: {ncores} из {total_cores}\n")
 
     # ================================================================
-    # ШАГ 3b: РЕЖИМ АПРИОРНЫХ ВЕРОЯТНОСТЕЙ КЛАССОВ (v56)
+    # ШАГ 3b: КРИТЕРИЙ ВЫБОРА ЛУЧШЕЙ МОДЕЛИ (v57)
     # ================================================================
     print("============================================================")
-    print(" ШАГ 3b: ВЕРОЯТНОСТИ КЛАССОВ ПРИ ОБУЧЕНИИ")
+    print(" ШАГ 3b: КРИТЕРИЙ ВЫБОРА ЛУЧШЕЙ МОДЕЛИ")
+    print("============================================================\n")
+    print("  По критерию выбираются гиперпараметры (среднее по CV-фолдам)")
+    print("  и ранжируются модели (по прогнозу вне обучающей части, OOF).")
+    print("  Штрафа за переобучение нет: побеждает максимум на CV.\n")
+    print("  [1] Overall Accuracy (OA)")
+    print("      доля верно классифицированных пикселей; крупные классы весят больше,")
+    print("      редкие классы могут почти не предсказываться")
+    print("  [2] Balanced Accuracy (BA)")
+    print("      средняя полнота по классам; каждый класс равноценен (прежний режим)")
+    print("  [3] Компромисс (OA + BA) / 2\n")
+    _sm = input("Выбор (Enter = 1): ").strip()
+    global EQUAL_CLASS_PRIOR, POLY_ALPHA, SELECT_METRIC
+    SELECT_METRIC = {"2": "ba", "3": "oa_ba"}.get(_sm, "oa")
+    select_label = SELECT_METRIC_LABELS[SELECT_METRIC]
+    print(f"\n✓ Критерий: {select_label}\n")
+
+    # ================================================================
+    # ШАГ 3c: РЕЖИМ АПРИОРНЫХ ВЕРОЯТНОСТЕЙ КЛАССОВ (v56)
+    # ================================================================
+    print("============================================================")
+    print(" ШАГ 3c: ВЕРОЯТНОСТИ КЛАССОВ ПРИ ОБУЧЕНИИ")
     print("============================================================\n")
     _cls_counts = samples_df["class_name"].value_counts()
     print(
@@ -1223,14 +1275,18 @@ def main():
         f"max={int(_cls_counts.max())} ({_cls_counts.idxmax()}), "
         f"отношение max/min = {_cls_counts.max() / max(_cls_counts.min(), 1):.0f}\n"
     )
-    print("  [1] Равная вероятность классов + выравнивание полигонов (alpha=0.5) - РЕКОМЕНДУЕМО")
+    # Режим весов по умолчанию соответствует критерию: OA -> как в выборке,
+    # BA -> равные вероятности + выравнивание полигонов, компромисс -> равные вероятности.
+    _wm_default = {"oa": "3", "ba": "1", "oa_ba": "2"}[SELECT_METRIC]
+    _rec = {k: (" - РЕКОМЕНДУЕМО для выбранного критерия" if k == _wm_default else "") for k in ("1", "2", "3")}
+    print(f"  [1] Равная вероятность классов + выравнивание полигонов (alpha=0.5){_rec['1']}")
     print("      сумма весов каждого класса одинакова; внутри класса вес пикселя ~ n_pixels^-0.5")
-    print("  [2] Равная вероятность классов")
+    print(f"  [2] Равная вероятность классов{_rec['2']}")
     print("      сумма весов каждого класса одинакова; все пиксели класса равноценны")
-    print("  [3] Как в выборке (без весов, прежнее поведение)")
-    print("      крупные классы получают преимущество пропорционально числу пикселей\n")
-    _wm = input("Выбор (Enter = 1): ").strip()
-    global EQUAL_CLASS_PRIOR, POLY_ALPHA
+    print(f"  [3] Как в выборке (без весов){_rec['3']}")
+    print("      крупные классы получают преимущество пропорционально числу пикселей;")
+    print("      обычно даёт максимальный OA\n")
+    _wm = input(f"Выбор (Enter = {_wm_default}): ").strip() or _wm_default
     if _wm == "3":
         EQUAL_CLASS_PRIOR, POLY_ALPHA = False, 0.0
         weight_mode_label = "без весов (вероятности классов как в выборке)"
@@ -1255,9 +1311,10 @@ def main():
     if EQUAL_CLASS_PRIOR:
         print("  RF/CatBoost/LightGBM/логистические/SVM - sample_weight;")
         print("  LDA/QDA/RDA - priors = 1/K; KNN весов не поддерживает (обучается как раньше).")
-        print("  Гиперпараметры подбираются по Balanced Accuracy, модели ранжируются по Balanced Accuracy.\n")
-    else:
-        print("  Гиперпараметры подбираются по Overall Accuracy.\n")
+        if SELECT_METRIC == "oa":
+            print("  ! Равные веса классов снижают OA: модель чаще выбирает редкие классы.")
+            print("    Для максимального OA выберите [3].")
+    print(f"  Гиперпараметры подбираются и модели ранжируются по: {select_label}.\n")
 
     # ================================================================
     # ШАГ 4: НАСТРОЙКА ГИПЕРПАРАМЕТРОВ
@@ -1279,6 +1336,8 @@ def main():
         "cv_method": f"{cv_method_label} — {n_folds}-fold CV",
         "preProcess": "SimpleImputer(median) + StandardScaler (z-score)",
         "class_weighting": weight_mode_label,
+        "select_metric": SELECT_METRIC,
+        "select_metric_label": select_label,
         "equal_class_prior": bool(EQUAL_CLASS_PRIOR),
         "poly_alpha": float(POLY_ALPHA),
         "algorithms": {},
@@ -1678,9 +1737,32 @@ def main():
                         pbar.update(1)
 
                 mean_scores = scores_mat.mean(axis=1)
+                sd_scores = scores_mat.std(axis=1)
                 best_ci = int(np.argmax(mean_scores))
                 best_params_ = combos[best_ci]
                 y_pred = oof_by_combo[best_ci]
+
+                # v57: 5 лучших комбинаций по критерию (среднее ± SD по фолдам)
+                def _fmt_combo(pr: dict) -> str:
+                    return ", ".join(
+                        f"{k.replace('model__', '')}={v}"
+                        for k, v in pr.items() if "penalty" not in k
+                    )
+                top_lines = []
+                if len(combos) > 1:
+                    order = np.argsort(-mean_scores, kind="stable")[:5]
+                    for rnk, ci_ in enumerate(order, 1):
+                        top_lines.append(
+                            f"    {rnk}. {mean_scores[ci_]:.4f} ± {sd_scores[ci_]:.4f} "
+                            f"(min {scores_mat[ci_].min():.4f})  {_fmt_combo(combos[ci_])}"
+                        )
+                    pbar.write(f"  Топ комбинаций по {select_label} (среднее ± SD по фолдам):")
+                    for ln in top_lines:
+                        pbar.write(ln)
+                run_log["algorithms"][algo_name]["best_params"] = _fmt_combo(best_params_)
+                run_log["algorithms"][algo_name]["cv_mean"] = float(mean_scores[best_ci])
+                run_log["algorithms"][algo_name]["cv_sd"] = float(sd_scores[best_ci])
+                run_log["algorithms"][algo_name]["top_combos"] = top_lines
 
                 # Финальный refit лучшей модели на всех стандартизованных данных (1 раз)
                 pbar.set_postfix_str("финальное обучение на всей выборке...", refresh=True)
@@ -1814,6 +1896,7 @@ def main():
             "GridMode": grid_label,
             "OverallAccuracy": overall_acc,
             "BalancedAccuracy": balanced_acc,
+            "OA_BA": 0.5 * (float(overall_acc) + float(balanced_acc)),
             "Kappa": kappa,
             "TSS": tss,
             "F1_Macro": f1_macro,
@@ -1914,11 +1997,11 @@ def main():
         return
 
     results_df = pd.DataFrame(results_list)
-    rank_metric = "BalancedAccuracy" if EQUAL_CLASS_PRIOR else "OverallAccuracy"
+    rank_metric = SELECT_METRIC_COLUMNS[SELECT_METRIC]
     results_df = results_df.sort_values(rank_metric, ascending=False).reset_index(drop=True)
 
     print_cols = [
-        "Algorithm", "GridMode", "OverallAccuracy", "BalancedAccuracy", "Kappa",
+        "Algorithm", "GridMode", "OverallAccuracy", "BalancedAccuracy", "OA_BA", "Kappa",
         "TSS", "F1_Macro", "AIC", "TrainingTime_Sec",
     ]
     print_cols = [c for c in print_cols if c in results_df.columns]
@@ -2042,7 +2125,7 @@ def main():
             ascending=[False, False, False],
         ).reset_index(drop=True)
 
-    print(f"Ранжирование по {'BalancedAccuracy' if EQUAL_CLASS_PRIOR else 'OA'}, F1_Macro, TSS, ΔAIC:\n")
+    print(f"Ранжирование по {select_label} (OOF), затем F1_Macro, TSS, ΔAIC:\n")
     for i, row in results_df.iterrows():
         marker = " <- лучшая" if i == 0 else ""
         daic = (
@@ -2053,6 +2136,7 @@ def main():
             f" [{i + 1}] {row['Algorithm']:<30s} "
             f"Acc={row['OverallAccuracy']:.4f} "
             f"BalAcc={row['BalancedAccuracy']:.4f} "
+            f"(OA+BA)/2={row['OA_BA']:.4f} "
             f"F1={row['F1_Macro']:.4f} "
             f"TSS={row['TSS']:.4f} "
             f"ΔAIC={daic}{marker}"
@@ -2088,6 +2172,7 @@ def main():
 
     run_log["best_model"] = best_model_name
     run_log["best_accuracy"] = round(best_acc, 4)
+    run_log["best_bacc"] = round(float(best_bacc), 4)
 
     # ================================================================
     # ШАГ 8: ОТЧЁТ (run_info.txt)
@@ -2105,7 +2190,7 @@ def main():
         f"Кросс-валидация: {run_log['cv_method']}",
         f"Предобработка: {run_log['preProcess']}",
         f"Вероятности классов: {run_log['class_weighting']}",
-        f"Критерий подбора гиперпараметров: {'Balanced Accuracy' if run_log['equal_class_prior'] else 'Overall Accuracy'}",
+        f"Критерий выбора (гиперпараметры и ранжирование моделей): {run_log['select_metric_label']}",
         "",
         "------------------------------------------------------------",
         "  АЛГОРИТМЫ И ГИПЕРПАРАМЕТРЫ",
@@ -2121,6 +2206,15 @@ def main():
             f"  Параметры: {a['parameters']}",
             a.get("grid_values", ""),
         ])
+        if a.get("best_params"):
+            info_lines.append(f"  Лучшие параметры: {a['best_params']}")
+            info_lines.append(
+                f"  {run_log['select_metric_label']} по фолдам: "
+                f"{a['cv_mean']:.4f} ± {a['cv_sd']:.4f}"
+            )
+            if a.get("top_combos"):
+                info_lines.append("  Топ комбинаций (среднее ± SD по фолдам):")
+                info_lines.extend(a["top_combos"])
         if "accuracy" in a:
             info_lines.extend([
                 "  --- Результат ---",
@@ -2137,7 +2231,8 @@ def main():
             "------------------------------------------------------------",
             "  ВЫБРАННАЯ МОДЕЛЬ",
             "------------------------------------------------------------",
-            f"  * {run_log['best_model']} (Accuracy = {run_log['best_accuracy']:.4f})",
+            f"  * {run_log['best_model']} (Accuracy = {run_log['best_accuracy']:.4f}, "
+            f"Balanced Accuracy = {run_log['best_bacc']:.4f})",
         ])
 
     info_lines.extend([
