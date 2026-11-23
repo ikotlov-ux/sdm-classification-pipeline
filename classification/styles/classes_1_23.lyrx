@@ -1,0 +1,443 @@
+{
+  "type": "CIMLayerDocument",
+  "version": "2.9.0",
+  "build": 32739,
+  "layers": [
+    "CIMPATH=map/classes_lc.xml"
+  ],
+  "layerDefinitions": [
+    {
+      "type": "CIMRasterLayer",
+      "name": "\u041a\u043b\u0430\u0441\u0441\u044b \u0440\u0430\u0441\u0442\u0438\u0442\u0435\u043b\u044c\u043d\u043e\u0441\u0442\u0438 1\u201323",
+      "uRI": "CIMPATH=map/classes_lc.xml",
+      "sourceModifiedTime": {
+        "type": "TimeInstant"
+      },
+      "useSourceMetadata": true,
+      "description": "\u041a\u043b\u0430\u0441\u0441\u044b \u0440\u0430\u0441\u0442\u0438\u0442\u0435\u043b\u044c\u043d\u043e\u0441\u0442\u0438 1\u201323",
+      "layerType": "Operational",
+      "showLegends": true,
+      "visibility": true,
+      "displayCacheType": "Permanent",
+      "maxDisplayCacheAge": 5,
+      "showPopups": true,
+      "serviceLayerID": -1,
+      "refreshRate": -1,
+      "refreshRateUnit": "esriTimeUnitsSeconds",
+      "blendingMode": "Alpha",
+      "colorizer": {
+        "type": "CIMRasterUniqueValueColorizer",
+        "resamplingType": "NearestNeighbor",
+        "noDataColor": {
+          "type": "CIMRGBColor",
+          "values": [
+            255,
+            255,
+            255,
+            0
+          ]
+        },
+        "defaultColor": {
+          "type": "CIMRGBColor",
+          "values": [
+            191,
+            191,
+            191,
+            100
+          ]
+        },
+        "fieldName": "Value",
+        "groups": [
+          {
+            "type": "CIMRasterUniqueValueGroup",
+            "heading": "Value",
+            "classes": [
+              {
+                "type": "CIMRasterUniqueValueClass",
+                "values": [
+                  "1"
+                ],
+                "label": "\u0415\u043b\u043e\u0432\u044b\u0435 \u0438 \u0445\u0432\u043e\u0439\u043d\u043e-\u0448\u0438\u0440\u043e\u043a\u043e\u043b\u0438\u0441\u0442\u0432\u0435\u043d\u043d\u044b\u0435 \u2014 \u0431\u043e\u0440\u0435\u0430\u043b\u044c\u043d\u044b\u0435 (\u043a\u0443\u0441\u0442\u0430\u0440\u043d\u0438\u0447\u043a\u043e\u0432\u043e-\u043c\u0435\u043b\u043a\u043e\u0442\u0440\u0430\u0432\u043d\u043e-\u0437\u0435\u043b\u0435\u043d\u043e\u043c\u043e\u0448\u043d\u044b\u0435, \u043c\u0435\u043b\u043a\u043e\u0442\u0440\u0430\u0432\u043d\u044b\u0435)",
+                "color": {
+                  "type": "CIMRGBColor",
+                  "values": [
+                    112,
+                    48,
+                    160,
+                    100
+                  ]
+                }
+              },
+              {
+                "type": "CIMRasterUniqueValueClass",
+                "values": [
+                  "2"
+                ],
+                "label": "\u0415\u043b\u043e\u0432\u044b\u0435 \u0438 \u0445\u0432\u043e\u0439\u043d\u043e-\u0448\u0438\u0440\u043e\u043a\u043e\u043b\u0438\u0441\u0442\u0432\u0435\u043d\u043d\u044b\u0435 \u2014 \u043d\u0435\u043c\u043e\u0440\u0430\u043b\u044c\u043d\u044b\u0435 (\u043c\u0435\u043b\u043a\u043e\u0442\u0440\u0430\u0432\u043d\u043e-\u0448\u0438\u0440\u043e\u043a\u043e\u0442\u0440\u0430\u0432\u043d\u044b\u0435, \u0448\u0438\u0440\u043e\u043a\u043e\u0442\u0440\u0430\u0432\u043d\u044b\u0435, \u0440\u0430\u0437\u043d\u043e\u0442\u0440\u0430\u0432\u043d\u044b\u0435)",
+                "color": {
+                  "type": "CIMRGBColor",
+                  "values": [
+                    255,
+                    51,
+                    204,
+                    100
+                  ]
+                }
+              },
+              {
+                "type": "CIMRasterUniqueValueClass",
+                "values": [
+                  "3"
+                ],
+                "label": "\u0421\u043e\u0441\u043d\u043e\u0432\u043e-\u0435\u043b\u043e\u0432\u044b\u0435 \u2014 \u0431\u043e\u0440\u0435\u0430\u043b\u044c\u043d\u044b\u0435 (\u043a\u0443\u0441\u0442\u0430\u0440\u043d\u0438\u0447\u043a\u043e\u0432\u043e-\u043c\u0435\u043b\u043a\u043e\u0442\u0440\u0430\u0432\u043d\u043e-\u0437\u0435\u043b\u0435\u043d\u043e\u043c\u043e\u0448\u043d\u044b\u0435, \u043c\u0435\u043b\u043a\u043e\u0442\u0440\u0430\u0432\u043d\u044b\u0435)",
+                "color": {
+                  "type": "CIMRGBColor",
+                  "values": [
+                    255,
+                    102,
+                    0,
+                    100
+                  ]
+                }
+              },
+              {
+                "type": "CIMRasterUniqueValueClass",
+                "values": [
+                  "4"
+                ],
+                "label": "\u0421\u043e\u0441\u043d\u043e\u0432\u043e-\u0435\u043b\u043e\u0432\u044b\u0435 \u2014 \u043d\u0435\u043c\u043e\u0440\u0430\u043b\u044c\u043d\u044b\u0435 (\u043c\u0435\u043b\u043a\u043e\u0442\u0440\u0430\u0432\u043d\u043e-\u0448\u0438\u0440\u043e\u043a\u043e\u0442\u0440\u0430\u0432\u043d\u044b\u0435, \u0448\u0438\u0440\u043e\u043a\u043e\u0442\u0440\u0430\u0432\u043d\u044b\u0435, \u0440\u0430\u0437\u043d\u043e\u0442\u0440\u0430\u0432\u043d\u044b\u0435)",
+                "color": {
+                  "type": "CIMRGBColor",
+                  "values": [
+                    255,
+                    153,
+                    83,
+                    100
+                  ]
+                }
+              },
+              {
+                "type": "CIMRasterUniqueValueClass",
+                "values": [
+                  "5"
+                ],
+                "label": "\u0421\u043e\u0441\u043d\u043e\u0432\u043e-\u0435\u043b\u043e\u0432\u044b\u0435 \u2014 \u043e\u043b\u0438\u0433\u043e\u0442\u0440\u043e\u0444\u043d\u044b\u0435 (\u0442\u0440\u0430\u0432\u044f\u043d\u043e-\u0431\u043e\u043b\u043e\u0442\u043d\u044b\u0435, \u043a\u0443\u0441\u0442\u0430\u0440\u043d\u0438\u0447\u043a\u043e\u0432\u043e-\u0442\u0440\u0430\u0432\u044f\u043d\u043e-\u0441\u0444\u0430\u0433\u043d\u043e\u0432\u044b\u0435)",
+                "color": {
+                  "type": "CIMRGBColor",
+                  "values": [
+                    255,
+                    225,
+                    205,
+                    100
+                  ]
+                }
+              },
+              {
+                "type": "CIMRasterUniqueValueClass",
+                "values": [
+                  "6"
+                ],
+                "label": "\u0414\u0443\u0431\u043e\u0432\u044b\u0435 \u2014 \u043d\u0435\u043c\u043e\u0440\u0430\u043b\u044c\u043d\u044b\u0435 (\u043c\u0435\u043b\u043a\u043e\u0442\u0440\u0430\u0432\u043d\u043e-\u0448\u0438\u0440\u043e\u043a\u043e\u0442\u0440\u0430\u0432\u043d\u044b\u0435, \u0448\u0438\u0440\u043e\u043a\u043e\u0442\u0440\u0430\u0432\u043d\u044b\u0435, \u0440\u0430\u0437\u043d\u043e\u0442\u0440\u0430\u0432\u043d\u044b\u0435)",
+                "color": {
+                  "type": "CIMRGBColor",
+                  "values": [
+                    0,
+                    102,
+                    0,
+                    100
+                  ]
+                }
+              },
+              {
+                "type": "CIMRasterUniqueValueClass",
+                "values": [
+                  "7"
+                ],
+                "label": "\u041b\u0438\u043f\u043e\u0432\u044b\u0435 \u2014 \u043d\u0435\u043c\u043e\u0440\u0430\u043b\u044c\u043d\u044b\u0435 (\u043c\u0435\u043b\u043a\u043e\u0442\u0440\u0430\u0432\u043d\u043e-\u0448\u0438\u0440\u043e\u043a\u043e\u0442\u0440\u0430\u0432\u043d\u044b\u0435, \u0448\u0438\u0440\u043e\u043a\u043e\u0442\u0440\u0430\u0432\u043d\u044b\u0435, \u0440\u0430\u0437\u043d\u043e\u0442\u0440\u0430\u0432\u043d\u044b\u0435)",
+                "color": {
+                  "type": "CIMRGBColor",
+                  "values": [
+                    255,
+                    255,
+                    0,
+                    100
+                  ]
+                }
+              },
+              {
+                "type": "CIMRasterUniqueValueClass",
+                "values": [
+                  "8"
+                ],
+                "label": "\u0428\u0438\u0440\u043e\u043a\u043e\u043b\u0438\u0441\u0442\u0432\u0435\u043d\u043d\u043e-\u0435\u043b\u043e\u0432\u044b\u0435 \u2014 \u043d\u0435\u043c\u043e\u0440\u0430\u043b\u044c\u043d\u044b\u0435 (\u043c\u0435\u043b\u043a\u043e\u0442\u0440\u0430\u0432\u043d\u043e-\u0448\u0438\u0440\u043e\u043a\u043e\u0442\u0440\u0430\u0432\u043d\u044b\u0435, \u0448\u0438\u0440\u043e\u043a\u043e\u0442\u0440\u0430\u0432\u043d\u044b\u0435, \u0440\u0430\u0437\u043d\u043e\u0442\u0440\u0430\u0432\u043d\u044b\u0435)",
+                "color": {
+                  "type": "CIMRGBColor",
+                  "values": [
+                    192,
+                    0,
+                    0,
+                    100
+                  ]
+                }
+              },
+              {
+                "type": "CIMRasterUniqueValueClass",
+                "values": [
+                  "9"
+                ],
+                "label": "\u0411\u0435\u0440\u0435\u0437\u043e\u0432\u043e-\u043e\u0441\u0438\u043d\u043e\u0432\u044b\u0435 \u0441 \u0435\u043b\u044c\u044e \u0438 \u043e\u0441\u0438\u043d\u043e\u0439, \u043c\u0435\u0441\u0442\u0430\u043c\u0438 \u0441 \u0434\u0443\u0431\u043e\u043c \u0438 \u043b\u0438\u043f\u043e\u0439 \u2014 \u043d\u0435\u043c\u043e\u0440\u0430\u043b\u044c\u043d\u044b\u0435 (\u043c\u0435\u043b\u043a\u043e\u0442\u0440\u0430\u0432\u043d\u043e-\u0448\u0438\u0440\u043e\u043a\u043e\u0442\u0440\u0430\u0432\u043d\u044b\u0435, \u0448\u0438\u0440\u043e\u043a\u043e\u0442\u0440\u0430\u0432\u043d\u044b\u0435, \u0440\u0430\u0437\u043d\u043e\u0442\u0440\u0430\u0432\u043d\u044b\u0435)",
+                "color": {
+                  "type": "CIMRGBColor",
+                  "values": [
+                    0,
+                    145,
+                    196,
+                    100
+                  ]
+                }
+              },
+              {
+                "type": "CIMRasterUniqueValueClass",
+                "values": [
+                  "10"
+                ],
+                "label": "\u0411\u0435\u0440\u0435\u0437\u043e\u0432\u043e-\u043e\u0441\u0438\u043d\u043e\u0432\u044b\u0435 \u0441 \u0435\u043b\u044c\u044e \u0438 \u043e\u0441\u0438\u043d\u043e\u0439, \u043c\u0435\u0441\u0442\u0430\u043c\u0438 \u0441 \u0434\u0443\u0431\u043e\u043c \u0438 \u043b\u0438\u043f\u043e\u0439 \u2014 \u043e\u043b\u0438\u0433\u043e\u0442\u0440\u043e\u0444\u043d\u044b\u0435 (\u0442\u0440\u0430\u0432\u044f\u043d\u043e-\u0431\u043e\u043b\u043e\u0442\u043d\u044b\u0435, \u043a\u0443\u0441\u0442\u0430\u0440\u043d\u0438\u0447\u043a\u043e\u0432\u043e-\u0442\u0440\u0430\u0432\u044f\u043d\u043e-\u0441\u0444\u0430\u0433\u043d\u043e\u0432\u044b\u0435)",
+                "color": {
+                  "type": "CIMRGBColor",
+                  "values": [
+                    139,
+                    225,
+                    255,
+                    100
+                  ]
+                }
+              },
+              {
+                "type": "CIMRasterUniqueValueClass",
+                "values": [
+                  "11"
+                ],
+                "label": "\u041e\u0441\u0438\u043d\u043d\u0438\u043a\u0438 \u0441 \u0435\u043b\u044c\u044e \u0438 \u0434\u0443\u0431\u043e\u043c \u2014 \u043d\u0435\u043c\u043e\u0440\u0430\u043b\u044c\u043d\u044b\u0435 (\u043c\u0435\u043b\u043a\u043e\u0442\u0440\u0430\u0432\u043d\u043e-\u0448\u0438\u0440\u043e\u043a\u043e\u0442\u0440\u0430\u0432\u043d\u044b\u0435, \u0448\u0438\u0440\u043e\u043a\u043e\u0442\u0440\u0430\u0432\u043d\u044b\u0435, \u0440\u0430\u0437\u043d\u043e\u0442\u0440\u0430\u0432\u043d\u044b\u0435) / \u043d\u0438\u0442\u0440\u043e\u0444\u0438\u043b\u044c\u043d\u044b\u0435 (\u0432\u043b\u0430\u0436\u043d\u043e\u0442\u0440\u0430\u0432\u043d\u043e-\u0448\u0438\u0440\u043e\u043a\u043e\u0442\u0440\u0430\u0432\u043d\u044b\u0435)",
+                "color": {
+                  "type": "CIMRGBColor",
+                  "values": [
+                    0,
+                    180,
+                    0,
+                    100
+                  ]
+                }
+              },
+              {
+                "type": "CIMRasterUniqueValueClass",
+                "values": [
+                  "12"
+                ],
+                "label": "\u0421\u0435\u0440\u043e\u043e\u043b\u044c\u0448\u0430\u043d\u0438\u043a\u0438 \u2014 \u043d\u0438\u0442\u0440\u043e\u0444\u0438\u043b\u044c\u043d\u044b\u0435 (\u0432\u043b\u0430\u0436\u043d\u043e\u0442\u0440\u0430\u0432\u043d\u043e-\u0448\u0438\u0440\u043e\u043a\u043e\u0442\u0440\u0430\u0432\u043d\u044b\u0435)",
+                "color": {
+                  "type": "CIMRGBColor",
+                  "values": [
+                    128,
+                    128,
+                    128,
+                    100
+                  ]
+                }
+              },
+              {
+                "type": "CIMRasterUniqueValueClass",
+                "values": [
+                  "13"
+                ],
+                "label": "\u0427\u0435\u0440\u043d\u043e\u043e\u043b\u044c\u0448\u0430\u043d\u0438\u043a\u0438 \u2014 \u043d\u0438\u0442\u0440\u043e\u0444\u0438\u043b\u044c\u043d\u044b\u0435 (\u0432\u043b\u0430\u0436\u043d\u043e\u0442\u0440\u0430\u0432\u043d\u043e-\u0448\u0438\u0440\u043e\u043a\u043e\u0442\u0440\u0430\u0432\u043d\u044b\u0435)",
+                "color": {
+                  "type": "CIMRGBColor",
+                  "values": [
+                    64,
+                    64,
+                    64,
+                    100
+                  ]
+                }
+              },
+              {
+                "type": "CIMRasterUniqueValueClass",
+                "values": [
+                  "14"
+                ],
+                "label": "\u0420\u0430\u0441\u043f\u0430\u0432\u0448\u0438\u0435\u0441\u044f \u0435\u043b\u044c\u043d\u0438\u043a\u0438 \u2014 \u0431\u043e\u0440\u0435\u0430\u043b\u044c\u043d\u044b\u0435 (\u043a\u0443\u0441\u0442\u0430\u0440\u043d\u0438\u0447\u043a\u043e\u0432\u043e-\u043c\u0435\u043b\u043a\u043e\u0442\u0440\u0430\u0432\u043d\u043e-\u0437\u0435\u043b\u0435\u043d\u043e\u043c\u043e\u0448\u043d\u044b\u0435, \u043c\u0435\u043b\u043a\u043e\u0442\u0440\u0430\u0432\u043d\u044b\u0435)",
+                "color": {
+                  "type": "CIMRGBColor",
+                  "values": [
+                    255,
+                    204,
+                    255,
+                    100
+                  ]
+                }
+              },
+              {
+                "type": "CIMRasterUniqueValueClass",
+                "values": [
+                  "15"
+                ],
+                "label": "\u0420\u0430\u0441\u043f\u0430\u0432\u0448\u0438\u0435\u0441\u044f \u0435\u043b\u044c\u043d\u0438\u043a\u0438 \u2014 \u043d\u0435\u043c\u043e\u0440\u0430\u043b\u044c\u043d\u044b\u0435 (\u043c\u0435\u043b\u043a\u043e\u0442\u0440\u0430\u0432\u043d\u043e-\u0448\u0438\u0440\u043e\u043a\u043e\u0442\u0440\u0430\u0432\u043d\u044b\u0435, \u0448\u0438\u0440\u043e\u043a\u043e\u0442\u0440\u0430\u0432\u043d\u044b\u0435, \u0440\u0430\u0437\u043d\u043e\u0442\u0440\u0430\u0432\u043d\u044b\u0435)",
+                "color": {
+                  "type": "CIMRGBColor",
+                  "values": [
+                    226,
+                    239,
+                    218,
+                    100
+                  ]
+                }
+              },
+              {
+                "type": "CIMRasterUniqueValueClass",
+                "values": [
+                  "16"
+                ],
+                "label": "\u0418\u0432\u043d\u044f\u043a\u0438 \u2014 \u043d\u0438\u0442\u0440\u043e\u0444\u0438\u043b\u044c\u043d\u044b\u0435 (\u0432\u043b\u0430\u0436\u043d\u043e\u0442\u0440\u0430\u0432\u043d\u043e-\u0448\u0438\u0440\u043e\u043a\u043e\u0442\u0440\u0430\u0432\u043d\u044b\u0435)",
+                "color": {
+                  "type": "CIMRGBColor",
+                  "values": [
+                    198,
+                    224,
+                    180,
+                    100
+                  ]
+                }
+              },
+              {
+                "type": "CIMRasterUniqueValueClass",
+                "values": [
+                  "17"
+                ],
+                "label": "\u041c\u0435\u043b\u043a\u043e\u043b\u0438\u0441\u0442\u0432\u0435\u043d\u043d\u0430\u044f \u043f\u043e\u0440\u043e\u0441\u043b\u044c \u0438 \u0432\u044b\u0440\u0443\u0431\u043a\u0438 \u2014 \u043d\u0438\u0442\u0440\u043e\u0444\u0438\u043b\u044c\u043d\u044b\u0435 (\u0432\u043b\u0430\u0436\u043d\u043e\u0442\u0440\u0430\u0432\u043d\u043e-\u0448\u0438\u0440\u043e\u043a\u043e\u0442\u0440\u0430\u0432\u043d\u044b\u0435)",
+                "color": {
+                  "type": "CIMRGBColor",
+                  "values": [
+                    169,
+                    208,
+                    142,
+                    100
+                  ]
+                }
+              },
+              {
+                "type": "CIMRasterUniqueValueClass",
+                "values": [
+                  "18"
+                ],
+                "label": "\u041b\u0443\u0433\u0430 \u0441\u0443\u0445\u043e\u0434\u043e\u043b\u044c\u043d\u044b\u0435 \u2014 \u0440\u0430\u0437\u043d\u043e\u0442\u0440\u0430\u0432\u043d\u044b\u0435",
+                "color": {
+                  "type": "CIMRGBColor",
+                  "values": [
+                    204,
+                    255,
+                    255,
+                    100
+                  ]
+                }
+              },
+              {
+                "type": "CIMRasterUniqueValueClass",
+                "values": [
+                  "19"
+                ],
+                "label": "\u041b\u0443\u0433\u0430 \u0443\u0432\u043b\u0430\u0436\u043d\u0451\u043d\u043d\u044b\u0435 \u0438 \u043e\u0442\u043a\u0440\u044b\u0442\u044b\u0435 \u0437\u0430\u0431\u043e\u043b\u043e\u0447\u0435\u043d\u043d\u044b\u0435 \u043c\u0435\u0441\u0442\u043e\u043e\u0431\u0438\u0442\u0430\u043d\u0438\u044f \u2014 \u043e\u043b\u0438\u0433\u043e\u0442\u0440\u043e\u0444\u043d\u044b\u0435 (\u0442\u0440\u0430\u0432\u044f\u043d\u043e-\u0431\u043e\u043b\u043e\u0442\u043d\u044b\u0435, \u043a\u0443\u0441\u0442\u0430\u0440\u043d\u0438\u0447\u043a\u043e\u0432\u043e-\u0442\u0440\u0430\u0432\u044f\u043d\u043e-\u0441\u0444\u0430\u0433\u043d\u043e\u0432\u044b\u0435)",
+                "color": {
+                  "type": "CIMRGBColor",
+                  "values": [
+                    204,
+                    236,
+                    255,
+                    100
+                  ]
+                }
+              },
+              {
+                "type": "CIMRasterUniqueValueClass",
+                "values": [
+                  "20"
+                ],
+                "label": "\u041f\u0430\u0448\u043d\u0438 (\u0432\u043a\u043b\u044e\u0447\u0430\u044f \u0437\u0430\u043b\u0435\u0436\u0438 \u043d\u0430 \u0440\u0430\u043d\u043d\u0438\u0445 \u0441\u0442\u0430\u0434\u0438\u044f\u0445)",
+                "color": {
+                  "type": "CIMRGBColor",
+                  "values": [
+                    255,
+                    255,
+                    204,
+                    100
+                  ]
+                }
+              },
+              {
+                "type": "CIMRasterUniqueValueClass",
+                "values": [
+                  "21"
+                ],
+                "label": "\u0417\u0430\u0441\u0442\u0440\u043e\u0439\u043a\u0430 \u0438 \u0434\u043e\u0440\u043e\u0433\u0438",
+                "color": {
+                  "type": "CIMRGBColor",
+                  "values": [
+                    13,
+                    13,
+                    13,
+                    100
+                  ]
+                }
+              },
+              {
+                "type": "CIMRasterUniqueValueClass",
+                "values": [
+                  "22"
+                ],
+                "label": "\u0412\u043e\u0434\u043d\u044b\u0435 \u043e\u0431\u044a\u0435\u043a\u0442\u044b",
+                "color": {
+                  "type": "CIMRGBColor",
+                  "values": [
+                    68,
+                    114,
+                    196,
+                    100
+                  ]
+                }
+              },
+              {
+                "type": "CIMRasterUniqueValueClass",
+                "values": [
+                  "23"
+                ],
+                "label": "\u041a\u0430\u0440\u044c\u0435\u0440\u044b \u0438 \u0442\u043e\u0440\u0444\u043e\u0440\u0430\u0437\u0440\u0430\u0431\u043e\u0442\u043a\u0438",
+                "color": {
+                  "type": "CIMRGBColor",
+                  "values": [
+                    255,
+                    0,
+                    0,
+                    100
+                  ]
+                }
+              }
+            ]
+          }
+        ],
+        "colorScheme": {
+          "type": "CIMRandomHSVColorRamp",
+          "colorSpace": {
+            "type": "CIMICCColorSpace",
+            "url": "Default RGB"
+          },
+          "maxH": 360,
+          "minS": 15,
+          "maxS": 30,
+          "minV": 99,
+          "maxV": 100,
+          "minAlpha": 100,
+          "maxAlpha": 100
+        }
+      }
+    }
+  ]
+}
