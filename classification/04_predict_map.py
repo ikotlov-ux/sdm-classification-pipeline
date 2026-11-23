@@ -1,5 +1,17 @@
 # =============================================================================
-# 04_predict_map_v5.py
+# 04_predict_map_v7.py
+#
+# ИЗМЕНЕНИЯ В v7 (исправление ошибки v6):
+# - Статистика классов (ШАГ 8 и таблица классов в *_stats.csv) считалась
+#   по индексам 0..n-1, тогда как с v6 растр хранит исходные коды классов.
+#   Из-за этого числа пикселей были сдвинуты относительно названий классов
+#   (при числовых метках, отсортированных как строки "1","10","11",...),
+#   а последний код не учитывался. Теперь подсчёт идёт по фактическим
+#   значениям растра, строки упорядочены по коду, проверяется сумма и
+#   выводятся значения растра, не соответствующие ни одному классу.
+# - PNG-карта (ШАГ 10): легенда не соответствовала цветам (те же сдвиги);
+#   теперь цвета и легенда сопоставляются по коду класса.
+# - class_table.pkl: добавлен столбец Value (значение в растре).
 #
 # СКРИПТ 4: ЭКСТРАПОЛЯЦИЯ МОДЕЛИ НА ВЕСЬ РАСТР
 #
@@ -1518,6 +1530,12 @@ def main():
 
     le = LabelEncoder()
     le.fit(class_levels)
+    # v7: значение класса в категориальном растре (исходный код или индекс)
+    class_values = [_class_value(c, class_levels) for c in class_levels]
+    value_to_pos = {v: i for i, v in enumerate(class_values)}
+    if len(value_to_pos) != len(class_values):
+        print("  ВНИМАНИЕ: разные метки классов дают одинаковое значение растра - "
+              "статистика по таким классам будет объединена")
 
     # Оценка времени
     speed_map = {
@@ -1575,7 +1593,8 @@ def main():
 
     n_classes = len(class_levels)
     class_table = pd.DataFrame({
-        "ID": range(0, n_classes),          # 0-based
+        "ID": range(0, n_classes),          # 0-based индекс в class_levels
+        "Value": class_values,              # значение в _cat.tif
         "Class": class_levels,
     })
 
@@ -1631,7 +1650,8 @@ def main():
             extent=extent,
         )
         print(f"  ✓ {os.path.basename(file_qgs)} (проект QGIS)")
-        print(f"    Цветов в палитре: {len(palette_entries)} (значения 0..{n_classes - 1})")
+        _vals_txt = ", ".join(str(e["value"]) for e in sorted(palette_entries, key=lambda e: e["value"]))
+        print(f"    Цветов в палитре: {len(palette_entries)} (значения растра: {_vals_txt})")
     except Exception as e:
         print(f"  ! QGIS-проект не создан: {e}")
 
@@ -1643,25 +1663,46 @@ def main():
     with rasterio.open(file_categorical) as src:
         cat_data = src.read(1)
 
-    # Подсчёт пикселей по классам (0-based: валидными считаем всё, кроме nodata)
+    # v7: подсчёт по фактическим значениям растра (исходные коды классов),
+    # а не по индексам 0..n-1
     valid_cat = cat_data[cat_data != -9999]
-    total_pixels = len(valid_cat)
+    total_pixels = int(valid_cat.size)
+    _vals, _cnts = np.unique(valid_cat, return_counts=True)
+    value_counts = {int(v): int(c) for v, c in zip(_vals, _cnts)}
+    del valid_cat, cat_data
+
+    # Порядок строк: по значению растра (1, 2, ..., 10, 11, ...)
+    order = sorted(range(n_classes), key=lambda i: class_values[i])
 
     class_freq_rows = []
     print("--------------------------------------------------")
-    print(f"{'Класс':<20s} {'Пикселей':>12s} {'%':>10s}")
+    print(f"{'Класс':<20s} {'Value':>6s} {'Пикселей':>12s} {'%':>10s}")
     print("--------------------------------------------------")
-    for cid in range(0, n_classes):
-        count = int((valid_cat == cid).sum())
-        cname = class_levels[cid]
+    counted = 0
+    for pos in order:
+        val = class_values[pos]
+        cname = class_levels[pos]
+        count = value_counts.get(val, 0)
+        counted += count
         pct = count / max(total_pixels, 1) * 100
-        print(f"{cname:<20s} {count:>12d} {pct:>9.2f}%")
+        print(f"{cname:<20s} {val:>6d} {count:>12d} {pct:>9.2f}%")
         class_freq_rows.append({
-            "value": cid, "Class": cname, "count": count, "Percent": pct,
+            "value": val, "Class": cname, "count": count, "Percent": pct,
         })
     print("--------------------------------------------------")
-    print(f"{'ВСЕГО':<20s} {total_pixels:>12d} {'100.00':>9s}%")
-    print("--------------------------------------------------\n")
+    print(f"{'ВСЕГО':<20s} {'':>6s} {total_pixels:>12d} {'100.00':>9s}%")
+    print("--------------------------------------------------")
+    unknown = {v: c for v, c in value_counts.items() if v not in value_to_pos}
+    if unknown:
+        print(
+            "  ! В растре есть значения, не соответствующие классам модели: "
+            + ", ".join(f"{v} ({c} пикс.)" for v, c in sorted(unknown.items()))
+        )
+    if counted != total_pixels:
+        print(f"  ! Сумма по классам ({counted}) не равна числу валидных пикселей ({total_pixels})")
+    else:
+        print("  ✓ Сумма по классам совпадает с числом валидных пикселей")
+    print()
 
     class_freq = pd.DataFrame(class_freq_rows)
 
@@ -1814,7 +1855,8 @@ def main():
             transform = src.transform
             bounds = src.bounds
 
-        # Цвета для классов
+        # v7: значения растра (коды классов) переводятся в ранг кода 0..n-1;
+        # цвета и легенда идут в порядке кодов и совпадают с растром
         n_cls = len(class_levels)
         if n_cls <= 10:
             cmap_cls = plt.cm.Set3
@@ -1823,31 +1865,31 @@ def main():
         else:
             cmap_cls = plt.cm.nipy_spectral
         colors = [cmap_cls(i / max(n_cls - 1, 1)) for i in range(n_cls)]
+        order_map = sorted(range(n_cls), key=lambda i: class_values[i])
 
-        # Маска nodata (0-based: класс 0 валиден, прячем только -9999)
-        cat_float = cat_data.astype(float)
-        cat_float[cat_data == -9999] = np.nan
+        pos_img = np.full(cat_data.shape, np.nan, dtype=np.float32)
+        for rank, pos in enumerate(order_map):
+            pos_img[cat_data == class_values[pos]] = rank
+        del cat_data
 
         fig, ax = plt.subplots(figsize=(12, 10))
 
-        # Создаём custom colormap
         from matplotlib.colors import ListedColormap, BoundaryNorm
         cmap_custom = ListedColormap(colors)
-        # 0-based: границы -0.5 .. (n_cls-0.5), чтобы значения 0..n_cls-1
-        # попадали ровно в свои ячейки цветовой шкалы
         bounds_arr = np.arange(-0.5, n_cls + 0.5, 1)
         norm = BoundaryNorm(bounds_arr, cmap_custom.N)
 
         extent = [bounds.left, bounds.right, bounds.bottom, bounds.top]
         im = ax.imshow(
-            cat_float, cmap=cmap_custom, norm=norm,
+            pos_img, cmap=cmap_custom, norm=norm,
             extent=extent, interpolation="nearest",
         )
+        del pos_img
 
-        # Легенда
+        # Легенда в порядке кодов классов
         patches = [
-            mpatches.Patch(color=colors[i], label=class_levels[i])
-            for i in range(n_cls)
+            mpatches.Patch(color=colors[rank], label=class_levels[pos])
+            for rank, pos in enumerate(order_map)
         ]
         ax.legend(
             handles=patches, loc="upper right", title="Классы",
